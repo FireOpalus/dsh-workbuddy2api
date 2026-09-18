@@ -2,11 +2,17 @@
 /**
  * Verify the PUBLISHED artifact, not the working tree.
  *
- * Extracts the tarball produced by `npm pack` into an isolated directory,
- * wires it into a second throw-away profile inside the workspace, and reports
- * whether the package is self-contained: a missing `lib/client.js`, a
- * forgotten `cordis.patch.yml`, or an absent `./client` export would all
- * surface here instead of on a user's machine.
+ * Two layers, deliberately separable:
+ *
+ * 1. **Artifact checks** — extract the tarball produced by `npm pack` and
+ *    assert the manifest's promises actually hold inside it: a missing
+ *    `lib/client.js`, a forgotten `cordis.patch.yml`, or an absent
+ *    `./client` export all surface here instead of on a user's machine.
+ *    These need nothing but Node, so CI runs them on every tag.
+ * 2. **Profile wiring** — additionally link the extracted copy into a second
+ *    throw-away profile inside the workspace, so it can actually be booted.
+ *    This needs an installed `dsh`, which a CI runner does not have, so it is
+ *    skipped (with a printed reason) when none can be located.
  *
  * Usage:  node testenv/verify-pack.mjs [tarball]
  *
@@ -26,7 +32,14 @@ const PROFILE = join(DSH_HOME, 'profiles', 'web')
 const PLUGIN_NAME = 'dsh-workbuddy2api'
 const WEB_PORT = 63951
 
-/** The installed DSH CLI, resolved from the filesystem (no child processes). */
+/**
+ * The installed DSH CLI, or undefined when there is none.
+ *
+ * Resolved from the filesystem rather than by shelling out to `where`/`which`:
+ * under the DSH Windows file sandbox any spawned child with piped stdio fails
+ * with EPERM, and this script must run there. A CI runner has no installed
+ * `dsh` at all, which is a normal, reported outcome rather than a failure.
+ */
 function resolveDshInstall() {
   const candidates = [
     process.env.DSH_INSTALL,
@@ -38,7 +51,7 @@ function resolveDshInstall() {
   for (const candidate of candidates) {
     if (candidate !== undefined && lstatSync(candidate, { throwIfNoEntry: false }) !== undefined) return candidate
   }
-  throw new Error('cannot locate the installed @deepseek-ai/dsh; set DSH_INSTALL to its directory')
+  return undefined
 }
 
 /** The tarball to verify: the argument, else the newest one in dist-pack. */
@@ -181,7 +194,16 @@ writeFileSync(join(PROFILE, 'cordis.patch.yml'), `# Pack-verification profile fo
 `)
 writeFileSync(join(PROFILE, 'pnpm-workspace.yaml'), 'packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n')
 
-const dshPackages = join(resolveDshInstall(), 'node_modules')
+const dshInstall = resolveDshInstall()
+if (dshInstall === undefined) {
+  process.stdout.write('\n(no installed @deepseek-ai/dsh found — profile wiring skipped; set DSH_INSTALL to enable it)\n')
+  const failed = checks.filter(entry => !entry.ok)
+  process.stdout.write(`${checks.length - failed.length}/${checks.length} artifact checks passed.\n`)
+  process.exitCode = failed.length === 0 ? 0 : 1
+  process.exit(process.exitCode)
+}
+
+const dshPackages = join(dshInstall, 'node_modules')
 const modulesDir = join(PROFILE, 'node_modules')
 const scopeSrc = join(dshPackages, '@deepseek-ai')
 const scopeDest = join(modulesDir, '@deepseek-ai')
