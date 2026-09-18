@@ -140,6 +140,10 @@ const GLOBAL_BASE = 'https://www.workbuddy.ai'
 const TASKS_LIST_PATH = '/v2/activity/growth/tasks'
 const TASKS_ACCEPT_PATH = '/v2/activity/growth/tasks/accept'
 const REPORT_PATH = '/v2/report'
+/** The platform expert market (desktop channel). */
+const MARKET_EXPERT_PATH = '/portal/operation-platform/market/expert/list'
+/** A real chat turn is capped: the sweep must not stall on a long answer. */
+const CHAT_TURN_TIMEOUT_MS = 90_000
 
 /** Browser user agent used by the web-fingerprint report channel. */
 const WEB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
@@ -559,6 +563,55 @@ export function parseUpstreamTask(value: unknown): WorkBuddyTask | undefined {
     ...status === undefined ? {} : { status },
     claimable: !claimed && target > 0 && current >= target,
     claimed,
+  }
+}
+
+
+/** One expert from the platform market; ids must be real to count. */
+export interface WorkBuddyMarketExpert {
+  expertId: string
+  expertType: string
+  name: string
+  profession: string
+  version: string
+  category: string
+}
+
+/** Whether a moment falls in the night-owl scoring window (23:00–08:00 local). */
+export function isNightWindow(now: Date = new Date()): boolean {
+  const hour = now.getHours()
+  return hour >= 23 || hour < 8
+}
+
+/**
+ * Read the first server-minted request id out of an SSE stream, then abandon
+ * the rest of the body.
+ *
+ * The expert and skill tasks JOIN their events onto a real conversation, and
+ * the join key has to be the id the SERVER returned (`cmb-` + 32 hex, or 32
+ * bare hex). A locally invented id is accepted by `/v2/report` and then never
+ * scored, which is the failure this reader exists to prevent.
+ */
+async function readServerRequestId(response: Response): Promise<string | undefined> {
+  const body = response.body
+  if (body === null) return undefined
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffered = ''
+  try {
+    // Bounded: the id always arrives in the first frames, and the stream is
+    // abandoned instead of being drained in full (a long answer would
+    // otherwise hold the sweep for minutes).
+    while (buffered.length < 1 << 20) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffered += decoder.decode(value, { stream: true })
+      const match = /"id"\s*:\s*"((?:cmb-)?[0-9a-f]{32})"/u.exec(buffered)
+      if (match !== null) return match[1]
+    }
+    return undefined
+  } finally {
+    void reader.cancel().catch(() => {})
   }
 }
 
@@ -1145,5 +1198,181 @@ export class WorkBuddyUpstreamClient {
     })
     const envelope = await readEnvelope(response)
     if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+  }
+
+  /**
+   * Read the platform's real expert market. The ids must be REAL: an invented
+   * expert id never counts toward the expert tasks, which is why the market is
+   * listed instead of hard-coding names.
+   */
+  async marketExpertList(
+    credential: WorkBuddyCredential,
+    expertType: 'agent' | 'team',
+  ): Promise<WorkBuddyMarketExpert[]> {
+    const response = await fetch(chatBase(credential) + MARKET_EXPERT_PATH, {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + credential.accessToken,
+        'Content-Type': 'application/json',
+        'User-Agent': DESKTOP_UA,
+        'X-Domain': chatBase(credential),
+        'X-Product': 'SaaS',
+        ...credential.uid === '' ? {} : { 'X-User-Id': credential.uid },
+      },
+      body: JSON.stringify({ page: 1, page_size: 20, sort_by: 'reco_rank', sort_order: 'desc', expert_type: expertType }),
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const data = typeof envelope.data === 'object' && envelope.data !== null
+      ? envelope.data as Record<string, unknown>
+      : {}
+    const raw = Array.isArray(data['experts']) ? data['experts'] : []
+    const experts: WorkBuddyMarketExpert[] = []
+    for (const entry of raw) {
+      if (typeof entry !== 'object' || entry === null) continue
+      const record = entry as Record<string, unknown>
+      const expertId = typeof record['expert_id'] === 'string' ? record['expert_id'] : ''
+      if (expertId === '') continue
+      experts.push({
+        expertId,
+        expertType: typeof record['expert_type'] === 'string' ? record['expert_type'] : expertType,
+        name: typeof record['display_name_zh'] === 'string' ? record['display_name_zh'] : expertId,
+        profession: typeof record['profession_zh'] === 'string' ? record['profession_zh'] : '',
+        version: typeof record['version'] === 'string' && record['version'] !== '' ? record['version'] : '1.0.0',
+        category: Array.isArray(record['categories']) && typeof record['categories'][0] === 'string'
+          ? record['categories'][0] as string
+          : 'expert-all',
+      })
+    }
+    return experts
+  }
+
+  /**
+   * Send one real chat turn in the desktop app's shape and read the SERVER's
+   * request id out of the SSE stream.
+   *
+   * The expert/skill tasks are scored on events that JOIN a real conversation,
+   * and the join key must be the id the server minted — a locally generated
+   * UUID does not count. So this streams (and drains) the answer just far
+   * enough to capture `data.id`, then stops caring about the content.
+   */
+  async desktopChatTurn(
+    credential: WorkBuddyCredential,
+    options: { expertId?: string; model?: string; prompt?: string } = {},
+  ): Promise<{ conversationId: string; requestId: string }> {
+    const conversationId = 'wb2api-conv-' + String(Date.now()) + '-' + Math.floor(Math.random() * 1e6).toString(36)
+    const model = options.model ?? 'fast-model'
+    const response = await fetch(chatBase(credential) + '/v2/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + credential.accessToken,
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+        'User-Agent': DESKTOP_UA,
+        'X-Domain': chatBase(credential),
+        'X-Product': 'SaaS',
+        'X-User-Id': credential.uid,
+        'X-Conversation-ID': conversationId,
+        'X-Request-ID': String(Date.now()),
+        'X-Agent-Intent': 'craft',
+        'X-Agent-Type': 'main',
+        'X-IDE-Name': 'WorkBuddy',
+        'X-IDE-Type': 'WorkBuddy',
+        'X-IDE-Version': '5.5.6',
+        'x-codebuddy-request': '1',
+        ...options.expertId === undefined || options.expertId === '' ? {} : { 'X-Expert-Id': options.expertId },
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: 'You are a helpful assistant. 当前处于中文环境，使用简体中文回答。' },
+          { role: 'user', content: options.prompt ?? '1+1等于几？直接回答。' },
+        ],
+        agent: 'cli',
+        temperature: 1,
+        stream: true,
+        stream_options: { include_usage: true },
+      }),
+      signal: AbortSignal.timeout(CHAT_TURN_TIMEOUT_MS),
+    })
+    if (!response.ok) {
+      const text = (await response.text()).slice(0, 200)
+      throw new Error('workbuddy desktop chat: http ' + String(response.status) + ' ' + text)
+    }
+    const requestId = await readServerRequestId(response)
+    if (requestId === undefined) {
+      throw new Error('workbuddy desktop chat: the stream carried no server request id')
+    }
+    return { conversationId, requestId }
+  }
+
+  /** Claim the one-off newcomer gift. Re-claiming answers a business error. */
+  async claimGift(credential: WorkBuddyCredential): Promise<number> {
+    const envelope = await this.billingJson(credential, '/billing/meter/claim-gift', {})
+    const data = typeof envelope.data === 'object' && envelope.data !== null
+      ? envelope.data as Record<string, unknown>
+      : {}
+    return typeof data['credit'] === 'number' ? data['credit'] as number : 0
+  }
+
+  /** Agree to the buddy programme terms. Idempotent. */
+  async buddyAgreement(credential: WorkBuddyCredential): Promise<void> {
+    await this.growthJson(credential, 'POST', '/activity/growth/buddy/agreement', { agree: true })
+  }
+
+  /**
+   * Adopt the first buddy. Before the daily-activity threshold is met the
+   * gateway answers HTTP 400 with `first_buddy task not completed yet`; that is
+   * an expected "not yet", not a failure, so it is reported as such.
+   */
+  async buddyFirst(credential: WorkBuddyCredential): Promise<{ adopted: boolean; message: string }> {
+    try {
+      await this.growthJson(credential, 'POST', '/activity/growth/buddy/first', {})
+      return { adopted: true, message: '已领取 Buddy（+300 分 +8 能量）' }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (message.toLowerCase().includes('first_buddy task not completed yet')) {
+        return { adopted: false, message: '前置已上报，但领养门槛未过（上游要求当日活跃），稍后会自动重试' }
+      }
+      throw error
+    }
+  }
+
+  /** One POST to the growth domain, envelope unwrapped. */
+  private async growthJson(
+    credential: WorkBuddyCredential,
+    method: 'GET' | 'POST',
+    path: string,
+    body: unknown,
+  ): Promise<Record<string, unknown>> {
+    const response = await fetch(chatBase(credential) + path, {
+      method,
+      headers: { ...billingHeaders(credential), 'Content-Type': 'application/json' },
+      ...body === undefined ? {} : { body: JSON.stringify(body) },
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    return typeof envelope.data === 'object' && envelope.data !== null
+      ? envelope.data as Record<string, unknown>
+      : {}
+  }
+
+  /** One POST to the billing domain, envelope unwrapped. */
+  private async billingJson(
+    credential: WorkBuddyCredential,
+    path: string,
+    body: unknown,
+  ): Promise<{ data: unknown }> {
+    const response = await fetch(billingBase(credential) + path, {
+      method: 'POST',
+      headers: { ...billingHeaders(credential), 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    return { data: envelope.data }
   }
 }

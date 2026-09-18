@@ -646,6 +646,15 @@ declare function selectCliModels(rawModels: unknown, agents: unknown): WorkBuddy
  * carries a real value.
  */
 declare function parseUpstreamTask(value: unknown): WorkBuddyTask | undefined;
+/** One expert from the platform market; ids must be real to count. */
+interface WorkBuddyMarketExpert {
+  expertId: string;
+  expertType: string;
+  name: string;
+  profession: string;
+  version: string;
+  category: string;
+}
 /** One growth task as the upstream returns it, progress already normalized. */
 interface WorkBuddyTask {
   taskCode: string;
@@ -760,6 +769,46 @@ declare class WorkBuddyUpstreamClient {
    * the desktop one mimics the app, and the web one mimics the growth centre.
    */
   private reportEvents;
+  /**
+   * Read the platform's real expert market. The ids must be REAL: an invented
+   * expert id never counts toward the expert tasks, which is why the market is
+   * listed instead of hard-coding names.
+   */
+  marketExpertList(credential: WorkBuddyCredential, expertType: 'agent' | 'team'): Promise<WorkBuddyMarketExpert[]>;
+  /**
+   * Send one real chat turn in the desktop app's shape and read the SERVER's
+   * request id out of the SSE stream.
+   *
+   * The expert/skill tasks are scored on events that JOIN a real conversation,
+   * and the join key must be the id the server minted — a locally generated
+   * UUID does not count. So this streams (and drains) the answer just far
+   * enough to capture `data.id`, then stops caring about the content.
+   */
+  desktopChatTurn(credential: WorkBuddyCredential, options?: {
+    expertId?: string;
+    model?: string;
+    prompt?: string;
+  }): Promise<{
+    conversationId: string;
+    requestId: string;
+  }>;
+  /** Claim the one-off newcomer gift. Re-claiming answers a business error. */
+  claimGift(credential: WorkBuddyCredential): Promise<number>;
+  /** Agree to the buddy programme terms. Idempotent. */
+  buddyAgreement(credential: WorkBuddyCredential): Promise<void>;
+  /**
+   * Adopt the first buddy. Before the daily-activity threshold is met the
+   * gateway answers HTTP 400 with `first_buddy task not completed yet`; that is
+   * an expected "not yet", not a failure, so it is reported as such.
+   */
+  buddyFirst(credential: WorkBuddyCredential): Promise<{
+    adopted: boolean;
+    message: string;
+  }>;
+  /** One POST to the growth domain, envelope unwrapped. */
+  private growthJson;
+  /** One POST to the billing domain, envelope unwrapped. */
+  private billingJson;
 }
 //#endregion
 //#region src/pool.d.ts
@@ -1017,7 +1066,7 @@ declare class WorkBuddyAccountPool {
 //#endregion
 //#region src/tasks.d.ts
 /** The subset of the upstream client the task engine uses. */
-type WorkBuddyTaskClient = Pick<WorkBuddyUpstreamClient, 'listTasks' | 'acceptTasks' | 'claimTaskReward' | 'reportChatActivity' | 'reportDesktopEvents' | 'reportWebEvents'>;
+type WorkBuddyTaskClient = Pick<WorkBuddyUpstreamClient, 'listTasks' | 'acceptTasks' | 'claimTaskReward' | 'reportChatActivity' | 'reportDesktopEvents' | 'reportWebEvents' | 'marketExpertList' | 'desktopChatTurn' | 'claimGift' | 'buddyAgreement' | 'buddyFirst'>;
 /** How one action finished. */
 type WorkBuddyTaskOutcome = 'done' | 'skipped' | 'error' | 'unsupported';
 /** One action's result, as the card renders it. */

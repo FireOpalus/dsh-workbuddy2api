@@ -2,7 +2,7 @@
   "name": "dsh-workbuddy2api",
   "displayName": "DSH WorkBuddy2API",
   "description": "用多个 WorkBuddy 账号（网页登录或本机桌面端）组成两个独立账号池（国内版 / 国际版）：加权轮换、会话粘性、冷却熔断、换号重试，并每天自动完成成长任务。",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "author": "Boiser",
   "copyright": "Copyright (c) 2026 dsh-wb2api",
   "license": "MIT",

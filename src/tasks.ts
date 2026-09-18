@@ -19,18 +19,23 @@
  *      由 DSH 宿主进程的存活期决定，不再有独立网关进程；
  *   2. 每个动作声明自己需要的**前置条件**（例如某个任务的进度必须先达标），
  *      执行器按依赖顺序跑，跳过不满足的动作而不是发一条注定不计分的请求；
- *   3. 只做纯 API 可点亮、且不需要真实客户端交互的动作子集，其余任务在卡片里
- *      如实标注「需要客户端内操作」，不做无法验证的尝试。
+ *   3. **动作表对齐参考实现的全部可自动化任务**（17 个）：包括需要真实对话的那几个
+ *      （专家召唤+使用、skill_info、指定模型对话、夜猫子），它们同样只需 API ——
+ *      真实对话由本插件自己发，事件的 requestId 取**服务端返回的那个**；
+ *      只有「需要真实付款」和「需要打扰第三方」的两个任务不做。
  *
  * @module dsh-workbuddy2api/tasks
  */
 
 import type { WorkBuddyCredential } from './auth.ts'
-import type { WorkBuddyTask, WorkBuddyRegion, WorkBuddyUpstreamClient } from './upstream.ts'
+import type { WorkBuddyMarketExpert, WorkBuddyTask, WorkBuddyRegion, WorkBuddyUpstreamClient } from './upstream.ts'
+import { isNightWindow } from './upstream.ts'
 
 /** The subset of the upstream client the task engine uses. */
 export type WorkBuddyTaskClient = Pick<WorkBuddyUpstreamClient,
-  'listTasks' | 'acceptTasks' | 'claimTaskReward' | 'reportChatActivity' | 'reportDesktopEvents' | 'reportWebEvents'>
+  | 'listTasks' | 'acceptTasks' | 'claimTaskReward'
+  | 'reportChatActivity' | 'reportDesktopEvents' | 'reportWebEvents'
+  | 'marketExpertList' | 'desktopChatTurn' | 'claimGift' | 'buddyAgreement' | 'buddyFirst'>
 
 /** How one action finished. */
 export type WorkBuddyTaskOutcome = 'done' | 'skipped' | 'error' | 'unsupported'
@@ -70,16 +75,31 @@ export interface WorkBuddyTaskView {
   /** Why it is not automated, when it is not. */
   unsupportedReason?: string
 }
+/** What an action reports back: a note, optionally declaring it did nothing. */
+export type WorkBuddyTaskActionOutcome = string | { message: string; skipped: true }
+
 /** One automated action. */
-interface WorkBuddyTaskAction {
+export interface WorkBuddyTaskAction {
   taskCode: string
   /** What the action does (shown before it runs). */
   desc: string
   /**
-   * The behavior that scores the task. Returning a string reports a
-   * non-fatal note; throwing means the action failed.
+   * The behavior that scores the task.
+   *
+   * Returning a string reports work done; returning `{skipped: true}` states
+   * that nothing was attempted and why (a closed scoring window, a threshold
+   * that is not met yet) — the two must not be conflated, or the card would
+   * claim credit for a task that was never even reported. Throwing means the
+   * action failed.
    */
-  run(client: WorkBuddyTaskClient, credential: WorkBuddyCredential): Promise<string>
+  run(client: WorkBuddyTaskClient, credential: WorkBuddyCredential): Promise<WorkBuddyTaskActionOutcome>
+}
+
+/** Split an action's answer into the note and whether it actually did work. */
+function readOutcome(outcome: WorkBuddyTaskActionOutcome): { message: string; skipped: boolean } {
+  return typeof outcome === 'string'
+    ? { message: outcome, skipped: false }
+    : { message: outcome.message, skipped: true }
 }
 
 /** The desktop app's event chain for one successful conversation. */
@@ -322,7 +342,233 @@ const ACTIONS: readonly WorkBuddyTaskAction[] = [
       return '已上报皮肤生效事件'
     },
   },
+  {
+    taskCode: 'first_buddy',
+    desc: '活跃上报 → 同意协议 → 领取第一只 Buddy',
+    run: async (client, credential) => {
+      // The adoption threshold is "active today", so the activity report comes
+      // first; without it `buddy/first` answers "task not completed yet".
+      await client.reportChatActivity(credential, runId('wb2api-adopt'), '')
+      await delay(REPORT_GAP_MS)
+      await client.buddyAgreement(credential)
+      const adopted = await client.buddyFirst(credential)
+      return adopted.message
+    },
+  },
+  {
+    taskCode: 'Model_chat_GLM5.2',
+    desc: '真实 glm-5.2 对话一次 + 对齐模型的上报',
+    run: async (client, credential) => {
+      // A REAL turn (the gateway scores the conversation, not the report), then
+      // a report whose model fields match what was actually used.
+      await client.desktopChatTurn(credential, { model: NIGHT_MODEL.id })
+      await delay(REPORT_GAP_MS)
+      await client.reportChatActivity(credential, runId('wb2api-glm52'), '', NIGHT_MODEL)
+      return '已完成 glm-5.2 对话并上报'
+    },
+  },
+  expertBatchAction('expert_5', '召唤并使用 5 位平台专家（真实列表 + 真实对话）', 'agent', 5),
+  expertBatchAction('Expert_team_use_3', '召唤并使用 3 个专家团（真实列表 + 真实对话）', 'team', 3),
+  {
+    taskCode: 'skill_1',
+    desc: '真实对话 + skill_info 技能加载事件',
+    run: async (client, credential) => {
+      const turn = await client.desktopChatTurn(credential, {})
+      const messageId = 'msg-' + turn.requestId.slice(-8)
+      const events = chatSequence(turn.conversationId, turn.requestId, messageId, 'fast-model', 'fast-model')
+      for (const event of events) {
+        // The task's own criterion: the turn ended by loading a skill.
+        if (event['eventCode'] === 'chat_message_response') event['finishReason'] = 'tool_calls'
+      }
+      events.push({
+        eventCode: 'skill_info',
+        id: '润泽小馆·日报撰写',
+        skillId: 'skill_2097350077599879168',
+        skillVersion: '1.0.0',
+        toolStatus: 'success',
+        fileCount: 56,
+        source: 'workbuddy-desktop',
+        conversationId: turn.conversationId,
+        requestId: turn.requestId,
+        messageId,
+        requestModelId: 'fast-model',
+        requestModelName: 'fast-model',
+        traceId: turn.requestId,
+      })
+      await client.reportDesktopEvents(credential, events)
+      return '已上报真实对话 + skill_info 技能加载事件'
+    },
+  },
+  {
+    taskCode: 'Expert_lighthouse',
+    desc: '腾讯轻量云专家：召唤链 + 真实对话（mode=LOCAL）',
+    run: async (client, credential) => {
+      // Prefer the market's own record for this expert (its version is the
+      // server's); fall back to the known id when it is not on page one.
+      let expert: WorkBuddyMarketExpert = {
+        expertId: LIGHTHOUSE_EXPERT_ID, expertType: 'agent',
+        name: '腾讯轻量云专家', profession: '腾讯轻量云专家', version: '1.0.2', category: 'expert-all',
+      }
+      try {
+        const found = (await client.marketExpertList(credential, 'agent'))
+          .find(entry => entry.expertId === LIGHTHOUSE_EXPERT_ID)
+        if (found !== undefined) expert = found
+      } catch {
+        // The market is an optimisation here, not a requirement.
+      }
+      await client.reportDesktopEvents(credential, expertSummonSequence(expert))
+      const turn = await client.desktopChatTurn(credential, { expertId: expert.expertId })
+      const events = chatSequence(
+        turn.conversationId,
+        turn.requestId,
+        'msg-' + turn.requestId.slice(-8),
+        'fast-model',
+        'fast-model',
+      )
+      for (const event of events) {
+        // The real sample this criterion came from carries the expert on the
+        // task-created event, and its use event is LOCAL with no cost.
+        if (event['eventCode'] === 'agent_task_created') {
+          event['has_expert'] = true
+          event['expert_id'] = expert.expertId
+          event['expert_name'] = expert.name
+          event['expert_industry_id'] = ''
+        }
+      }
+      const use = expertActualUse(expert, turn.conversationId, turn.requestId, 'LOCAL')
+      use['type'] = ''
+      use['cost'] = 0
+      events.push(use)
+      await client.reportDesktopEvents(credential, events)
+      return '已上报轻量云专家召唤+使用链（真实对话 requestId）'
+    },
+  },
+  {
+    taskCode: 'black_cat',
+    desc: '夜间窗口内补足 glm-5.2 真实对话（23:00–08:00）',
+    run: async (client, credential) => {
+      // Outside the window the behavior is not scored at all, so a sweep that
+      // runs at 00:05 must say so rather than burn three real conversations.
+      if (!isNightWindow()) {
+        return { skipped: true, message: '当前不在 23:00–08:00 计数窗口，本轮不做（发了也不计分）' }
+      }
+      const tasks = await client.listTasks(credential)
+      const task = tasks.find(entry => entry.taskCode === 'black_cat')
+      const need = task === undefined || task.target <= 0 ? 0 : Math.max(task.target - task.current, 0)
+      if (need === 0) return '进度已达标，无需补足'
+      let done = 0
+      for (let index = 0; index < need; index += 1) {
+        await client.desktopChatTurn(credential, { model: NIGHT_MODEL.id })
+        await client.reportChatActivity(credential, runId('wb2api-night-' + String(index)), '', NIGHT_MODEL)
+        done += 1
+        if (index < need - 1) await delay(4_000)
+      }
+      return '已完成 ' + String(done) + ' 次夜间对话并上报'
+    },
+  },
 ]
+
+
+/** The event pair that scores one expert: summon, then genuine use. */
+function expertSummonSequence(expert: WorkBuddyMarketExpert): Record<string, unknown>[] {
+  return [
+    {
+      eventCode: 'web_element_click', source: expert.expertId, type: expert.category, version: expert.version,
+      elementId: 'expert_summon_click', elementName: '立即召唤',
+      pageURL: '/C:/Program Files/WorkBuddy/resources/app.asar/renderer/index.html',
+    },
+    {
+      eventCode: 'expert_summon_click', id: expert.expertId, name: expert.name,
+      expertTitle: expert.profession, type: 'expert-all', position: 0,
+      expertType: expert.expertType, version: expert.version, mode: 'LOCAL',
+    },
+    {
+      eventCode: 'expert_summoned', id: expert.expertId, name: expert.name,
+      expertTitle: expert.profession, type: 'expert-all',
+    },
+  ]
+}
+
+/** The `expert_actual_use` event, joined onto a real conversation. */
+function expertActualUse(
+  expert: WorkBuddyMarketExpert,
+  conversationId: string,
+  requestId: string,
+  mode: 'craft' | 'LOCAL',
+): Record<string, unknown> {
+  return {
+    eventCode: 'expert_actual_use',
+    id: expert.expertId, name: expert.name, expertTitle: expert.profession,
+    type: expert.category, expertType: expert.expertType, source: 'builtin', version: expert.version,
+    cost: 9000, characterCount: 14,
+    conversationId, requestId, messageId: 'msg-' + requestId.slice(-8),
+    requestModelId: 'fast-model', requestModelName: 'fast-model',
+    mode,
+  }
+}
+
+/** The model the nightly task is scored with. */
+const NIGHT_MODEL = { id: 'glm-5.2', name: 'GLM-5.2' }
+
+/**
+ * The light-cloud expert `Expert_lighthouse` is scored on. The market list is
+ * preferred for its metadata, but the id is a known constant so the action
+ * still works when the expert is not on the market's first page.
+ */
+const LIGHTHOUSE_EXPERT_ID = 'ex_2cvvUZQhDyeJ'
+
+/** Gap between two real chat turns inside one chained action. */
+const EXPERT_GAP_MS = 6_000
+
+/**
+ * Summon and genuinely use `count` experts of one market type.
+ *
+ * The market is listed first because the scoring events must carry REAL expert
+ * ids — an invented id reports 200 and never scores. The chat turn is real
+ * because the use event must JOIN the server's own request id. One expert
+ * failing must not abort the batch, so failures are counted and the loop moves
+ * on: the task only needs `count` successes out of the market list.
+ */
+function expertBatchAction(
+  taskCode: string,
+  desc: string,
+  expertType: 'agent' | 'team',
+  count: number,
+): WorkBuddyTaskAction {
+  return {
+    taskCode,
+    desc,
+    run: async (client, credential) => {
+      const experts = await client.marketExpertList(credential, expertType)
+      if (experts.length === 0) throw new Error('专家市场列表为空')
+      let done = 0
+      let failed = 0
+      for (const [index, expert] of experts.entries()) {
+        if (done >= count) break
+        try {
+          await client.reportDesktopEvents(credential, expertSummonSequence(expert))
+          const turn = await client.desktopChatTurn(credential, { expertId: expert.expertId })
+          await client.reportDesktopEvents(credential, [
+            ...chatSequence(
+              turn.conversationId,
+              turn.requestId,
+              'msg-' + turn.requestId.slice(-8),
+              'fast-model',
+              'fast-model',
+            ),
+            expertActualUse(expert, turn.conversationId, turn.requestId, 'craft'),
+          ])
+          done += 1
+        } catch {
+          failed += 1
+        }
+        if (index < experts.length - 1 && done < count) await delay(EXPERT_GAP_MS)
+      }
+      if (done === 0) throw new Error('专家召唤链全部失败（' + String(failed) + ' 位）')
+      return '已对 ' + String(done) + ' 位真实专家完成召唤+使用链（' + expertType + '）'
+    },
+  }
+}
 
 /** The buddyapp entry chain, shared by the two buddy-app tasks. */
 function buddyAppSequence(): Record<string, unknown>[] {
@@ -339,17 +585,18 @@ function buddyAppSequence(): Record<string, unknown>[] {
   ]
 }
 
-/** Tasks that exist upstream but need a real client interaction to score. */
+/**
+ * Tasks the upstream offers but that this plugin does NOT automate, each with
+ * the reason the card shows.
+ *
+ * The bar for an entry here is "no API path exists", not "the API path is
+ * involved": every other task is scored on behavior that can be reported, even
+ * when that means a real chat turn. Only the two below genuinely cannot be
+ * driven from here.
+ */
 const CLIENT_ONLY: Readonly<Record<string, string>> = {
-  first_buddy: '需要先有当日活跃记录并同意领养协议，属客户端交互',
-  'Model_chat_GLM5.2': '需要在客户端里用指定模型真实对话',
-  expert_5: '需要在专家市场召唤并使用 5 位真实专家',
-  Expert_team_use_3: '需要在专家市场召唤并使用 3 个专家团',
-  Expert_lighthouse: '需要连接器授权与真实专家会话',
-  Expert_Philanthropy: '需要真实捐款',
-  skill_1: '需要真实 Skill 工具调用',
-  black_cat: '仅 23:00–08:00 窗口内计数，且需真实夜间对话',
-  share_invite: '需要分享邀请链接',
+  Expert_Philanthropy: '需要真实捐款（涉及真实支付，插件不会代做）',
+  share_invite: '需要把邀请链接分享给他人（插件不代替用户打扰别人）',
 }
 
 /** Gap between two reported events, matching the reference's measured pace. */
@@ -503,11 +750,19 @@ export class WorkBuddyTaskEngine {
         results.push({ ...item, outcome: 'skipped', message: '已完成（' + progressText(before) + '）' })
         continue
       }
+      let skipped = false
       try {
-        const note = await action.run(this.options.client, credential)
-        item.message = note
+        const answer = readOutcome(await action.run(this.options.client, credential))
+        item.message = answer.message
+        skipped = answer.skipped
       } catch (error: unknown) {
         results.push({ ...item, outcome: 'error', message: messageOf(error) })
+        continue
+      }
+      if (skipped) {
+        // Nothing was reported, so there is nothing to wait for and nothing to
+        // claim: saying "done" here would be a false record of what happened.
+        results.push({ ...item, outcome: 'skipped' })
         continue
       }
       // Reporting is not scoring: the gateway scores asynchronously, so the
