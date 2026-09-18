@@ -63,6 +63,8 @@ import {
   WorkBuddyTaskEngine,
   WorkBuddyTaskScheduler,
 } from './tasks.ts'
+import { clearPoolState, readPoolState, writePoolState } from './pool-state.ts'
+import type { WorkBuddyPoolCounterRecord, WorkBuddyPoolStateDocument } from './pool-state.ts'
 import type { WorkBuddyTaskSchedule, WorkBuddyTaskScheduleStatus } from './tasks.ts'
 import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
 
@@ -141,6 +143,17 @@ export {
   type WorkBuddyRegion,
   type WorkBuddyUpstreamModel,
 } from './upstream.ts'
+export {
+  clearPoolState,
+  parsePoolCounterRecord,
+  readPoolState,
+  writePoolState,
+  workbuddyPoolStatePath,
+  WORKBUDDY2API_POOL_STATE_FILENAME,
+  WORKBUDDY2API_POOL_STATE_VERSION,
+  type WorkBuddyPoolCounterRecord,
+  type WorkBuddyPoolStateDocument,
+} from './pool-state.ts'
 export {
   automatedTaskCodes,
   DEFAULT_WORKBUDDY_TASK_SCHEDULE,
@@ -393,6 +406,13 @@ export const Config: z<Config> = z.object({
 /** Every region, in card tab order. */
 export const REGION_KEYS: readonly WorkBuddyRegion[] = ['cn', 'global']
 
+/**
+ * How long counter writes are coalesced. Every dispatch bumps a counter, and a
+ * file rewrite per request would be pointless churn; the loss window this opens
+ * is one debounce interval of *statistics*, never credentials or schedules.
+ */
+const COUNTER_PERSIST_DEBOUNCE_MS = 2_000
+
 /** One region's saved state, or an empty state when it was never configured. */
 export function regionStateOf(config: Config, region: WorkBuddyRegion): WorkBuddyRegionState {
   return config.regions?.[region] ?? {}
@@ -485,7 +505,15 @@ export function apply(ctx: Context, config: Config): void {
       ...regionStateOf(config, region).poolState === undefined ? {} : { state: regionStateOf(config, region).poolState },
       policy: resolvePolicy(regionStateOf(config, region).pool),
     })
-    const shim = createWorkBuddyShim({ store, pool, client, catalog, logger: ctx.logger })
+    const shim = createWorkBuddyShim({
+      store,
+      pool,
+      client,
+      catalog,
+      logger: ctx.logger,
+      // Every dispatch moves a counter; the host coalesces those into one write.
+      onDispatch: () => { schedulePersist() },
+    })
     stacks[region] = { store, pool, catalog, shim }
   }
 
@@ -561,6 +589,50 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
+   * Durable counters.
+   *
+   * The pool's dispatch totals and cached credits are RUNTIME facts, so they live
+   * in a host-owned file rather than in DSH settings: settings is the user's
+   * configuration and is written by the card under revision checks, so two
+   * writers on one document would clobber each other (and a card save would wipe
+   * whatever the host had just recorded).
+   *
+   * Reads happen once at startup, after the first pool refresh so only accounts
+   * that still exist receive their counters. Writes are debounced: a busy pool
+   * updates a counter on every dispatch, and rewriting a file per request would
+   * be absurd.
+   */
+  let countersLoaded = false
+  const counters: WorkBuddyPoolStateDocument = { version: 1, regions: {} }
+  let persistTimer: ReturnType<typeof setTimeout> | undefined
+
+  /** Fold every region's current counters into the document and write it. */
+  const persistCounters = async (): Promise<void> => {
+    for (const region of REGION_KEYS) {
+      const records = [...stacks[region].pool.toCounters().values()]
+      // Drop accounts the pool no longer knows: their counters are for a
+      // credential that is gone, and keeping them would grow the file forever.
+      const live = new Set(stacks[region].pool.snapshot().map(entry => entry.accountId))
+      counters.regions[region] = records.filter(record => live.has(record.accountId))
+    }
+    try {
+      await writePoolState(counters)
+    } catch (error: unknown) {
+      ctx.logger.warn('dsh-workbuddy2api: pool counters could not be saved', error)
+    }
+  }
+
+  /** Persist soon, coalescing a burst of dispatches into one write. */
+  const schedulePersist = (): void => {
+    if (!countersLoaded) return
+    if (persistTimer !== undefined) return
+    persistTimer = setTimeout(() => {
+      persistTimer = undefined
+      void persistCounters()
+    }, COUNTER_PERSIST_DEBOUNCE_MS)
+  }
+
+  /**
    * Browser sign-in. Signing in through the card is the multi-account story:
    * the upstream has no public multi-account API, so an account that is not
    * already signed in on this machine could previously only be added by
@@ -597,6 +669,7 @@ export function apply(ctx: Context, config: Config): void {
           expiringSoon: credits.expiringSoon,
           capacity: credits.capacity,
         })
+        schedulePersist()
         // Today's check-in is a separate endpoint and never fatal: the account
         // is already signed in and usable either way.
         try {
@@ -681,6 +754,8 @@ export function apply(ctx: Context, config: Config): void {
         expiringSoon: credits.expiringSoon,
         capacity: credits.capacity,
       })
+      // The cached credits are part of the durable counters.
+      schedulePersist()
       return credits
     },
     login,
@@ -708,6 +783,12 @@ export function apply(ctx: Context, config: Config): void {
   let stopped = false
   ctx.effect(() => () => {
     stopped = true
+    if (persistTimer !== undefined) {
+      // A pending debounce would otherwise be lost with the counters in it.
+      clearTimeout(persistTimer)
+      persistTimer = undefined
+      void persistCounters()
+    }
     taskScheduler.dispose()
     login.dispose()
     for (const region of REGION_KEYS) {
@@ -802,6 +883,28 @@ export function apply(ctx: Context, config: Config): void {
           }
         }
         void writeHostHeartbeat(accounts)
+
+        // Restore the durable counters only AFTER the first refresh, so a counter
+        // is applied to an entry that exists now: an account whose credential
+        // disappeared meanwhile keeps no stale totals, and a record for an
+        // unknown account is ignored instead of resurrecting a phantom entry.
+        try {
+          const document = await readPoolState()
+          for (const region of REGION_KEYS) {
+            const records: readonly WorkBuddyPoolCounterRecord[] = document.regions[region] ?? []
+            if (records.length > 0) stacks[region].pool.restoreCounters(records)
+          }
+          for (const region of REGION_KEYS) {
+            counters.regions[region] = [...stacks[region].pool.toCounters().values()]
+          }
+          countersLoaded = true
+          ctx.logger.info('dsh-workbuddy2api: account counters restored')
+        } catch (error: unknown) {
+          // A counter file that cannot be read is not fatal: the pool simply
+          // starts from zero, exactly as it did before persistence existed.
+          countersLoaded = true
+          ctx.logger.warn('dsh-workbuddy2api: pool counters could not be restored', error)
+        }
       })()
 
       // Seed each region's catalog from that region's own accounts.

@@ -28,9 +28,11 @@
 
 import { createHash } from 'node:crypto'
 import type { WorkBuddyPoolPolicy, WorkBuddyPoolStateRecord } from './status-paths.ts'
+import type { WorkBuddyPoolCounterRecord } from './pool-state.ts'
 import type { UpstreamErrorKind, WorkBuddyRegion } from './upstream.ts'
 
 export type { WorkBuddyPoolPolicy, WorkBuddyPoolStateRecord } from './status-paths.ts'
+export type { WorkBuddyPoolCounterRecord } from './pool-state.ts'
 
 /** One account as the credential store sees it. */
 export interface WorkBuddyPoolAccount {
@@ -776,6 +778,79 @@ export class WorkBuddyAccountPool {
     entry.breakerTrips = 0
     entry.degradedUntil = 0
     entry.consecutiveFails = 0
+  }
+
+  /**
+   * The durable counters for every entry, keyed by account id.
+   *
+   * `inFlight` is NOT included on purpose: after a restart nothing is in flight,
+   * so restoring a count that no `release()` will ever decrement would consume
+   * that account's concurrency allowance for the life of the process.
+   */
+  toCounters(): Map<string, WorkBuddyPoolCounterRecord> {
+    const out = new Map<string, WorkBuddyPoolCounterRecord>()
+    for (const entry of this.entries.values()) {
+      out.set(entry.accountId, {
+        accountId: entry.accountId,
+        successes: entry.successes,
+        failures: entry.failures,
+        usedSeq: entry.usedSeq,
+        ...entry.lastUsedAt === 0 ? {} : { lastUsedAt: entry.lastUsedAt },
+        ...entry.lastSuccessAt === 0 ? {} : { lastSuccessAt: entry.lastSuccessAt },
+        ...entry.lastErrorAt === 0 ? {} : { lastErrorAt: entry.lastErrorAt },
+        ...entry.lastError === '' ? {} : { lastError: entry.lastError },
+        ...entry.credits === undefined ? {} : { credits: entry.credits },
+        ...entry.creditsExpiring === 0 ? {} : { creditsExpiringSoon: entry.creditsExpiring },
+        ...entry.creditsCapacity === 0 ? {} : { creditsCapacity: entry.creditsCapacity },
+        ...entry.creditsAtMs === 0 ? {} : { creditsAtMs: entry.creditsAtMs },
+        softStreak: entry.softStreak,
+        breakerFails: entry.breakerFails,
+        breakerTrips: entry.breakerTrips,
+        consecutiveFails: entry.consecutiveFails,
+      })
+    }
+    return out
+  }
+
+  /**
+   * Merge previously saved counters into the entries that exist NOW.
+   *
+   * Applied after the first {@link refresh}, so an account whose credential
+   * disappeared meanwhile simply does not receive its counters — and a record
+   * for an account this pool never loaded is ignored rather than resurrecting a
+   * phantom entry.
+   *
+   * Cumulative totals and the escalation counters are restored as-is. The
+   * `inFlight` slot is not touched (see {@link toCounters}), and cooldown
+   * deadlines are NOT taken from here: those live in settings, where a stale
+   * timestamp cannot outlive the process that wrote it.
+   */
+  restoreCounters(records: Iterable<WorkBuddyPoolCounterRecord>): void {
+    for (const record of records) {
+      const entry = this.entries.get(record.accountId)
+      if (entry === undefined) continue
+      if (record.successes !== undefined) entry.successes = record.successes
+      if (record.failures !== undefined) entry.failures = record.failures
+      if (record.usedSeq !== undefined) entry.usedSeq = record.usedSeq
+      if (record.lastUsedAt !== undefined) entry.lastUsedAt = record.lastUsedAt
+      if (record.lastSuccessAt !== undefined) entry.lastSuccessAt = record.lastSuccessAt
+      if (record.lastErrorAt !== undefined) entry.lastErrorAt = record.lastErrorAt
+      if (record.lastError !== undefined) entry.lastError = record.lastError
+      if (record.credits !== undefined) entry.credits = record.credits
+      if (record.creditsExpiringSoon !== undefined) entry.creditsExpiring = record.creditsExpiringSoon
+      if (record.creditsCapacity !== undefined) entry.creditsCapacity = record.creditsCapacity
+      if (record.creditsAtMs !== undefined) entry.creditsAtMs = record.creditsAtMs
+      if (record.softStreak !== undefined) entry.softStreak = record.softStreak
+      if (record.breakerFails !== undefined) entry.breakerFails = record.breakerFails
+      if (record.breakerTrips !== undefined) entry.breakerTrips = record.breakerTrips
+      if (record.consecutiveFails !== undefined) entry.consecutiveFails = record.consecutiveFails
+    }
+    // The LRU sequence must keep increasing across a restart: a restored seq
+    // higher than the fresh counter would make every new dispatch look "older"
+    // than the restored ones and invert the least-recently-used ordering.
+    for (const entry of this.entries.values()) {
+      if (entry.usedSeq > this.seq) this.seq = entry.usedSeq
+    }
   }
 
   /** The pool slice to persist into settings. */

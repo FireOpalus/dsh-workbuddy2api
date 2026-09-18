@@ -57,6 +57,12 @@ export interface WorkBuddyShimOptions {
   logger?: ShimLogger
   /** Maximum upstream attempts for one chat request (account switches included). */
   maxAttempts?: number
+  /**
+   * Called after every dispatch is reported to the pool, so the host can persist
+   * the counters that just changed. The shim itself knows nothing about files:
+   * it only says "the pool state moved".
+   */
+  onDispatch?(): void
 }
 
 const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
@@ -169,6 +175,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
  */
 export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShim {
   const { store, pool, client, catalog } = options
+  const onDispatch = options.onDispatch
   const logger = options.logger
   const maxAttempts = Math.max(1, options.maxAttempts ?? 3)
 
@@ -298,6 +305,8 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         credential = await store.resolve(accountId)
       } catch (error: unknown) {
         pool.report(accountId, { ok: false, kind: 'session_dead', message: String(error) })
+        // The counters just moved (a failure was recorded); let the host persist.
+        options.onDispatch?.()
         lastFailure = { status: 401, kind: 'session_dead', message: String(error) }
         pool.release(accountId)
         continue
@@ -310,6 +319,8 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       }
       if (result.ok) {
         pool.report(accountId, { ok: true }, stickyKey)
+        // Counters moved (a success, and possibly a sticky renewal).
+        onDispatch?.()
         if (controller.signal.aborted) {
           result.response.body?.cancel().catch(() => {})
           return
@@ -341,6 +352,8 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         ...result.status === 0 ? {} : { kind: result.kind },
         message: result.message,
       })
+      // Counters moved (a failure, and possibly a cooldown/breaker transition).
+      onDispatch?.()
       lastFailure = { status: KIND_STATUS[result.kind], kind: result.kind, message: result.message }
       if (!RETRYABLE.has(result.kind) || controller.signal.aborted) break
       logger?.warn(

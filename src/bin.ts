@@ -28,6 +28,7 @@ import { WorkBuddyUpstreamClient } from './upstream.ts'
 import type { WorkBuddyRegion } from './upstream.ts'
 import { WORKBUDDY2API_VERSION } from './version.ts'
 import { isHeartbeatProcessAlive, readHostHeartbeat, workbuddyHostHeartbeatPath } from './host-heartbeat.ts'
+import { clearPoolState, readPoolState, workbuddyPoolStatePath } from './pool-state.ts'
 
 type Action = 'doctor' | 'logout' | 'pool' | 'status'
 
@@ -80,6 +81,31 @@ async function doctor(jsonOutput: boolean): Promise<number> {
   const anyStore = new WorkBuddyCredentialStore({ refresh: credential => client.refreshToken(credential) })
   const desktopPresent = await anyStore.desktopFilePresent()
   const heartbeat = await readHostHeartbeat()
+  const counterDocument = await readPoolState()
+  /**
+   * What is actually on disk. `readPoolState` answers an EMPTY document for a
+   * missing or foreign file, so "present" has to mean "has records", not "the
+   * read returned something" — otherwise a fresh install reports its counters as
+   * saved when there is no file at all.
+   */
+  const counterSummary = (): {
+    path: string
+    present: boolean
+    accounts: { accountId: string; successes: number; failures: number; credits?: number; creditsAt?: string }[]
+  } => {
+    const records = Object.values(counterDocument.regions).flatMap(entries => entries ?? [])
+    return {
+      path: workbuddyPoolStatePath(),
+      present: records.length > 0,
+      accounts: records.map(record => ({
+        accountId: record.accountId,
+        successes: record.successes ?? 0,
+        failures: record.failures ?? 0,
+        ...record.credits === undefined ? {} : { credits: record.credits },
+        ...record.creditsAtMs === undefined ? {} : { creditsAt: new Date(record.creditsAtMs).toISOString() },
+      })),
+    }
+  }
   const hostAlive = heartbeat !== undefined && isHeartbeatProcessAlive(heartbeat)
   const regionLists = await Promise.all(REGIONS.map(async region => {
     try {
@@ -120,6 +146,9 @@ async function doctor(jsonOutput: boolean): Promise<number> {
       fallbackModels: fallbackModelsFor(region).length,
     }])),
     poolPolicy: DEFAULT_WORKBUDDY_POOL_POLICY,
+    // The durable counters live in their own file; report whether it is there so
+    // "my counters reset" is answerable without guessing.
+    poolCounters: counterSummary(),
     hints: [
       ...totalAccounts > 0 ? [] : ['Sign in once in the WorkBuddy desktop app (either region), then run status again.'],
       ...desktopPresent ? [] : [`No WorkBuddy desktop auth file at the expected path; set ${WORKBUDDY_AUTH_FILE_ENV} if it lives elsewhere.`],
@@ -133,6 +162,7 @@ async function doctor(jsonOutput: boolean): Promise<number> {
       `WorkBuddy2API ${WORKBUDDY2API_VERSION} on ${process.version}`,
       `Desktop auth file: ${desktopPresent ? 'present' : 'missing'} (${report.desktopAuthFile.path})`,
       `Host bundle: ${hostAlive ? `running (pid ${heartbeat?.pid})` : heartbeat !== undefined ? 'stale heartbeat (process exited)' : 'not started'}`,
+      `Account counters: ${report.poolCounters.present ? `saved for ${report.poolCounters.accounts.length} account(s)` : 'none saved yet'} (${report.poolCounters.path})`,
       ...regionLists.flatMap(({ region, accounts, error }) => [
         `${REGION_LABELS[region]} — provider ${region === 'global' ? 'workbuddy2api-global' : 'workbuddy2api'}: ${accounts.length} account(s)`,
         ...error === undefined ? [] : [`  scan error: ${error}`],
@@ -284,7 +314,10 @@ export async function run(argv: readonly string[]): Promise<number> {
         // so logout must sweep it once per region to cover every account.
         const client = new WorkBuddyUpstreamClient()
         for (const region of REGIONS) await makeStore(region, client).logout()
-        process.stdout.write('WorkBuddy2API: removed the plugin-owned per-account credential copies for both regions; the desktop app\'s sign-ins are untouched\n')
+        // The counters describe credentials that were just forgotten; keeping
+        // them would attach a new account's history to a re-used account id.
+        await clearPoolState()
+        process.stdout.write('WorkBuddy2API: removed the plugin-owned per-account credential copies and their account counters for both regions; the desktop app\'s sign-ins are untouched\n')
         return 0
       }
     }

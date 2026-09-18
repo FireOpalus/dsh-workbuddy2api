@@ -811,6 +811,55 @@ declare class WorkBuddyUpstreamClient {
   private billingJson;
 }
 //#endregion
+//#region src/pool-state.d.ts
+/** Basename of the counter file inside the Harness home. */
+declare const WORKBUDDY2API_POOL_STATE_FILENAME = ".workbuddy2api-pool-state.json";
+/** Current on-disk format; readers reject others. */
+declare const WORKBUDDY2API_POOL_STATE_VERSION = 1;
+/**
+ * One account's durable counters. Every field is optional on read so an older or
+ * partial file still loads, and absent means "unknown" rather than zero.
+ */
+interface WorkBuddyPoolCounterRecord {
+  accountId: string;
+  /** Dispatches that completed successfully, lifetime. */
+  successes?: number;
+  /** Dispatches that failed, lifetime. */
+  failures?: number;
+  /** Monotonic per-account dispatch counter, the LRU tie-breaker. */
+  usedSeq?: number;
+  lastUsedAt?: number;
+  lastSuccessAt?: number;
+  lastErrorAt?: number;
+  lastError?: string;
+  /** Cached remaining credits and the allowance they are measured against. */
+  credits?: number;
+  creditsExpiringSoon?: number;
+  creditsCapacity?: number;
+  /** When the cached credits were read, so the card can show their age. */
+  creditsAtMs?: number;
+  /** Escalation state, so a backoff resumes instead of restarting. */
+  softStreak?: number;
+  breakerFails?: number;
+  breakerTrips?: number;
+  consecutiveFails?: number;
+}
+/** The whole file: counters per region, keyed by account id. */
+interface WorkBuddyPoolStateDocument {
+  version: typeof WORKBUDDY2API_POOL_STATE_VERSION;
+  regions: Partial<Record<WorkBuddyRegion, WorkBuddyPoolCounterRecord[]>>;
+}
+/** Absolute path of the counter file. */
+declare function workbuddyPoolStatePath(storeDir?: string): string;
+/** Parse one counter record, keeping only fields that carry a real value. */
+declare function parsePoolCounterRecord(value: unknown): WorkBuddyPoolCounterRecord | undefined;
+/** Read the counter document; absent, unreadable, or malformed reads as empty. */
+declare function readPoolState(storeDir?: string): Promise<WorkBuddyPoolStateDocument>;
+/** Write the counter document atomically. */
+declare function writePoolState(document: WorkBuddyPoolStateDocument, storeDir?: string): Promise<void>;
+/** Remove the counter file; used when the user forgets stored credentials. */
+declare function clearPoolState(storeDir?: string): Promise<void>;
+//#endregion
 //#region src/pool.d.ts
 /** One account as the credential store sees it. */
 interface WorkBuddyPoolAccount {
@@ -1055,6 +1104,28 @@ declare class WorkBuddyAccountPool {
   }[]): void;
   /** Forget one account's cooldown, breaker, and degrade marks. */
   reset(accountId: string): void;
+  /**
+   * The durable counters for every entry, keyed by account id.
+   *
+   * `inFlight` is NOT included on purpose: after a restart nothing is in flight,
+   * so restoring a count that no `release()` will ever decrement would consume
+   * that account's concurrency allowance for the life of the process.
+   */
+  toCounters(): Map<string, WorkBuddyPoolCounterRecord>;
+  /**
+   * Merge previously saved counters into the entries that exist NOW.
+   *
+   * Applied after the first {@link refresh}, so an account whose credential
+   * disappeared meanwhile simply does not receive its counters — and a record
+   * for an account this pool never loaded is ignored rather than resurrecting a
+   * phantom entry.
+   *
+   * Cumulative totals and the escalation counters are restored as-is. The
+   * `inFlight` slot is not touched (see {@link toCounters}), and cooldown
+   * deadlines are NOT taken from here: those live in settings, where a stale
+   * timestamp cannot outlive the process that wrote it.
+   */
+  restoreCounters(records: Iterable<WorkBuddyPoolCounterRecord>): void;
   /** The pool slice to persist into settings. */
   toPersisted(): WorkBuddyPoolStateRecord[];
   /** Live sticky-binding count, for diagnostics. */
@@ -1325,6 +1396,12 @@ interface WorkBuddyShimOptions {
   logger?: ShimLogger;
   /** Maximum upstream attempts for one chat request (account switches included). */
   maxAttempts?: number;
+  /**
+   * Called after every dispatch is reported to the pool, so the host can persist
+   * the counters that just changed. The shim itself knows nothing about files:
+   * it only says "the pool state moved".
+   */
+  onDispatch?(): void;
 }
 /**
  * Start the loopback endpoint. Requests must carry the shim's shared secret;
@@ -1713,4 +1790,4 @@ declare function resolvePolicy(configured: Partial<WorkBuddyPoolTuning> | undefi
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { Config, DEFAULT_WORKBUDDY_POOL_POLICY, DEFAULT_WORKBUDDY_TASK_SCHEDULE, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, REGION_KEYS, type UpstreamErrorKind, WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, WORKBUDDY2API_ACCOUNT_PARAM, WORKBUDDY2API_CHECKIN_PATH, WORKBUDDY2API_CREDITS_REFRESH_PATH, WORKBUDDY2API_GLOBAL_PROVIDER, WORKBUDDY2API_HOST_HEARTBEAT_FILENAME, WORKBUDDY2API_LOGIN_POLL_PATH, WORKBUDDY2API_LOGIN_START_PATH, WORKBUDDY2API_MODELS_REFRESH_PATH, WORKBUDDY2API_POOL_ACTION_PATH, WORKBUDDY2API_PROVIDER, WORKBUDDY2API_PROVIDERS, WORKBUDDY2API_PROVIDER_DISPLAY_NAME, WORKBUDDY2API_PROVIDER_DISPLAY_NAMES, WORKBUDDY2API_REGIONS, WORKBUDDY2API_REGION_PARAM, WORKBUDDY2API_SETTINGS_NS, WORKBUDDY2API_STATE_PARAM, WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY2API_USAGE_PATH, WORKBUDDY2API_VERSION, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_LOGIN_TTL_MS, type WorkBuddyAccountChoice, WorkBuddyAccountPool, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCheckinClaim, type WorkBuddyCheckinStatus, type WorkBuddyContextBudget, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredentialStoreOptions, type WorkBuddyCreditPackage, type WorkBuddyCredits, type WorkBuddyDesktopEvent, type WorkBuddyDispatchOutcome, type WorkBuddyHostHeartbeat, type WorkBuddyLoginAccount, type WorkBuddyLoginEndpoints, WorkBuddyLoginManager, type WorkBuddyLoginManagerOptions, type WorkBuddyLoginPoll, type WorkBuddyLoginStart, WorkBuddyLoginUnknownStateError, type WorkBuddyModelInfo, WorkBuddyPersistedModel, type WorkBuddyPickResult, type WorkBuddyPoolAccount, type WorkBuddyPoolEntry, type WorkBuddyPoolMissReason, type WorkBuddyPoolPolicy, type WorkBuddyPoolState, type WorkBuddyPoolStateRecord, type WorkBuddyPoolTuning, type WorkBuddyReasoning, type WorkBuddyRefreshOutcome, type WorkBuddyRegion, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, type WorkBuddyTask, type WorkBuddyTaskClient, WorkBuddyTaskEngine, type WorkBuddyTaskOutcome, type WorkBuddyTaskResult, type WorkBuddyTaskReward, type WorkBuddyTaskRunReport, type WorkBuddyTaskSchedule, type WorkBuddyTaskScheduleStatus, WorkBuddyTaskScheduler, type WorkBuddyTaskView, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyWebAccount, type WorkBuddyWebAccountCredits, type WorkBuddyWebCheckin, type WorkBuddyWebCredits, type WorkBuddyWebLogin, type WorkBuddyWebModel, type WorkBuddyWebPackage, type WorkBuddyWebPoolEntry, type WorkBuddyWebPoolPolicy, type WorkBuddyWebPoolState, type WorkBuddyWebRegion, type WorkBuddyWebUsage, apply, applyContextBudgets, authFileName, automatedTaskCodes, classifyUpstreamError, clearHostHeartbeat, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, deriveCatalog, expiryToMs, fallbackModelsFor, inject, isFresher, isHeartbeatProcessAlive, loginEndpointsFor, name, nextDailyRunAt, nextDay4Am, parseCreditMultiplier, parseReasoning, parseUpstreamModel, parseUpstreamTask, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, progressText, readHostHeartbeat, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, registerWorkBuddy2ApiStatusRoute, resolvePolicy, selectCliModels, setWorkBuddyTaskDelay, stickyKeyOf, toPersistedWorkBuddyModel, unsupportedReasonFor, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, writeHostHeartbeat };
+export { Config, DEFAULT_WORKBUDDY_POOL_POLICY, DEFAULT_WORKBUDDY_TASK_SCHEDULE, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, REGION_KEYS, type UpstreamErrorKind, WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, WORKBUDDY2API_ACCOUNT_PARAM, WORKBUDDY2API_CHECKIN_PATH, WORKBUDDY2API_CREDITS_REFRESH_PATH, WORKBUDDY2API_GLOBAL_PROVIDER, WORKBUDDY2API_HOST_HEARTBEAT_FILENAME, WORKBUDDY2API_LOGIN_POLL_PATH, WORKBUDDY2API_LOGIN_START_PATH, WORKBUDDY2API_MODELS_REFRESH_PATH, WORKBUDDY2API_POOL_ACTION_PATH, WORKBUDDY2API_POOL_STATE_FILENAME, WORKBUDDY2API_POOL_STATE_VERSION, WORKBUDDY2API_PROVIDER, WORKBUDDY2API_PROVIDERS, WORKBUDDY2API_PROVIDER_DISPLAY_NAME, WORKBUDDY2API_PROVIDER_DISPLAY_NAMES, WORKBUDDY2API_REGIONS, WORKBUDDY2API_REGION_PARAM, WORKBUDDY2API_SETTINGS_NS, WORKBUDDY2API_STATE_PARAM, WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY2API_USAGE_PATH, WORKBUDDY2API_VERSION, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_LOGIN_TTL_MS, type WorkBuddyAccountChoice, WorkBuddyAccountPool, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCheckinClaim, type WorkBuddyCheckinStatus, type WorkBuddyContextBudget, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredentialStoreOptions, type WorkBuddyCreditPackage, type WorkBuddyCredits, type WorkBuddyDesktopEvent, type WorkBuddyDispatchOutcome, type WorkBuddyHostHeartbeat, type WorkBuddyLoginAccount, type WorkBuddyLoginEndpoints, WorkBuddyLoginManager, type WorkBuddyLoginManagerOptions, type WorkBuddyLoginPoll, type WorkBuddyLoginStart, WorkBuddyLoginUnknownStateError, type WorkBuddyModelInfo, WorkBuddyPersistedModel, type WorkBuddyPickResult, type WorkBuddyPoolAccount, type WorkBuddyPoolCounterRecord, type WorkBuddyPoolEntry, type WorkBuddyPoolMissReason, type WorkBuddyPoolPolicy, type WorkBuddyPoolState, type WorkBuddyPoolStateDocument, type WorkBuddyPoolStateRecord, type WorkBuddyPoolTuning, type WorkBuddyReasoning, type WorkBuddyRefreshOutcome, type WorkBuddyRegion, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, type WorkBuddyTask, type WorkBuddyTaskClient, WorkBuddyTaskEngine, type WorkBuddyTaskOutcome, type WorkBuddyTaskResult, type WorkBuddyTaskReward, type WorkBuddyTaskRunReport, type WorkBuddyTaskSchedule, type WorkBuddyTaskScheduleStatus, WorkBuddyTaskScheduler, type WorkBuddyTaskView, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyWebAccount, type WorkBuddyWebAccountCredits, type WorkBuddyWebCheckin, type WorkBuddyWebCredits, type WorkBuddyWebLogin, type WorkBuddyWebModel, type WorkBuddyWebPackage, type WorkBuddyWebPoolEntry, type WorkBuddyWebPoolPolicy, type WorkBuddyWebPoolState, type WorkBuddyWebRegion, type WorkBuddyWebUsage, apply, applyContextBudgets, authFileName, automatedTaskCodes, classifyUpstreamError, clearHostHeartbeat, clearPoolState, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, deriveCatalog, expiryToMs, fallbackModelsFor, inject, isFresher, isHeartbeatProcessAlive, loginEndpointsFor, name, nextDailyRunAt, nextDay4Am, parseCreditMultiplier, parsePoolCounterRecord, parseReasoning, parseUpstreamModel, parseUpstreamTask, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, progressText, readHostHeartbeat, readPoolState, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, registerWorkBuddy2ApiStatusRoute, resolvePolicy, selectCliModels, setWorkBuddyTaskDelay, stickyKeyOf, toPersistedWorkBuddyModel, unsupportedReasonFor, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, workbuddyPoolStatePath, writeHostHeartbeat, writePoolState };

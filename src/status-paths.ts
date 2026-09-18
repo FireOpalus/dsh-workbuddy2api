@@ -227,6 +227,12 @@ export interface WorkBuddyPoolStateRecord {
   enabled: boolean
   weight: number
   priority: number
+  // Deliberately NOT the dispatch counters or cached credits: those are RUNTIME
+  // facts the host updates on every request, and this document is written by the
+  // CARD under settings revision checks. Two writers on one document means one
+  // clobbers the other — a card save would wipe whatever the host just recorded.
+  // The counters live in the host-owned $DSH_HOME/.workbuddy2api-pool-state.json
+  // (see pool-state.ts) and survive a restart from there.
   cooldownUntil?: number
   cooldownKind?: 'soft' | 'hard'
   cooldownCount?: number
