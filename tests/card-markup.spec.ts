@@ -41,11 +41,51 @@ function ruleFor(className: string): string | undefined {
   return styles.slice(at, styles.indexOf('}', at) + 1)
 }
 
+/** Index of the first line mentioning a class, or -1. */
+function lineOf(className: string): number {
+  const lines = card.split('\n')
+  return lines.findIndex(line => line.includes(className))
+}
+
+/**
+ * Whether the schedule block sits OUTSIDE the collapsible roster body.
+ *
+ * The roster is wrapped in a collapsible div; the schedule deliberately is not,
+ * because it holds the on/off switch, the time, and the last/next run — the
+ * things the header advertises while collapsed. That distinction is invisible to
+ * the type system and was gotten wrong once, so it is asserted here by walking
+ * the JSX and tracking div depth.
+ */
+function scheduleIsOutsideCollapsibleBody(): boolean {
+  const lines = card.split('\n')
+  const bodyAt = lines.findIndex(line => line.includes('dsm-wb2api-tasks-body'))
+  const scheduleAt = lines.findIndex(line => line.includes('dsm-wb2api-task-schedule"'))
+  if (bodyAt === -1 || scheduleAt === -1 || scheduleAt < bodyAt) return false
+  let depth = 0
+  for (let index = bodyAt; index < scheduleAt; index += 1) {
+    const line = lines[index] ?? ''
+    depth += (line.match(/<div\b/gu) ?? []).length
+    depth -= (line.match(/<\/div>/gu) ?? []).length
+  }
+  return depth <= 0
+}
+
 describe('card markup invariants', () => {
   it('finds the hidden elements it is meant to guard', () => {
     // If the card ever stops using `hidden`, this guard has nothing to check
     // and should be revisited rather than silently pass.
     expect(hiddenClasses().length).toBeGreaterThan(0)
+  })
+
+  it('keeps the automatic schedule outside the collapsible roster', () => {
+    expect(lineOf('dsm-wb2api-tasks-body')).toBeGreaterThan(-1)
+    expect(lineOf('dsm-wb2api-task-schedule"')).toBeGreaterThan(-1)
+    expect(
+      scheduleIsOutsideCollapsibleBody(),
+      'the schedule block is nested inside the collapsible roster body:'
+      + ' collapsing the roster would also hide the auto-run switch, its time,'
+      + ' and the last/next run status',
+    ).toBe(true)
   })
 
   it('never lets author display beat the hidden attribute', () => {

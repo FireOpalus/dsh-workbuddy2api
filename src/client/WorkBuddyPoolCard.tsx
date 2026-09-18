@@ -832,15 +832,18 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   const taskState = tasksByRegion[activeRegion]
   const tasksExpanded = tasksOpen[activeRegion] === true
 
-  // Tasks are fetched when the user actually expands the section (or presses
-  // refresh), not on the 60s pool poll: the list costs one upstream call per
-  // account, and a collapsed section should not make any. Expanding also
-  // fetches, so this only covers the collapse→expand→collapse→expand path.
+  // Fetch once per region per page load, whether or not the roster is expanded.
+  //
+  // It is NOT polled: one document costs one upstream call per account, and the
+  // 60s pool poll must not pay that. But it cannot be deferred to the first
+  // expand either — the collapsed header shows the schedule status and the
+  // done/total summary, and both live in this document. So: loaded once, then
+  // only on an explicit refresh or a task run.
   useEffect(() => {
-    if (!open || !tasksExpanded) return
+    if (!open) return
     if (tasksByRegion[activeRegion] !== undefined) return
     void loadTasks(activeRegion)
-  }, [open, activeRegion, tasksExpanded, tasksByRegion, loadTasks])
+  }, [open, activeRegion, tasksByRegion, loadTasks])
   /** Summary for the collapsed header: how far along this region's tasks are. */
   const taskSummary = (() => {
     const accounts = (taskState?.accounts ?? []).filter(account => account.supported)
@@ -1299,11 +1302,7 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                     className="dsm-wb2api-section-toggle"
                     aria-expanded={tasksExpanded}
                     onClick={() => {
-                      const next = !tasksExpanded
-                      setTasksOpen(previous => ({ ...previous, [activeRegion]: next }))
-                      // Expanding is the moment the list is worth its cost, so
-                      // the first expand of a session fetches it.
-                      if (next && tasksByRegion[activeRegion] === undefined) void loadTasks(activeRegion)
+                      setTasksOpen(previous => ({ ...previous, [activeRegion]: !tasksExpanded }))
                     }}
                   >
                     <span
@@ -1324,6 +1323,18 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                       </span>
                       <span className="dsm-wb2api-section-sub">
                         {tasksExpanded ? t('row.tasksHint') : t('row.tasksHintCollapsed')}
+                        {/*
+                          The schedule stays visible whether or not the roster
+                          is expanded, so its status is advertised here rather
+                          than hidden behind the toggle.
+                        */}
+                        {schedule === undefined
+                          ? ''
+                          : ' · ' + (schedule.running
+                            ? t('row.tasksAutoRunning')
+                            : schedule.enabled
+                              ? t('row.tasksAutoAtShort', { at: schedule.dailyAt })
+                              : t('row.tasksAutoOff'))}
                       </span>
                     </span>
                   </button>
@@ -1444,10 +1455,19 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                         </div>
                       )
                     })}
+                </div>
 
+                {/*
+                  The automatic schedule stays OUTSIDE the collapsible body.
+                  It is not part of the long roster — it is the switch, the time,
+                  and "when did it last run / when is the next one", which is
+                  exactly what someone opens this card to check. Collapsing the
+                  list must not hide it.
+                */}
                 {schedule === undefined
                   ? null
                   : <div className="dsm-wb2api-task-schedule">
+                      <h4 className="dsm-wb2api-task-schedule-title">{t('row.tasksAuto')}</h4>
                       <label>
                         <span>{t('row.tasksAutoEnabled')}</span>
                         <input
@@ -1518,7 +1538,6 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                         </button>
                       </div>
                     </div>}
-                </div>
               </section>
 
               {usage.status === 'error' ? <p className="dsm-wb2api-error">{usage.message}</p> : null}

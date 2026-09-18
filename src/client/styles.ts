@@ -120,6 +120,9 @@ export const WORKBUDDY2API_CARD_CSS = `
 .dsm-wb2api-task-report{margin:0;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:11px;line-height:16px}
 .dsm-wb2api-task-report-error{color:var(--dsw-alias-state-error-primary,#ef4444)}
 .dsm-wb2api-task-schedule{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px 14px;padding:11px 13px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:10px;background:var(--dsw-alias-bg-layer-2,#24262c)}
+/* The schedule is a sibling of the roster, not part of it: it stays visible
+   while the roster is collapsed, so it carries its own heading. */
+.dsm-wb2api-task-schedule-title{grid-column:1/-1;margin:0;color:var(--dsw-alias-label-primary,#e6e6e6);font-size:12px;font-weight:600;line-height:18px}
 .dsm-wb2api-task-schedule label{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:12px;line-height:18px}
 .dsm-wb2api-task-schedule input[type=number]{width:64px;font:inherit;font-size:12px;padding:3px 7px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);background:var(--dsw-alias-bg-layer-3,#2a2c33);color:var(--dsw-alias-label-primary,#e6e6e6)}
 .dsm-wb2api-task-schedule input[type=checkbox]{margin:0;accent-color:var(--dsw-alias-brand-primary,#5686fe)}
