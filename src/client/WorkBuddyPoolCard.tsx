@@ -203,7 +203,12 @@ function stateKeyOf(state: WorkBuddyWebPoolEntry['state']): WorkBuddySettingsKey
  * left. One stroked circle with a dash offset; the geometry is in viewBox units
  * so the icon scales with the surrounding text.
  */
-function CreditRing({ ratio, title }: { ratio: number | undefined; title: string }): ReturnType<typeof h> {
+function CreditRing({ ratio, title, size = 14 }: {
+  ratio: number | undefined
+  title: string
+  /** Rendered edge length; the geometry is in viewBox units so it scales. */
+  size?: number
+}): ReturnType<typeof h> {
   const radius = 6
   const circumference = 2 * Math.PI * radius
   const share = ratio === undefined ? 0 : Math.min(Math.max(ratio, 0), 1)
@@ -211,8 +216,8 @@ function CreditRing({ ratio, title }: { ratio: number | undefined; title: string
     <svg
       className="dsm-wb2api-ring"
       viewBox="0 0 16 16"
-      width="14"
-      height="14"
+      width={size}
+      height={size}
       role="img"
       aria-label={title}
     >
@@ -897,6 +902,44 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   const creditsByAccount = new Map(
     (usage.status === 'ready' ? usage.credits : []).map(credit => [credit.accountId, credit]),
   )
+  /**
+   * The region's total: every PRESENT account's credits over the allowance they
+   * were granted.
+   *
+   * Two honesty rules, same as the per-account ring:
+   *   - credits are cached on demand, so accounts nobody has queried yet are
+   *     reported separately rather than silently counted as zero;
+   *   - an allowance the sum cannot cover (total > capacity) means the ratio is
+   *     unknown, not "over 100%".
+   */
+  const creditsTotal = (() => {
+    // Iterate the ACCOUNTS, not the credit entries: the host omits the entry of
+    // an account whose credits were never queried, so walking the credit list
+    // would count those accounts as "known, zero" instead of "unknown".
+    const present = entries.filter(entry => entry.present)
+    let total = 0
+    let capacity = 0
+    let known = 0
+    let unknown = 0
+    for (const entry of present) {
+      const credits = creditsByAccount.get(entry.accountId)?.credits
+      if (credits === undefined) {
+        unknown += 1
+        continue
+      }
+      known += 1
+      total += credits.total
+      capacity += credits.capacity
+    }
+    const ratio = known === 0 || capacity <= 0 || total > capacity ? undefined : total / capacity
+    return { total, capacity, known, unknown, ratio, accounts: present.length }
+  })()
+  const creditsTotalPercent = creditsTotal.ratio === undefined ? 0 : Math.round(creditsTotal.ratio * 100)
+  const creditsTotalRingTitle = creditsTotal.known === 0
+    ? t('row.creditsRatioUnknown')
+    : creditsTotal.ratio === undefined
+      ? t('row.creditsRatioUnknown')
+      : t('row.creditsRatio', { percent: creditsTotalPercent })
   const dirty = poolDraft !== undefined || modelDraft !== undefined
 
   return (
@@ -949,6 +992,32 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                 })}
               </div>
               <p className="dsm-wb2api-section-sub">{t('row.tabHint')}</p>
+
+              {/*
+                The region's standing, between the tab strip and the account
+                section: one line to answer "how much is left across the pool"
+                without reading every account row.
+              */}
+              <div className="dsm-wb2api-summary">
+                <CreditRing ratio={creditsTotal.ratio} title={creditsTotalRingTitle} size={18} />
+                <span className="dsm-wb2api-summary-text">
+                  {creditsTotal.known === 0
+                    ? t('row.creditsTotalUnknown')
+                    : creditsTotal.ratio === undefined
+                      ? t('row.creditsTotalNoRatio', { credits: formatNumber(creditsTotal.total) })
+                      : t('row.creditsTotal', {
+                        credits: formatNumber(creditsTotal.total),
+                        capacity: formatNumber(creditsTotal.capacity),
+                        percent: creditsTotalPercent,
+                      })}
+                  {creditsTotal.unknown === 0
+                    ? ''
+                    : ' · ' + t('row.creditsTotalPartial', { count: creditsTotal.unknown })}
+                </span>
+                <span className="dsm-wb2api-summary-accounts">
+                  {t('row.creditsTotalAccounts', { count: creditsTotal.accounts })}
+                </span>
+              </div>
 
               <section className="dsm-wb2api-section" aria-label={t('row.accountsTitle')}>
                 <div className="dsm-wb2api-section-head">
