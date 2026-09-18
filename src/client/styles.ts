@@ -96,6 +96,12 @@ export const WORKBUDDY2API_CARD_CSS = `
 @keyframes dsm-wb2api-spin{to{transform:rotate(360deg)}}
 .dsm-wb2api-signin-done{flex:1;min-width:180px;color:var(--dsw-alias-state-success-primary,#22a06b);font-size:12px;line-height:18px}
 .dsm-wb2api-tasks{display:flex;flex-direction:column;gap:10px;border-top:1px solid var(--dsw-alias-border-l2,#36373b);padding-top:14px}
+.dsm-wb2api-tasks-body{display:flex;flex-direction:column;gap:12px}
+.dsm-wb2api-section-toggle{appearance:none;font:inherit;text-align:left;cursor:pointer;flex:1;min-width:0;display:flex;align-items:flex-start;gap:8px;padding:0;border:0;background:transparent;color:inherit}
+.dsm-wb2api-section-toggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#5686fe);outline-offset:2px;border-radius:6px}
+.dsm-wb2api-section-toggle-text{display:flex;flex-direction:column;gap:2px;min-width:0}
+.dsm-wb2api-section-chevron{flex:none;display:inline-flex;margin-top:2px;color:var(--dsw-alias-label-tertiary,#999);transition:transform .16s}
+.dsm-wb2api-section-chevron-open{transform:rotate(180deg)}
 .dsm-wb2api-task-list{display:flex;flex-direction:column;border:1px solid var(--dsw-alias-border-l2,#36373b);border-radius:10px;overflow:hidden}
 .dsm-wb2api-task{display:flex;flex-direction:column;gap:5px;padding:9px 12px;background:var(--dsw-alias-bg-layer-2,#232529)}
 .dsm-wb2api-task+.dsm-wb2api-task{border-top:1px solid var(--dsw-alias-border-l2,#36373b)}

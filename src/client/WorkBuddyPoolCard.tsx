@@ -286,6 +286,12 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   /** Per-region growth tasks, loaded on demand (never on the 60s poll). */
   const [tasksByRegion, setTasksByRegion] = useState<Partial<Record<WorkBuddyWebRegion, WorkBuddyTaskState>>>({})
   const [tasksBusy, setTasksBusy] = useState(false)
+  /**
+   * Whether the task list is expanded, per region. Default COLLAPSED: a full
+   * roster is ~18 rows, which would otherwise push the policy and model
+   * sections off the screen every time the card is opened.
+   */
+  const [tasksOpen, setTasksOpen] = useState<Partial<Record<WorkBuddyWebRegion, boolean>>>({})
   /** The account a task run is currently sweeping, when it is one account. */
   const [tasksBusyAccount, setTasksBusyAccount] = useState<string | undefined>(undefined)
   const [taskDraft, setTaskDraft] = useState<Partial<Record<WorkBuddyWebRegion, WorkBuddyWebTaskSchedule>>>({})
@@ -483,13 +489,6 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
       if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
     }
   }, [t])
-
-  // Tasks are loaded when the tab is opened, not on the 60s pool poll: the list
-  // costs one upstream call per account, so polling it would be rude.
-  useEffect(() => {
-    if (!open) return
-    void loadTasks(activeRegion)
-  }, [open, activeRegion, loadTasks])
 
   /** Run the tasks: this account's, or every account in the region. */
   const runTasks = async (accountId?: string): Promise<void> => {
@@ -831,6 +830,32 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   }
 
   const taskState = tasksByRegion[activeRegion]
+  const tasksExpanded = tasksOpen[activeRegion] === true
+
+  // Tasks are fetched when the user actually expands the section (or presses
+  // refresh), not on the 60s pool poll: the list costs one upstream call per
+  // account, and a collapsed section should not make any. Expanding also
+  // fetches, so this only covers the collapse→expand→collapse→expand path.
+  useEffect(() => {
+    if (!open || !tasksExpanded) return
+    if (tasksByRegion[activeRegion] !== undefined) return
+    void loadTasks(activeRegion)
+  }, [open, activeRegion, tasksExpanded, tasksByRegion, loadTasks])
+  /** Summary for the collapsed header: how far along this region's tasks are. */
+  const taskSummary = (() => {
+    const accounts = (taskState?.accounts ?? []).filter(account => account.supported)
+    let done = 0
+    let total = 0
+    let claimable = 0
+    for (const account of accounts) {
+      for (const task of account.tasks) {
+        total += 1
+        if (task.claimed || (task.target > 0 && task.current >= task.target)) done += 1
+        if (task.claimable) claimable += 1
+      }
+    }
+    return { done, total, claimable, accounts: accounts.length }
+  })()
   const schedule = taskDraft[activeRegion] ?? taskState?.schedule
   const reportsByAccount = new Map(
     (taskState?.reports ?? []).map(report => [report.accountId, report]),
@@ -1264,10 +1289,44 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
 
               <section className="dsm-wb2api-tasks" aria-label={t('row.tasksTitle')}>
                 <div className="dsm-wb2api-section-head">
-                  <div>
-                    <h3 className="dsm-wb2api-section-title">{t('row.tasksTitle')}</h3>
-                    <p className="dsm-wb2api-section-sub">{t('row.tasksHint')}</p>
-                  </div>
+                  {/*
+                    The whole section collapses behind this heading. The roster
+                    is ~18 rows per account, so leaving it open would bury the
+                    policy and model sections below it.
+                  */}
+                  <button
+                    type="button"
+                    className="dsm-wb2api-section-toggle"
+                    aria-expanded={tasksExpanded}
+                    onClick={() => {
+                      const next = !tasksExpanded
+                      setTasksOpen(previous => ({ ...previous, [activeRegion]: next }))
+                      // Expanding is the moment the list is worth its cost, so
+                      // the first expand of a session fetches it.
+                      if (next && tasksByRegion[activeRegion] === undefined) void loadTasks(activeRegion)
+                    }}
+                  >
+                    <span
+                      aria-hidden="true"
+                      className={`dsm-wb2api-section-chevron${tasksExpanded ? ' dsm-wb2api-section-chevron-open' : ''}`}
+                    >
+                      {h(IconChevronDownOutline14, { size: 14 })}
+                    </span>
+                    <span className="dsm-wb2api-section-toggle-text">
+                      <span className="dsm-wb2api-section-title">
+                        {t('row.tasksTitle')}
+                        {taskSummary.total === 0
+                          ? ''
+                          : ' · ' + t('row.tasksSummary', { done: taskSummary.done, total: taskSummary.total })}
+                        {taskSummary.claimable === 0
+                          ? ''
+                          : ' · ' + t('row.tasksClaimableCount', { count: taskSummary.claimable })}
+                      </span>
+                      <span className="dsm-wb2api-section-sub">
+                        {tasksExpanded ? t('row.tasksHint') : t('row.tasksHintCollapsed')}
+                      </span>
+                    </span>
+                  </button>
                   <div className="dsm-wb2api-actions-buttons">
                     <button
                       type="button"
@@ -1288,6 +1347,7 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                   </div>
                 </div>
 
+                <div className="dsm-wb2api-tasks-body" hidden={!tasksExpanded}>
                 {taskState === undefined
                   ? <p className="dsm-wb2api-text">{t('row.tasksRefreshing')}</p>
                   : taskState.accounts.length === 0
@@ -1458,6 +1518,7 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                         </button>
                       </div>
                     </div>}
+                </div>
               </section>
 
               {usage.status === 'error' ? <p className="dsm-wb2api-error">{usage.message}</p> : null}
