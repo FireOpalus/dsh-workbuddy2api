@@ -1,0 +1,26 @@
+# 依赖
+node_modules/
+
+# 构建产物：由 prepack 的 `npm run build` 生成，不进仓库。
+lib/
+
+# 打包与产物校验的中间目录。
+dist-pack/
+
+# 隔离测试环境：只属于本仓库的 DSH home，由 testenv/setup.mjs 创建。
+# 它含有从真实 home 复制来的凭据与运行期会话数据，绝不能提交。
+testenv/dsh-home/
+testenv/dsh-home-pack/
+testenv/pack-extract/
+
+# 依赖安装缓存与早期验证用的临时目录。
+.npm-cache/
+.scratch-net/
+
+# 调研参照物的本地副本（第三方源码，不随本仓库分发）。
+.reference/
+
+# 编辑器与系统噪音
+.DS_Store
+Thumbs.db
+*.log

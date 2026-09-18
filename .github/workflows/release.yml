@@ -1,0 +1,83 @@
+# 推送到 v* 标签时，用 GitHub Release 承载发布产物。
+#
+# 为什么不是 npm trusted publishing：本插件是一个 **DSH bundle 插件**，
+# 它通过 git/本地目录安装（`dsh plugin add <path>`），npm 只是可选渠道之一；
+# 这里先把「仓库 + Release + tarball」这条最直接的路走通。
+# 若之后要同时发 npm，把 dsh-laa 的 .github/workflows/publish.yml 搬过来即可
+# （关键点：不要给 setup-node 传 registry-url、发布前 unset NODE_AUTH_TOKEN、
+#   npm >= 11.5.1，否则 OIDC 会被 token 认证抢先而报误导性的 404）。
+#
+# 这个工作流做四件事：
+#   1. 断言标签与 package.json 版本一致（防止发出错版本）；
+#   2. 跑 typecheck + 全部单测（产物不对就不该产生 Release）；
+#   3. `npm pack` 出 tarball，并核对包内容（12 项产物自检）；
+#   4. 用 CHANGELOG 里对应版本的段落建 Release，附上 tarball。
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # 建 Release、传 asset
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'   # package.json engines: ^22.19.0 || >=24.0.0
+          package-manager-cache: false
+
+      - name: 校验标签与 package.json 版本一致
+        run: |
+          expected="v$(node -p 'require("./package.json").version')"
+          if [ "$expected" != "$GITHUB_REF_NAME" ]; then
+            echo "标签 $GITHUB_REF_NAME 与 package.json 版本 $expected 不一致，拒绝发布"
+            exit 1
+          fi
+
+      # 本包只把 @deepseek-ai/* 声明为 peerDependency（由宿主提供），
+      # 因此这里只装开发期工具链。用 `--legacy-peer-deps`：peer 要等宿主，
+      # 在 CI 里没有宿主可解析。
+      - name: 安装开发期依赖
+        run: npm install --no-audit --no-fund --legacy-peer-deps --ignore-scripts
+
+      - name: 类型检查与单元测试
+        run: |
+          npx tsc -p tsconfig.json --noEmit
+          npx tsc -p tsconfig.client.json --noEmit
+          npx vitest run
+
+      - name: 打包并自检产物
+        run: |
+          mkdir -p dist-pack
+          npm pack --pack-destination dist-pack
+          node testenv/verify-pack.mjs
+
+      - name: 从 CHANGELOG 摘出本版本说明
+        run: |
+          node -e '
+            const { readFileSync, writeFileSync } = require("node:fs");
+            const tag = process.env.GITHUB_REF_NAME;
+            const text = readFileSync("CHANGELOG.md", "utf8");
+            const heading = "## [" + tag.replace(/^v/, "") + "]";
+            const start = text.indexOf(heading);
+            if (start === -1) { console.error("CHANGELOG 里没有 " + heading); process.exit(1); }
+            const next = text.indexOf("\n## [", start);
+            writeFileSync("release-notes.md", text.slice(start, next === -1 ? undefined : next).trim() + "\n");
+          '
+
+      - name: 建 Release 并附上 tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            dist-pack/*.tgz
