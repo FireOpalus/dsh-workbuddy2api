@@ -18,6 +18,7 @@ import {
   loginEndpointsFor,
   WorkBuddyLoginManager,
   WorkBuddyLoginUnknownStateError,
+  WORKBUDDY_LOGIN_COMPLETED_TTL_MS,
 } from '../src/login.ts'
 import type { WorkBuddyCredential } from '../src/auth.ts'
 import type { WorkBuddyRegion } from '../src/upstream.ts'
@@ -191,7 +192,9 @@ describe('WorkBuddyLoginManager', () => {
     expect(poll.account.nickname).toBe('tester')
     expect(poll.account.domain).toBe('www.workbuddy.cn')
     expect(seen).toEqual(['cn:access-1'])
-    expect(manager.pendingCount()).toBe(0)
+    // The session outlives the completion on purpose, so the polls already in
+    // flight still get this account instead of "unknown session".
+    expect(manager.pendingCount()).toBe(1)
 
     // The credential is on disk as the plugin's OWN copy, never as a desktop
     // file, and the pool sees it right away.
@@ -239,6 +242,71 @@ describe('WorkBuddyLoginManager', () => {
     expect(poll.account.accountId).toBe(workbuddyAccountId({ uin: '330120281752', uid: 'uid-1', nickname: 'tester' }))
     expect(await store.accounts()).toHaveLength(1)
     expect((await store.resolve(poll.account.accountId)).uin).toBe('330120281752')
+  })
+
+  it('answers repeat polls with the same account instead of "unknown session"', async () => {
+    // The card polls on a timer, so a completion is normally observed by more
+    // than one request; every one of them has to see the account it added.
+    const gateway = fakeGateway({ token: tokenBundle() })
+    const { manager } = makeManager({ fetch: gateway.fetch })
+    await manager.start('cn')
+    const first = await manager.poll('st-1')
+    if (!first.done) throw new Error('unreachable')
+    const second = await manager.poll('st-1')
+    expect(second).toEqual(first)
+    expect(second.done && second.account.accountId).toBe(first.account.accountId)
+    // The gateway redeemed the one-shot state exactly once.
+    expect(gateway.calls.filter(call => call.url.includes('/v2/plugin/auth/token'))).toHaveLength(1)
+  })
+
+  it('keeps answering a completed sign-in until its completion window closes', async () => {
+    const gateway = fakeGateway({ token: tokenBundle() })
+    let now = 1_000
+    const store = makeStore('cn')
+    const manager = new WorkBuddyLoginManager({
+      store: () => store,
+      pool: () => new WorkBuddyAccountPool({ list: () => store.accounts() }),
+      fetch: gateway.fetch,
+      now: () => now,
+    })
+    await manager.start('cn')
+    expect((await manager.poll('st-1')).done).toBe(true)
+    now += WORKBUDDY_LOGIN_COMPLETED_TTL_MS
+    expect((await manager.poll('st-1')).done).toBe(true)
+    now += 1
+    await expect(manager.poll('st-1')).rejects.toBeInstanceOf(WorkBuddyLoginUnknownStateError)
+  })
+
+  it('never redeems one state twice while a poll is in flight', async () => {
+    // Two overlapping polls are the normal case: the timer fires while the
+    // previous answer is still travelling. Redeeming the one-shot state twice
+    // makes the gateway revoke the token the first redemption produced, so the
+    // second request must be answered locally.
+    let release = (): void => {}
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const base = fakeGateway({ token: tokenBundle() })
+    let tokenCalls = 0
+    const slowFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url.includes('/v2/plugin/auth/token')) {
+        tokenCalls += 1
+        if (tokenCalls === 1) await gate
+      }
+      return base.fetch(input, init)
+    }) as unknown as typeof fetch
+    const { manager, store } = makeManager({ fetch: slowFetch })
+    await manager.start('cn')
+    const first = manager.poll('st-1')
+    // The second poll starts while the first is still waiting on the gateway.
+    expect(await manager.poll('st-1')).toEqual({ done: false })
+    expect(tokenCalls).toBe(1)
+    release()
+    expect((await first).done).toBe(true)
+    expect(await store.accounts()).toHaveLength(1)
+    // Once the sign-in is complete, repeat polls come from the record, not the
+    // gateway.
+    expect((await manager.poll('st-1')).done).toBe(true)
+    expect(tokenCalls).toBe(1)
   })
 
   it('rejects an unknown or expired state', async () => {

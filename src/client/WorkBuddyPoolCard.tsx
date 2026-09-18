@@ -235,10 +235,18 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   /** A finished sign-in's confirmation line, cleared by the next action. */
   const [loginDone, setLoginDone] = useState<WorkBuddyLoginDone | undefined>(undefined)
   const mounted = useRef(true)
-  const loginRef = useRef<WorkBuddyLoginDraft | undefined>(undefined)
-  loginRef.current = login
+  /**
+   * The authoritative "which sign-in is running" record. It is written
+   * synchronously on every deliberate change, never derived from the rendered
+   * state: a poll answer that lands after the sign-in it belongs to was
+   * replaced or cancelled must not be able to touch the card, and comparing
+   * against a value that only updates on the next render would leave a window
+   * where a stale answer still looks current.
+   */
+  const loginRef = useRef<WorkBuddyLoginDraft | undefined>(login)
 
   const rememberLogin = useCallback((draft: WorkBuddyLoginDraft | undefined): void => {
+    loginRef.current = draft
     writeStoredLogin(draft)
     if (mounted.current) setLogin(draft)
   }, [])
@@ -302,6 +310,13 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   /** Poll the running sign-in once and apply whatever it answered. */
   const pollLogin = useCallback(async (draft: WorkBuddyLoginDraft): Promise<void> => {
     const region = draft.region
+    /**
+     * Whether this answer still belongs to the sign-in the card is tracking.
+     * The poller fires on a timer, so several requests are always in flight
+     * around the moment a sign-in completes; the ones that lost the race must
+     * be dropped rather than reported.
+     */
+    const stillCurrent = (): boolean => loginRef.current?.state === draft.state
     const path = withWorkBuddyRegion(WORKBUDDY2API_LOGIN_POLL_PATH, region)
     let response: Response
     try {
@@ -310,7 +325,7 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
         credentials: 'same-origin',
       })
     } catch (error: unknown) {
-      if (mounted.current) {
+      if (mounted.current && stillCurrent()) {
         rememberLogin({
           ...draft,
           status: 'error',
@@ -323,6 +338,7 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
       | (Partial<WorkBuddyWebLogin> & { error?: string })
       | undefined
     if (!response.ok) {
+      if (!stillCurrent()) return
       // 400/404 mean the host has no such sign-in any more; retrying cannot
       // fix that, so the row becomes a terminal message plus a restart button.
       rememberLogin({
@@ -334,6 +350,9 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
       return
     }
     const document = body as WorkBuddyWebLogin
+    // Every branch below reports on THIS sign-in; a stale answer would either
+    // resurrect a finished sign-in or show an error for one that just worked.
+    if (!stillCurrent()) return
     if (document.status === 'waiting') {
       rememberLogin({ ...draft, status: 'waiting', ...document.message === undefined ? {} : { message: document.message } })
       return
@@ -351,18 +370,28 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
     if (document.status === 'error') {
       rememberLogin({ ...draft, status: 'error', message: document.message })
     }
+    // A finished sign-in is terminal: no branch of the poller may revive it.
   }, [rememberLogin, refreshUsage, t])
 
-  // One poller for the running sign-in, alive whether or not the card is open,
-  // so a sign-in finished while the user was in the browser is picked up as
-  // soon as they come back.
+  // One poller per sign-in, alive whether or not the card is open, so a
+  // sign-in finished while the user was in the browser is picked up as soon as
+  // they come back. The effect re-runs whenever a sign-in is started or
+  // replaced, which also retires the previous one's timer.
   useEffect(() => {
     if (login === undefined) return
     const controller = new AbortController()
+    /**
+     * Whether a request for this sign-in is still travelling. The poller is
+     * what keeps a finished sign-in from being polled twice at once — the host
+     * refuses the second request, but there is no reason to send it.
+     */
+    let inflight = false
     const tick = (): void => {
       const current = loginRef.current
       if (current === undefined || current.fatal === true || controller.signal.aborted) return
-      void pollLogin(current)
+      if (inflight) return
+      inflight = true
+      void pollLogin(current).finally(() => { inflight = false })
     }
     tick()
     const timer = window.setInterval(tick, LOGIN_POLL_INTERVAL_MS)
@@ -786,27 +815,42 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                     ? null
                     : <span className="dsm-wb2api-signin-done">{loginDone.text}</span>}
                   <div className="dsm-wb2api-actions-buttons">
-                    {login !== undefined && login.region === activeRegion
-                      ? <>
-                          <button
-                            type="button"
-                            className="dsm-btn dsm-btn-outline"
-                            onClick={() => { window.open(login.url, '_blank', 'noopener,noreferrer') }}
-                          >
-                            {t('row.signInOpen')}
-                          </button>
-                          <button type="button" className="dsm-btn dsm-btn-outline" onClick={cancelLogin}>
-                            {t('row.signInCancel')}
-                          </button>
-                        </>
-                      : <button
+                    {login === undefined || login.region !== activeRegion
+                      // Nothing running on this tab: the only action is to start
+                      // one.
+                      ? <button
                           type="button"
                           className="dsm-btn dsm-btn-primary"
                           disabled={busy}
                           onClick={() => { void startLogin() }}
                         >
                           {t('row.signIn')}
-                        </button>}
+                        </button>
+                      : login.fatal === true
+                        // The host no longer knows this sign-in (it expired, or
+                        // the plugin restarted), so its authorization URL is
+                        // dead: reopening it would only burn the user's time.
+                        // Offer a fresh sign-in instead.
+                        ? <button
+                            type="button"
+                            className="dsm-btn dsm-btn-primary"
+                            disabled={busy}
+                            onClick={() => { void startLogin() }}
+                          >
+                            {t('row.signIn')}
+                          </button>
+                        : <>
+                            <button
+                              type="button"
+                              className="dsm-btn dsm-btn-outline"
+                              onClick={() => { window.open(login.url, '_blank', 'noopener,noreferrer') }}
+                            >
+                              {t('row.signInOpen')}
+                            </button>
+                            <button type="button" className="dsm-btn dsm-btn-outline" onClick={cancelLogin}>
+                              {t('row.signInCancel')}
+                            </button>
+                          </>}
                   </div>
                 </div>
                 {entries.length === 0

@@ -1148,6 +1148,8 @@ declare class WorkBuddyLoginManager {
    * per-account copy and written back into that region's pool.
    */
   poll(state: string): Promise<WorkBuddyLoginPoll>;
+  /** One gateway round trip for a sign-in this manager is already tracking. */
+  private pollOnce;
   /** Write the freshly signed-in account into its region's pool and revive it. */
   private adoptIntoPool;
   /** Read the signed-in account's identity; a failure is not fatal by itself. */

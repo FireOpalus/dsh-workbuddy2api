@@ -21,7 +21,13 @@
  *   2. 落盘写的是本插件自有的每账号副本（`.workbuddy2api-auth.<id>.json`），
  *      不写桌面端 auth 文件；
  *   3. 完成后直接写回池（save → refresh → reset），
- *      并回调宿主做签到 / 积分 / 目录刷新。
+ *      并回调宿主做签到 / 积分 / 目录刷新；
+ *   4. **登录态是一次性的**：同一个 state 只能向上游兑换一次，且卡片是按
+ *      定时器轮询的，因此完成瞬间必然有多个请求在飞。这里做两件事 ——
+ *      同一 state 的并发轮询只放一个出去（其余本地回 waiting），
+ *      以及完成后的会话在窗口期内对重复轮询**继续回答同一个账号**。
+ *      没有这两条，抢输的那个请求会拿到「unknown session」，
+ *      用户就会在账号已经加好之后看到一个报错。
  *
  * @module dsh-workbuddy2api/login
  */
@@ -87,7 +93,27 @@ interface LoginEnvelope {
 interface LoginSession {
   region: WorkBuddyRegion
   createdAtMs: number
+  /**
+   * A poll is talking to the gateway for this state right now. The browser
+   * polls on a timer, so without this a slow gateway answer and the next tick
+   * overlap — and both of them would then redeem the same one-shot state,
+   * which makes the gateway revoke the token the first one just obtained.
+   */
+  polling?: boolean
+  /**
+   * How long a completed sign-in keeps answering the SAME account. The card
+   * has at least two pollers in flight when the completion lands (its own
+   * timer, plus the answer already travelling), and a browser that remounts
+   * the card polls again; every one of those must still see the account it
+   * added, never "unknown session".
+   */
+  completedUntilMs?: number
+  /** The account a completed sign-in produced, for those repeat polls. */
+  completed?: WorkBuddyLoginPollDone
 }
+
+/** The success answer of a poll, kept so repeat polls can be answered. */
+type WorkBuddyLoginPollDone = Extract<WorkBuddyLoginPoll, { done: true }>
 
 /** Answer of WorkBuddyLoginManager.start. */
 export interface WorkBuddyLoginStart {
@@ -125,6 +151,9 @@ export class WorkBuddyLoginUnknownStateError extends Error {
     this.name = 'WorkBuddyLoginUnknownStateError'
   }
 }
+
+/** How long a completed sign-in keeps answering repeat polls. */
+export const WORKBUDDY_LOGIN_COMPLETED_TTL_MS = 5 * 60 * 1000
 /** Constructor dependencies. */
 export interface WorkBuddyLoginManagerOptions {
   /** Region-scoped credential store that owns the resulting copy. */
@@ -207,13 +236,39 @@ export class WorkBuddyLoginManager {
   async poll(state: string): Promise<WorkBuddyLoginPoll> {
     const session = this.sessions.get(state)
     if (session === undefined) throw new WorkBuddyLoginUnknownStateError()
-    // The gateway keeps a state alive for far longer than a human needs; the
-    // local TTL is what stops a forgotten browser tab from completing a
-    // sign-in hours later, against a flow the user has stopped watching.
-    if (this.now() - session.createdAtMs > this.ttlMs) {
+    const now = this.now()
+    // A sign-in that already finished keeps answering the same account for a
+    // while. This is what makes the flow robust against its own concurrency:
+    // the card polls on a timer, so the completion is normally observed by more
+    // than one request, and the loser of that race used to be told the session
+    // was unknown — an error the user sees AFTER the account was added.
+    if (session.completedUntilMs !== undefined && session.completed !== undefined) {
+      if (now <= session.completedUntilMs) return session.completed
       this.sessions.delete(state)
       throw new WorkBuddyLoginUnknownStateError()
     }
+    // The gateway keeps a state alive for far longer than a human needs; the
+    // local TTL is what stops a forgotten browser tab from completing a
+    // sign-in hours later, against a flow the user has stopped watching.
+    if (now - session.createdAtMs > this.ttlMs) {
+      this.sessions.delete(state)
+      throw new WorkBuddyLoginUnknownStateError()
+    }
+    // The state is one-shot upstream: redeeming it twice makes the gateway
+    // revoke the token the first redemption just produced. A poll already in
+    // flight answers "still waiting" instead of racing it.
+    if (session.polling === true) return { done: false }
+    session.polling = true
+    try {
+      return await this.pollOnce(state, session)
+    } finally {
+      // A finished sign-in keeps its session so repeat polls can be answered.
+      if (session.completedUntilMs === undefined) session.polling = false
+    }
+  }
+
+  /** One gateway round trip for a sign-in this manager is already tracking. */
+  private async pollOnce(state: string, session: LoginSession): Promise<WorkBuddyLoginPoll> {
     const endpoints = loginEndpointsFor(session.region)
 
     // The token endpoint is the authoritative login-state answer: while the
@@ -290,7 +345,13 @@ export class WorkBuddyLoginManager {
       domain: stored.domain,
       region: session.region,
     }
-    this.sessions.delete(state)
+    // The credential is persisted and the account is in the pool: from here on
+    // the sign-in is SUCCESSFUL, whatever the follow-up calls do. The session
+    // stays, so the polls already in flight — and any the browser sends after a
+    // reload — get this same answer instead of "unknown session".
+    const done: WorkBuddyLoginPollDone = { done: true, account }
+    session.completed = done
+    session.completedUntilMs = this.now() + WORKBUDDY_LOGIN_COMPLETED_TTL_MS
 
     let note: string | undefined
     try {
@@ -303,12 +364,13 @@ export class WorkBuddyLoginManager {
     if (cached?.credits !== undefined) {
       credits = { total: cached.credits, expiringSoon: cached.creditsExpiringSoon ?? 0 }
     }
-    return {
-      done: true,
-      account,
+    const answered: WorkBuddyLoginPollDone = {
+      ...done,
       ...credits === undefined ? {} : { credits },
       ...note === undefined || note === '' ? {} : { note },
     }
+    session.completed = answered
+    return answered
   }
 
   /** Write the freshly signed-in account into its region's pool and revive it. */
