@@ -19,12 +19,16 @@ dist-pack/
 
 # 隔离测试环境：只属于本仓库的 DSH home，由 testenv/setup.mjs 创建。
 # 它含有从真实 home 复制来的凭据与运行期会话数据，绝不能提交。
+# dsh-home-* 一并覆盖「装/升级验证」用的第二个 home（如 dsh-home-update）。
 testenv/dsh-home/
+testenv/dsh-home-*/
 testenv/dsh-home-pack/
 testenv/pack-extract/
 
 # 依赖安装缓存与早期验证用的临时目录。
 .npm-cache/
+# pnpm 在本仓库里跑过一次就会留下这个 store（含索引库），不是源码。
+.pnpm-store/
 .scratch-net/
 
 # 调研参照物的本地副本（第三方源码，不随本仓库分发）。
