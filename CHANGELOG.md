@@ -1,5 +1,18 @@
 # 更新日志
 
+## [0.1.1] - 2026-09-18
+
+### 修复
+
+- **从 git 安装不再需要 allowBuilds。** 0.1.0 把 `lib/` 排除在仓库之外，
+  而 pnpm 对 git 依赖的判定是「有 prepack 且仓库里没有 main 文件 → 需要跑构建
+  脚本」，于是每个用 `dsh plugin add git+https://…` 的人都会撞上
+  `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`。现在把构建产物 `lib/` 提交进仓库，
+  pnpm 判定「不需要构建」，开箱即装。`prepack` 保留，`npm pack` / `npm publish`
+  照旧先构建。
+- 发布工作流新增一道闸：构建后断言 `git diff --exit-code lib/`，
+  防止提交的构建产物与 `src` 脱节（那会让用户装到旧代码）。
+
 ## [0.1.0] - 2026-09-18
 
 首个版本：把 workbuddy2api 的多账号调度带进 DeepSeek Harness。

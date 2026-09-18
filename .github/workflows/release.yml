@@ -54,6 +54,17 @@ jobs:
           npx tsc -p tsconfig.client.json --noEmit
           npx vitest run
 
+      - name: 构建并确认提交的 lib/ 与源码一致
+        run: |
+          npm run build
+          # lib/ 是提交进仓库的（见 .gitignore 里的说明：pnpm 对 git 依赖的
+          # 构建门要求仓库里就有 main 文件）。所以必须保证它与 src 同步——
+          # 忘了提交构建产物，用户装到的就是旧代码，而这里会当场失败。
+          if ! git diff --exit-code --stat lib/; then
+            echo "lib/ 与源码不一致：请本地 npm run build 后把 lib/ 一起提交"
+            exit 1
+          fi
+
       - name: 打包并自检产物
         run: |
           mkdir -p dist-pack

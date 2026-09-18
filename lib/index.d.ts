@@ -1,0 +1,1094 @@
+import z from "@deepseek-ai/schemastery";
+import { PiAiAdapter } from "@deepseek-ai/dsh-llm-pi-ai";
+import { Context } from "@deepseek-ai/cordis";
+import { SettingsNamespace } from "@deepseek-ai/dsh-settings";
+import { AttachmentStore } from "@deepseek-ai/dsh-attachment";
+//#region src/status-paths.d.ts
+/**
+ * Node-free constants and types shared by the Host and browser halves.
+ *
+ * 参考：dingminhua/dsh-connect-workbuddy（MIT，Copyright (c) 2026 LaoDing）
+ *   — 「同源只读路由 + 一份与浏览器共享的 node-free 类型定义」的 host↔client
+ *     桥梁形态来自该项目（其源自 dsh-connect-trae，并注明沿用
+ *     corrinehu/dsh-workbuddy-connect 的 status-route 模式）。
+ * 改动：路由路径改用本插件 id；文档结构从「一个账号 + 一份目录」改成
+ *   「账号池 + 每账号健康 + 一份合并目录」，并新增池操作路由
+ *   （启用/停用/重置/权重）与积分刷新路由。
+ *
+ * @module dsh-workbuddy2api/status-paths
+ */
+/** Plugin-owned usage endpoint consumed by its browser half. */
+declare const WORKBUDDY2API_USAGE_PATH = "/plugins/dsh-workbuddy2api/usage";
+/** Plugin-owned live model refresh endpoint. */
+declare const WORKBUDDY2API_MODELS_REFRESH_PATH = "/plugins/dsh-workbuddy2api/models/refresh";
+/** Plugin-owned local account rescan endpoint. */
+declare const WORKBUDDY2API_ACCOUNTS_REFRESH_PATH = "/plugins/dsh-workbuddy2api/accounts/refresh";
+/** Plugin-owned per-account credit refresh endpoint. */
+declare const WORKBUDDY2API_CREDITS_REFRESH_PATH = "/plugins/dsh-workbuddy2api/credits/refresh";
+/** Plugin-owned daily check-in action endpoint. */
+declare const WORKBUDDY2API_CHECKIN_PATH = "/plugins/dsh-workbuddy2api/checkin";
+/** Plugin-owned pool control endpoint (enable / disable / reset / weight). */
+declare const WORKBUDDY2API_POOL_ACTION_PATH = "/plugins/dsh-workbuddy2api/pool";
+/** Query parameter naming the account a card request addresses. */
+declare const WORKBUDDY2API_ACCOUNT_PARAM = "accountId";
+/** One credit package as the upstream returns it, node-free. */
+interface WorkBuddyWebCreditPackage {
+  packageName: string;
+  remain: number;
+  size: number;
+  /** CapacityType 4: refreshed every cycle and never expires. */
+  monthly: boolean;
+  /** Next cycle start (the monthly refresh point) in ms. */
+  cycleRefreshMs?: number;
+  /** One-off expiry in ms; the package disappears from the account then. */
+  expiresAtMs?: number;
+}
+/** Aggregated credit answer rendered by the plugin card. */
+interface WorkBuddyWebCredits {
+  total: number;
+  packages: readonly WorkBuddyWebCreditPackage[];
+  /** Credits expiring within 3 days across every package. */
+  expiringSoon: number;
+  /** When the nearest package expires, in ms. */
+  nearestExpiryMs?: number;
+}
+/** Daily check-in state rendered next to an account's credits. */
+interface WorkBuddyWebCheckin {
+  active: boolean;
+  todayCheckedIn: boolean;
+  streakDays: number;
+  dailyCredit: number;
+  todayCredit: number;
+  isStreakDay: boolean;
+  nextStreakDay: number;
+  streakBonusDays: number;
+  streakBonusCredit: number;
+  claimButtonText?: string;
+}
+/** Editable WorkBuddy model row rendered by the plugin-owned settings card. */
+interface WorkBuddyWebModel {
+  id: string;
+  name: string;
+  /** Effective DSH context after applying the saved local budget. */
+  contextWindow: number;
+  /** Native maximum advertised by WorkBuddy; models above 200K expose 200K/max. */
+  nativeContextWindow: number;
+  maxTokens: number;
+  creditMultiplier?: number;
+  multimodal?: boolean;
+  reasoning?: {
+    supportedEfforts?: readonly string[];
+    defaultEffort?: string;
+  };
+  description?: string;
+}
+/**
+ * Project one card row into its persisted `lastCatalog` shape: the native
+ * context window becomes the stored `contextWindow`, and the card-only
+ * presentation fields (`nativeContextWindow`, `multimodal`) are removed BY
+ * KEY. They must never be set to `undefined`: explicit `undefined` values
+ * survive `structuredClone` and are rejected by the settings write path's
+ * strict JSON codec, which fails the whole save.
+ */
+declare function toPersistedWorkBuddyModel(model: WorkBuddyWebModel): Omit<WorkBuddyWebModel, 'nativeContextWindow' | 'multimodal'>;
+/** One selectable local account, token-free. */
+interface WorkBuddyWebAccount {
+  id: string;
+  accountName: string;
+  uin?: string;
+  domain: string;
+  region: 'cn' | 'global';
+  source: 'desktop' | 'dsh';
+  tokenExpiresAtMs: number;
+  /** Whether a credential file for this account is still on disk. */
+  present: boolean;
+}
+/** One account's pool health, as the card renders it. */
+interface WorkBuddyWebPoolEntry {
+  accountId: string;
+  accountName: string;
+  region: 'cn' | 'global';
+  enabled: boolean;
+  weight: number;
+  priority: number;
+  state: 'ready' | 'cooldown' | 'degraded' | 'missing' | 'disabled';
+  cooldownUntil?: number;
+  cooldownKind?: 'soft' | 'hard';
+  breakerUntil?: number;
+  degradedUntil?: number;
+  inFlight: number;
+  successes: number;
+  failures: number;
+  consecutiveFailures: number;
+  cooldownCount: number;
+  lastUsedAt?: number;
+  lastSuccessAt?: number;
+  lastErrorAt?: number;
+  lastError?: string;
+  credits?: number;
+  creditsAtMs?: number;
+  creditsExpiringSoon?: number;
+  present: boolean;
+  tokenExpiresAtMs: number;
+}
+/** One account's credit panel document. */
+interface WorkBuddyWebAccountCredits {
+  accountId: string;
+  credits?: WorkBuddyWebCredits;
+  creditsError?: string;
+  checkin?: WorkBuddyWebCheckin;
+  checkinError?: string;
+}
+type WorkBuddyWebPackage = WorkBuddyWebCreditPackage;
+/** The JSON document the plugin card renders. */
+type WorkBuddyWebUsage = {
+  status: 'empty';
+  accounts: readonly WorkBuddyWebAccount[];
+  pool: readonly WorkBuddyWebPoolEntry[];
+  message?: string;
+} | {
+  status: 'ready';
+  /** The account the pool would pick right now, for the card's headline. */
+  activeAccountId?: string;
+  accounts: readonly WorkBuddyWebAccount[];
+  pool: readonly WorkBuddyWebPoolEntry[];
+  credits: readonly WorkBuddyWebAccountCredits[];
+  models: readonly WorkBuddyWebModel[];
+  enabledModelIds: readonly string[];
+  imageModelIds: readonly string[];
+  /** Persisted per-account pool state, so the card can save it back. */
+  poolState: readonly WorkBuddyWebPoolState[];
+  /** Effective pool policy, so the card can display and edit it. */
+  policy: WorkBuddyWebPoolPolicy;
+} | {
+  status: 'error';
+  message: string;
+};
+/**
+ * The persisted per-account pool slice. Declared node-free because the browser
+ * half saves it back verbatim through `settingsScope`; `pool.ts` owns the
+ * semantics and the host writes the values.
+ */
+interface WorkBuddyPoolStateRecord {
+  accountId: string;
+  enabled: boolean;
+  weight: number;
+  priority: number;
+  cooldownUntil?: number;
+  cooldownKind?: 'soft' | 'hard';
+  cooldownCount?: number;
+  breakerUntil?: number;
+  degradedUntil?: number;
+}
+/** The card's view of the persisted pool slice: the same document. */
+type WorkBuddyWebPoolState = WorkBuddyPoolStateRecord;
+/**
+ * Health-policy knobs for the account pool. Declared here (node-free) so the
+ * browser half and the host's `pool.ts` share ONE definition; every default is
+ * the workbuddy2api default and lives in `pool.ts`.
+ */
+interface WorkBuddyPoolPolicy {
+  /** Concurrent requests per account; 0 means unlimited. */
+  maxInFlightPerAccount: number;
+  /** Concurrent requests per international (global) account; <=0 falls back to 2. */
+  maxInFlightGlobalPerAccount: number;
+  /** Concurrent requests across the whole pool; 0 means unlimited. */
+  maxInFlightTotal: number;
+  /** Soft-rate-limit cooldown base. */
+  softRateCooldownMs: number;
+  /** Soft-rate-limit exponential backoff ceiling. */
+  softRateCooldownMaxMs: number;
+  /** Fixed cooldown for an upstream 404. */
+  notFoundCooldownMs: number;
+  /** Consecutive failures before the breaker opens. */
+  breakerThreshold: number;
+  /** First breaker cooldown; doubles per consecutive trip. */
+  breakerCooldownMs: number;
+  /** Ceiling for the breaker cooldown. */
+  breakerCooldownMaxMs: number;
+  /** Consecutive unclassified failures before an account is degraded. */
+  degradeThreshold: number;
+  /** How long a degraded account stays deprioritized. */
+  degradeCooldownMs: number;
+  /** Ceiling for the degrade window. */
+  degradeCooldownMaxMs: number;
+  /** Session stickiness lifetime; 0 disables stickiness. */
+  stickyTtlMs: number;
+  /** How often expired sticky bindings are collected. */
+  stickyGcIntervalMs: number;
+  /** Ignore credit- and idle-based weighting, picking uniformly. */
+  balanceAware: boolean;
+}
+/** The card's view of the policy: the same document, under its web name. */
+type WorkBuddyWebPoolPolicy = WorkBuddyPoolPolicy;
+//#endregion
+//#region src/auth.d.ts
+/** Normalized WorkBuddy credential, timestamps in epoch milliseconds. */
+interface WorkBuddyCredential {
+  accessToken: string;
+  refreshToken: string;
+  expiresAtMs: number;
+  refreshExpiresAtMs?: number;
+  domain: string;
+  uid: string;
+  enterpriseId?: string;
+  nickname?: string;
+  uin?: string;
+  /** Which auth file this came from; refreshes are always `dsh`. */
+  source: 'desktop' | 'dsh';
+  /** Absolute path of the auth file this credential was read from. */
+  filePath: string;
+  /**
+   * Epoch ms the upstream last issued this token (`auth.lastRefreshTime`).
+   *
+   * This is the ONLY trustworthy freshness signal. `expiresAtMs` cannot be
+   * used for ranking: when the upstream revokes a token it leaves the stored
+   * `expiresAt` untouched, so a long-dead backup can claim a LATER expiry than
+   * the live sign-in (observed on a real machine — a 2026-07-08 backup claimed
+   * 2027-07-06 while the live file expired 2026-11-14).
+   */
+  lastRefreshAtMs?: number;
+}
+/** Read-only sign-in summary for status and doctor output. */
+interface WorkBuddyAuthStatus {
+  state: 'signed-in' | 'signed-out';
+  expiresAtMs?: number;
+  refreshExpiresAtMs?: number;
+  nickname?: string;
+  domain?: string;
+  source?: 'desktop' | 'dsh';
+}
+/** One selectable local account, token-free. */
+interface WorkBuddyAccountChoice {
+  /** Stable id derived from `uin` (or `uid` when uin is absent). */
+  id: string;
+  accountName: string;
+  uin?: string;
+  domain: string;
+  /** Region derived from `domain`; the pool reports it per account. */
+  region: WorkBuddyRegion;
+  source: 'desktop' | 'dsh';
+  tokenExpiresAtMs: number;
+  /** The auth file this account was read from; newest is preferred. */
+  filePath: string;
+}
+/** Constructor options; only {@link WorkBuddyCredentialStoreOptions.refresh} is required. */
+interface WorkBuddyCredentialStoreOptions {
+  /** Explicit desktop auth-file path, overriding env and platform defaults. */
+  desktopPath?: string;
+  /**
+   * Auth directories to scan, overriding the platform defaults. Injectable so
+   * the multi-account scan is testable without touching a real machine.
+   */
+  authDirs?: readonly string[];
+  /** Directory for the per-account refreshed copies; defaults to $DSH_HOME. */
+  storeDir?: string;
+  /** Performs the upstream token refresh. */
+  refresh: (credential: WorkBuddyCredential) => Promise<WorkBuddyRefreshOutcome>;
+  /** Refresh this long before actual expiry; default five minutes. */
+  refreshMarginMs?: number;
+}
+/** Env variable that overrides the desktop auth-file location. */
+declare const WORKBUDDY_AUTH_FILE_ENV = "WORKBUDDY_AUTH_FILE";
+/**
+ * Plugin-owned copy path for one account inside the Harness home. One file per
+ * account id means N simultaneously signed-in accounts never overwrite each
+ * other's refreshed token — the property the pool depends on.
+ */
+declare function workbuddyOwnAuthPath(accountId: string, storeDir?: string): string;
+/**
+ * Platform-default directories holding the WorkBuddy desktop app's auth file.
+ *
+ * Windows and Linux prefer the OS-issued env location and fall back to the
+ * home-derived convention when it is unset, so a redirected profile (OneDrive
+ * folder backup, enterprise policy) still resolves. macOS has no equivalent
+ * env variable; the single Application Support path is used as-is.
+ */
+declare function defaultDesktopAuthDirs(platform?: NodeJS.Platform, home?: string, env?: NodeJS.ProcessEnv): string[];
+/** The live auth file's platform candidates, in probe order. */
+declare function defaultDesktopAuthCandidates(): string[];
+/** First platform-default candidate; see {@link defaultDesktopAuthCandidates}. */
+declare function defaultDesktopAuthPath(): string | undefined;
+/** Normalize an expiry that may arrive in seconds or milliseconds. */
+declare function expiryToMs(value: number): number;
+/**
+ * Parse a WorkBuddy auth document in either on-disk shape: the plugin OAuth
+ * nested form `{"auth":{...},"account":{...}}` and the flat panel form.
+ * Returns undefined when the document carries no access token.
+ */
+declare function parseWorkBuddyAuth(text: string, filePath: string): WorkBuddyCredential | undefined;
+/**
+ * Filename of a path regardless of the host separator: Windows paths use `\`
+ * and this helper must keep working when a Windows path is compared on a
+ * POSIX host (e.g. tests injecting a Windows-style auth dir).
+ */
+declare function authFileName(path: string): string;
+/**
+ * Whether `candidate` is a better pick than `incumbent` for the same account.
+ * Ordering, strongest signal first: the live file; then the most recent
+ * `lastRefreshAtMs` (the upstream's own issuance time); then `expiresAtMs`
+ * as a fallback for documents that omit the field.
+ */
+declare function isFresher(candidate: WorkBuddyCredential, incumbent: WorkBuddyCredential): boolean;
+/**
+ * Stable account id. `uin` is the billing identity the upstream keys on and
+ * survives across re-login; `uid` is the fallback for documents without one.
+ */
+declare function workbuddyAccountId(credential: Pick<WorkBuddyCredential, 'uin' | 'uid' | 'nickname'>): string;
+/**
+ * Read-only credential registry with demand-driven refresh and multi-account
+ * discovery.
+ *
+ * Refresh policy: refresh only when the access token is inside the margin (or
+ * already expired), keep the refreshed credential in the account's own
+ * plugin-owned copy, and never write the desktop app's files. A failed refresh
+ * still returns a not-yet-expired token so an unreachable refresh endpoint does
+ * not take down a working session.
+ */
+declare class WorkBuddyCredentialStore {
+  private readonly refresh;
+  private readonly refreshMarginMs;
+  private readonly authDirs;
+  private readonly storeDir;
+  private desktopPathOverride;
+  /** In-flight refresh per account id; concurrent callers share one request. */
+  private readonly inflight;
+  constructor(options: WorkBuddyCredentialStoreOptions);
+  /** Repoint the desktop file or directory; applies on the next read. */
+  setDesktopPath(path: string | undefined): void;
+  /** The auth-file path candidates, in probe order. */
+  private resolveDesktopCandidates;
+  /** The resolved desktop auth-file path, for diagnostics. */
+  desktopAuthPath(): string | undefined;
+  /**
+   * Every auth file to scan: the live file plus the timestamped backups
+   * WorkBuddy leaves beside it.
+   *
+   * An explicitly configured path pins the *directory*: its siblings are still
+   * scanned, because a user who points the plugin at their auth file expects
+   * account switching to work the same way it does on the default path. Only
+   * the file ordering changes.
+   */
+  private candidateFiles;
+  /** Timestamped siblings of one auth file, newest first by filename. */
+  private backupsBeside;
+  /** Every plugin-owned copy currently on disk, keyed by account id. */
+  private readOwns;
+  /**
+   * Read every local credential, deduplicated by account id. Files are probed
+   * newest-first, so the first entry for an account is its freshest. Every
+   * account — both regions — is returned: the pool decides which ones to use.
+   */
+  readAll(): Promise<WorkBuddyCredential[]>;
+  /** Token-free account list for the plugin card, in discovery order. */
+  accounts(): Promise<WorkBuddyAccountChoice[]>;
+  /** The freshest stored credential for one account id, no refresh. */
+  current(accountId: string): Promise<WorkBuddyCredential | undefined>;
+  /**
+   * Every requested credential that is present locally, in the order asked.
+   * Ids with no local credential are dropped: the pool must be able to tell
+   * "this account vanished" from "this account is unhealthy".
+   */
+  byIds(accountIds: readonly string[]): Promise<WorkBuddyCredential[]>;
+  /** The credential to send upstream for one account: {@link current}, refreshed on demand. */
+  resolve(accountId: string): Promise<WorkBuddyCredential>;
+  /** Read-only sign-in summary for one account; never refreshes and never throws. */
+  status(accountId: string): Promise<WorkBuddyAuthStatus>;
+  /**
+   * Remove every plugin-owned copy this store wrote; the desktop files are
+   * untouched. `logout` is the user's "forget what the plugin stored" action,
+   * not a per-account toggle, so every per-account copy is cleared.
+   */
+  logout(): Promise<void>;
+  /** Whether any desktop candidate file exists as a regular file; diagnostics only. */
+  desktopFilePresent(): Promise<boolean>;
+  private needsRefresh;
+  private refreshNow;
+  private saveOwn;
+}
+//#endregion
+//#region src/upstream.d.ts
+/** WorkBuddy region selected by the credential's login domain. */
+type WorkBuddyRegion = 'cn' | 'global';
+/** Upstream failure classes the shim maps onto distinct HTTP answers. */
+type UpstreamErrorKind = 'hard_credit' | 'soft_rate' | 'session_dead' | 'not_found' | 'server' | 'client';
+/** Reasoning capability as the upstream catalog declares it. */
+interface WorkBuddyReasoning {
+  supportedEfforts?: readonly string[];
+  defaultEffort?: string;
+  canDisableThinking?: boolean;
+}
+/** One CLI-usable model, carrying everything the plugin card displays. */
+interface WorkBuddyUpstreamModel {
+  id: string;
+  name: string;
+  contextWindow: number;
+  maxTokens: number;
+  /** Credit multiplier parsed from the upstream `credits` string. */
+  creditMultiplier?: number;
+  /**
+   * Image-input support decided by the user's explicit selection
+   * (imageModelIds), not inferred from upstream capability flags.
+   */
+  multimodal?: boolean;
+  reasoning?: WorkBuddyReasoning;
+  descriptionZh?: string;
+  descriptionEn?: string;
+  supportsToolCall?: boolean;
+}
+/** One billing package as the upstream returns it, dates already parsed. */
+interface WorkBuddyCreditPackage {
+  packageName: string;
+  remain: number;
+  size: number;
+  /** CapacityType 4: refreshed every cycle and never expires. */
+  monthly: boolean;
+  /** Next cycle start (the monthly refresh point); only on monthly packages. */
+  refreshAtMs?: number;
+  /** One-off expiry; the package disappears from the account at this time. */
+  expiresAtMs?: number;
+}
+/** Aggregated credit answer for one credential. */
+interface WorkBuddyCredits {
+  total: number;
+  packages: readonly WorkBuddyCreditPackage[];
+  /** Credits expiring within 3 days across every package. */
+  expiringSoon: number;
+  /** When the nearest package expires, in ms. */
+  nearestExpiryMs?: number;
+}
+/** Daily check-in activity state. */
+interface WorkBuddyCheckinStatus {
+  active: boolean;
+  todayCheckedIn: boolean;
+  streakDays: number;
+  dailyCredit: number;
+  todayCredit: number;
+  isStreakDay: boolean;
+  nextStreakDay: number;
+  streakBonusDays: number;
+  streakBonusCredit: number;
+  claimButtonText?: string;
+}
+/** Daily check-in claim result. */
+interface WorkBuddyCheckinClaim {
+  credit: number;
+  streakDays: number;
+  isStreakDay: boolean;
+}
+/** Token refresh answer; fields the upstream omits stay absent. */
+interface WorkBuddyRefreshOutcome {
+  accessToken: string;
+  refreshToken?: string;
+  expiresInSec?: number;
+  domain?: string;
+}
+/** Chat answer: either a live SSE response or a classified failure. */
+type WorkBuddyChatResult = {
+  ok: true;
+  response: Response;
+} | {
+  ok: false;
+  status: number;
+  kind: UpstreamErrorKind;
+  message: string;
+};
+/** Classify an upstream failure from its HTTP status and body excerpt. */
+declare function classifyUpstreamError(status: number, body: string): UpstreamErrorKind;
+/**
+ * Region for a login domain; an empty domain means CN. The international
+ * product is reachable under TWO brand domains (`workbuddy.ai` desktop and
+ * `codebuddy.ai` CLI), both served by the same gateway stack.
+ */
+declare function regionOf(domain: string): WorkBuddyRegion;
+/**
+ * Normalize an OpenAI chat-completions body for the WorkBuddy upstream:
+ * force `stream: true` (the upstream rejects non-streaming), rewrite DSH's
+ * `developer` role to `system`, and flatten `tool_choice`.
+ */
+declare function prepareChatBody(source: string): string;
+/**
+ * Parse the upstream's `credits` string into a multiplier. Observed forms:
+ * `"x0.79 credits"`, `"x0.05"`, `"x0.00 credits"`, and absent. Unparsable
+ * values yield undefined rather than a guess.
+ */
+declare function parseCreditMultiplier(value: unknown): number | undefined;
+/** Parse the upstream's `reasoning` object; unknown shapes degrade to undefined. */
+declare function parseReasoning(value: unknown): WorkBuddyReasoning | undefined;
+/** Parse one catalog entry; entries without usable token limits are dropped. */
+declare function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | undefined;
+/**
+ * Select the chat-capable models from a catalog-shaped document: parse every
+ * entry, then keep the `cli` agent's roster in its declared order. Without a
+ * usable `cli` roster the whole parsed catalog is exposed rather than nothing.
+ */
+declare function selectCliModels(rawModels: unknown, agents: unknown): WorkBuddyUpstreamModel[];
+/**
+ * Upstream HTTP client. One instance serves the whole plugin; requests take
+ * the credential explicitly so token refreshes apply on the next call.
+ */
+declare class WorkBuddyUpstreamClient {
+  /** POST the chat endpoint; a successful answer is the raw SSE response. */
+  chatStream(credential: WorkBuddyCredential, bodyJson: string, signal?: AbortSignal): Promise<WorkBuddyChatResult>;
+  /** POST the token-refresh endpoint; the caller merges the outcome. */
+  refreshToken(credential: WorkBuddyCredential): Promise<WorkBuddyRefreshOutcome>;
+  /**
+   * Read the model directory for the credential's region. CN answers
+   * `/v2/enterprises/personal/models`; the global gateway answers `/v3/config`
+   * for the desktop channel (its personal-models path returns HTTP 500 and the
+   * CLI channel omits chat-usable models).
+   */
+  fetchModels(credential: WorkBuddyCredential, signal?: AbortSignal): Promise<readonly WorkBuddyUpstreamModel[]>;
+  /**
+   * Read every pooled account's directory and merge the results into one
+   * plugin-wide catalog. Accounts are queried in parallel and a failing account
+   * never fails the merge: the catalog is the union of what the pool can
+   * actually serve, so one expired sign-in must not blank the model picker.
+   * When EVERY account fails the last error is thrown so the caller can report
+   * a real cause instead of an empty catalog.
+   */
+  fetchModelsForCredentials(credentials: readonly WorkBuddyCredential[], signal?: AbortSignal): Promise<WorkBuddyUpstreamModel[]>;
+  /** Query today's check-in status without changing account state. */
+  fetchCheckinStatus(credential: WorkBuddyCredential): Promise<WorkBuddyCheckinStatus>;
+  /** Claim today's check-in reward. The browser route guards this mutation. */
+  claimDailyCheckin(credential: WorkBuddyCredential): Promise<WorkBuddyCheckinClaim>;
+  /**
+   * POST the billing endpoint for the remaining credit, keeping every package
+   * separate: the card groups monthly-cycle packages itself and lists the
+   * nearest-expiring one-off packages, so aggregation here would lose the
+   * dates it needs.
+   */
+  fetchCredits(credential: WorkBuddyCredential): Promise<WorkBuddyCredits>;
+}
+//#endregion
+//#region src/pool.d.ts
+/** One account as the credential store sees it. */
+interface WorkBuddyPoolAccount {
+  id: string;
+  accountName: string;
+  region: WorkBuddyRegion;
+  tokenExpiresAtMs: number;
+}
+/** Runtime health of one pool entry, as the card reports it. */
+type WorkBuddyPoolState = 'ready' | 'cooldown' | 'degraded' | 'missing' | 'disabled';
+/** One pool entry, as the settings card renders it. */
+interface WorkBuddyPoolEntry {
+  accountId: string;
+  accountName: string;
+  region: WorkBuddyRegion;
+  /** The user's per-account switch; a disabled account is never picked. */
+  enabled: boolean;
+  /** Relative pick weight (integer 1..100). */
+  weight: number;
+  /** Lower number = preferred; orders the pool listing and breaks ties. */
+  priority: number;
+  /** Derived health, never stored. */
+  state: WorkBuddyPoolState;
+  /** Soft/hard cooldown deadline (epoch ms), when one is running. */
+  cooldownUntil?: number;
+  /** `hard` cooldowns come from out-of-credit or dead-session answers. */
+  cooldownKind?: 'soft' | 'hard';
+  /** Breaker deadline, when the breaker is open. */
+  breakerUntil?: number;
+  /** Degrade deadline, when the account is being deprioritized. */
+  degradedUntil?: number;
+  /** Requests currently dispatched to this account. */
+  inFlight: number;
+  successes: number;
+  failures: number;
+  /** Consecutive failures; drives the breaker and the degrade window. */
+  consecutiveFailures: number;
+  /** How many times the soft/credit cooldown has been extended. */
+  cooldownCount: number;
+  lastUsedAt?: number;
+  lastSuccessAt?: number;
+  lastErrorAt?: number;
+  lastError?: string;
+  /** Remaining credits, when the card or the CLI last queried them. */
+  credits?: number;
+  creditsAtMs?: number;
+  /** Credits expiring inside the configured window (default 7 days). */
+  creditsExpiringSoon?: number;
+  /** Whether the account still has a local credential file. */
+  present: boolean;
+  tokenExpiresAtMs: number;
+}
+/**
+ * Pool policy as this module consumes it: the shared, node-free knobs plus the
+ * weighting constants that only the host needs.
+ */
+interface WorkBuddyPoolTuning extends WorkBuddyPoolPolicy {
+  /** Idle compensation: weight gained per hour of not being used. */
+  idleWeightPerHour: number;
+  /** Idle compensation ceiling. */
+  idleWeightMax: number;
+  /** Weight multiplier for the share of credits expiring inside the window. */
+  expiringWeight: number;
+  /** The "expiring soon" window used both for weighting and credit bucketing. */
+  expiringSoonMs: number;
+  /** Two picks inside this gap never choose the same account. */
+  minPickGapMs: number;
+}
+/** The workbuddy2api-derived default policy. */
+declare const DEFAULT_WORKBUDDY_POOL_POLICY: WorkBuddyPoolTuning;
+/** Outcome of one dispatch, reported back by the shim. */
+interface WorkBuddyDispatchOutcome {
+  ok: boolean;
+  /** Upstream failure class; `transport` covers a failed connection. */
+  kind?: UpstreamErrorKind;
+  /** Redacted, human-readable reason stored on the entry. */
+  message?: string;
+}
+/** Why the pool could not pick any account at all. */
+type WorkBuddyPoolMissReason = 'no-accounts' | 'all-disabled' | 'pool-saturated';
+/** What {@link WorkBuddyAccountPool.pick} answers. */
+type WorkBuddyPickResult = {
+  ok: true;
+  entry: WorkBuddyPoolEntry;
+  /**
+   * True when every account was cooling down and the picker fell back to the
+   * one whose cooldown expires first. The request is still worth attempting:
+   * a cooldown is a local guess, not an upstream verdict.
+   */
+  fallback: boolean;
+} | {
+  ok: false;
+  reason: WorkBuddyPoolMissReason;
+};
+/** Constructor dependencies. */
+interface WorkBuddyAccountPoolOptions {
+  /** Re-read the locally discoverable accounts. */
+  list: () => Promise<readonly WorkBuddyPoolAccount[]>;
+  /** The persisted per-account state, keyed by account id. */
+  state?: readonly WorkBuddyPoolStateRecord[];
+  policy?: Partial<WorkBuddyPoolTuning>;
+  /** Injected clock, for deterministic tests. */
+  now?: () => number;
+  /** Injected randomness in [0, 1), for deterministic tests. */
+  random?: () => number;
+}
+/**
+ * Session-stickiness key for one chat request.
+ *
+ * DSH identifies a conversation by its system prompt plus its first user
+ * message; hashing both keeps one conversation on one account while different
+ * conversations spread across the pool, which is what makes pooled use look
+ * like a single account to the upstream's own conversation memory.
+ */
+declare function stickyKeyOf(bodyJson: string): string | undefined;
+/** The local 04:00 following `now`, the hard-credit cooldown deadline. */
+declare function nextDay4Am(now: number): number;
+/**
+ * A weighted account pool over locally discovered WorkBuddy sign-ins.
+ *
+ * The pool owns no credentials: it decides *which* account id should serve a
+ * request, and the shim resolves that account's credential from the store.
+ * That split keeps token material out of the scheduling layer and makes the
+ * whole pick deterministic under an injected clock and RNG.
+ */
+declare class WorkBuddyAccountPool {
+  private readonly list;
+  private readonly now;
+  private readonly random;
+  private readonly entries;
+  private readonly sticky;
+  private policy;
+  private totalInFlight;
+  private seq;
+  private gcTimer;
+  constructor(options: WorkBuddyAccountPoolOptions);
+  /** Replace the health policy; the next pick uses the new numbers. */
+  setPolicy(policy: Partial<WorkBuddyPoolTuning>): void;
+  /** The policy in force. */
+  currentPolicy(): WorkBuddyPoolTuning;
+  private blankEntry;
+  /**
+   * Re-read the local accounts and merge them into the pool. Accounts that
+   * vanished keep their entry (so their counters and the user's switch survive
+   * a temporarily unreadable auth file) but are marked `present: false` and
+   * become unpickable. Accounts that reappear are un-marked.
+   */
+  refresh(): Promise<void>;
+  /** Drop every entry whose account no longer exists locally. */
+  prune(): void;
+  /** Every entry, in card order: by priority, then by account name. */
+  snapshot(): WorkBuddyPoolEntry[];
+  /** One entry's card view, or undefined when the account is unknown. */
+  entryView(accountId: string): WorkBuddyPoolEntry | undefined;
+  private view;
+  private stateOf;
+  /** The per-account concurrency ceiling for this account's region. */
+  private inFlightLimit;
+  /** Whether the account is below its concurrency ceiling. */
+  private inFlightFull;
+  /**
+   * The four-dimension health gate: present, enabled, out of every cooldown,
+   * and below the concurrency ceiling.
+   */
+  private healthy;
+  /** The earliest still-running deadline of an entry, or 0 when it is clear. */
+  private expiryOf;
+  /** The sticky binding for a session key, when it is alive. */
+  private stickyBinding;
+  /** Weight of one candidate, per the reference's three-factor formula. */
+  private weightOf;
+  /**
+   * Choose the account for one request and reserve its concurrency slot. The
+   * caller MUST call {@link release} once the request settles.
+   *
+   * Decision order, mirroring workbuddy2api's picker:
+   *
+   * 1. a live session binding wins whenever its account is healthy — one
+   *    conversation must not bounce between accounts mid-flight;
+   * 2. otherwise filter to healthy accounts the caller has not already tried;
+   * 3. when nothing is healthy, fall back to the cooling account whose deadline
+   *    expires first (never a hard-credit cooldown): a cooldown is a local
+   *    guess, so it is still better to try than to fail the request;
+   * 4. rank by weight (credits ×10, expiring credits ×8, idle 0.5/h up to 5);
+   * 5. take the top five and drop those used inside the anti-collision gap,
+   *    falling back to the least-recently-used account in the FULL candidate
+   *    set — never only the shortlist, which would starve tied accounts;
+   * 6. draw one weighted-random from what remains.
+   */
+  pick(options?: {
+    exclude?: ReadonlySet<string>;
+    stickyKey?: string;
+  }): WorkBuddyPickResult;
+  /** Why nothing could be picked, in the most specific available terms. */
+  private missReason;
+  /**
+   * The all-cooling fallback: the account whose earliest running deadline is
+   * closest. Hard-credit cooldowns are excluded — the account is out of
+   * credits, so retrying it only burns a request.
+   */
+  private pickEarliestExpiry;
+  /** Fixed-point weighted draw over the candidates. */
+  private pickWeighted;
+  /** Reserve one concurrency slot on an entry and record the dispatch. */
+  private dispatch;
+  /**
+   * Return a reserved slot. Safe to call once per successful {@link pick};
+   * a double release would corrupt the ceilings, so the caller must pair them.
+   */
+  release(accountId: string): void;
+  /**
+   * Record one dispatch outcome and apply the health transition.
+   *
+   * | outcome | transition |
+   * |---|---|
+   * | success | clear every counter and rolling-renew the sticky binding |
+   * | `hard_credit` | hard cooldown until the next local 04:00 |
+   * | `session_dead` | hard cooldown until the next local 04:00 (re-sign-in) |
+   * | `soft_rate` | soft cooldown, base 600s doubling per streak, capped at 2h; an already-running soft cooldown is never extended |
+   * | `not_found` | fixed 60s soft cooldown |
+   * | `server` | breaker: opens at 3 consecutive failures, 30m doubling, capped at 6h |
+   * | `transport` / `client` | degrade after 5 consecutive failures (10m) — an unknown failure is not the account's fault |
+   */
+  report(accountId: string, outcome: WorkBuddyDispatchOutcome, stickyKey?: string): void;
+  /** Cache the credits the card or the CLI read for one account. */
+  setCredits(accountId: string, credits: {
+    total: number;
+    expiringSoon: number;
+  }): void;
+  /** Apply the card's per-account switches and weights. */
+  configure(updates: readonly {
+    accountId: string;
+    enabled?: boolean;
+    weight?: number;
+    priority?: number;
+  }[]): void;
+  /** Forget one account's cooldown, breaker, and degrade marks. */
+  reset(accountId: string): void;
+  /** The pool slice to persist into settings. */
+  toPersisted(): WorkBuddyPoolStateRecord[];
+  /** Live sticky-binding count, for diagnostics. */
+  stickySize(): number;
+  /** Stop the sticky GC timer; called when the plugin is disposed. */
+  dispose(): void;
+  private startGc;
+}
+//#endregion
+//#region src/catalog.d.ts
+/** One model entry the adapter exposes. */
+type WorkBuddyModelInfo = WorkBuddyUpstreamModel;
+/** Local DSH context budget for one model id. */
+type WorkBuddyContextBudget = number;
+/**
+ * Static CLI models captured from the CN endpoint (2026-08-30). The upstream
+ * refresh replaces this list at startup; it exists so the provider registers
+ * with a usable catalog even while the first fetch is in flight or offline.
+ */
+declare const FALLBACK_WORKBUDDY_MODELS: readonly WorkBuddyModelInfo[];
+/**
+ * Static CLI models captured from the INTERNATIONAL gateway's desktop-channel
+ * product config (`www.workbuddy.ai/v3/config`, 2026-09-11).
+ */
+declare const FALLBACK_WORKBUDDY_MODELS_GLOBAL: readonly WorkBuddyModelInfo[];
+/**
+ * The union of both regions' fallbacks, CN entries first and duplicates
+ * resolved in favour of the CN spelling (its context/output numbers are the
+ * ones the CN gateway serves). The union matters because ONE provider now
+ * serves every pooled account: seeding it with a single region's roster would
+ * hide the other region's models until the first live refresh lands.
+ */
+declare const FALLBACK_WORKBUDDY_MODELS_UNION: readonly WorkBuddyModelInfo[];
+/** Apply the saved local DSH budget; models above 200K default to 200K. */
+declare function applyContextBudgets(catalog: readonly WorkBuddyModelInfo[], budgets?: Readonly<Record<string, WorkBuddyContextBudget | undefined>>): WorkBuddyModelInfo[];
+/**
+ * Derive the runtime catalog from the last-refreshed directory plus the user's
+ * selection. An empty selection falls back to the whole directory: a plugin
+ * that has never been configured must still serve models rather than nothing.
+ */
+declare function deriveCatalog(catalog: readonly WorkBuddyModelInfo[], enabled: ReadonlySet<string>, budgets?: Readonly<Record<string, WorkBuddyContextBudget | undefined>>): WorkBuddyModelInfo[];
+/** Mutable catalog shared by the shim's `/v1/models` and the adapter. */
+declare class WorkBuddyCatalog {
+  private models;
+  constructor(seed?: readonly WorkBuddyModelInfo[]);
+  /** Current entries; the fallback list until the upstream answer lands. */
+  current(): readonly WorkBuddyModelInfo[];
+  /** Replace the list; callers invalidate their adapter snapshot after this. */
+  set(models: readonly WorkBuddyModelInfo[]): void;
+}
+//#endregion
+//#region src/shim.d.ts
+/** Minimal logger surface the plugin context already provides. */
+interface ShimLogger {
+  warn(...args: unknown[]): void;
+  error(...args: unknown[]): void;
+}
+/** What the plugin needs from a running shim. */
+interface WorkBuddyShim {
+  /** Resolves once the listener is up; rejects if listening failed. */
+  ready: Promise<void>;
+  /** The shim origin, e.g. `http://127.0.0.1:39271`; valid after ready. */
+  baseUrl(): string;
+  /**
+   * The per-process shared secret the plugin's own client must carry as
+   * `Authorization: Bearer <token>`. Lives only in memory; the adapter
+   * resolves this instead of any upstream token, because the shim resolves the
+   * real credential itself via the store and the pool.
+   */
+  token(): string;
+  /** Stop serving and destroy open connections. */
+  close(): Promise<void>;
+}
+/** Constructor dependencies. */
+interface WorkBuddyShimOptions {
+  store: WorkBuddyCredentialStore;
+  pool: WorkBuddyAccountPool;
+  client: Pick<WorkBuddyUpstreamClient, 'chatStream'>;
+  catalog: WorkBuddyCatalog;
+  logger?: ShimLogger;
+  /** Maximum upstream attempts for one chat request (account switches included). */
+  maxAttempts?: number;
+}
+/**
+ * Start the loopback endpoint. Requests must carry the shim's shared secret;
+ * the loopback bind alone is not a trust boundary.
+ */
+declare function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShim;
+//#endregion
+//#region src/adapter.d.ts
+/** Provider route this bundle owns. */
+declare const WORKBUDDY2API_PROVIDER = "workbuddy2api";
+/** Human-readable provider name, shown in the DSH model picker. */
+declare const WORKBUDDY2API_PROVIDER_DISPLAY_NAME = "WorkBuddy 账号池";
+/** Provider idle ceiling while one stream read is outstanding. */
+declare const WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS = 300000;
+/** Constructor dependencies. */
+interface WorkBuddyAdapterOptions {
+  shim: WorkBuddyShim;
+  catalog: WorkBuddyCatalog;
+  /** Resolve the durable attachment service at request time, when present. */
+  resolveAttachments?: () => AttachmentStore | undefined;
+}
+/** What {@link createWorkBuddyAdapter} hands back. */
+interface WorkBuddyAdapter {
+  adapter: PiAiAdapter;
+  /** Rebuild the adapter's provider snapshot; call after a catalog update. */
+  invalidate: () => void;
+}
+declare const THINKING_LEVELS: readonly ["minimal", "low", "medium", "high", "xhigh", "max"];
+type WorkBuddyThinkingLevel = typeof THINKING_LEVELS[number];
+type WorkBuddyThinkingLevelMap = Partial<Record<'off' | WorkBuddyThinkingLevel, string | null>>;
+/** pi-ai input modalities: images only when the user opted the model in. */
+declare function workBuddyModelInput(info: WorkBuddyModelInfo): ('text' | 'image')[];
+/**
+ * DSH-facing display name: the model name plus the upstream credit multiplier,
+ * spelled the way WorkBuddy's own selector does (`GLM-5.3 · x0.79`).
+ *
+ * Display-only by construction: every DSH-side join keys on the model id.
+ */
+declare function workBuddyDisplayName(info: WorkBuddyModelInfo): string;
+/** Map only levels advertised by WorkBuddy; undeclared DSH levels stay unavailable. */
+declare function workBuddyThinkingLevelMap(info: WorkBuddyModelInfo): WorkBuddyThinkingLevelMap | undefined;
+/**
+ * Assemble the adapter. The provider's `getModels` reads the live catalog, and
+ * every model's `baseUrl` is re-resolved per read so the shim's ephemeral port
+ * applies from the first snapshot after startup.
+ */
+declare function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkBuddyAdapter;
+//#endregion
+//#region src/host-heartbeat.d.ts
+/**
+ * Host-side heartbeat: a small JSON file written under `$DSH_HOME` once the
+ * `workbuddy2api` provider is registered. The status CLI reads it to report
+ * whether the host bundle is alive, independent of the browser card.
+ *
+ * 参考：dingminhua/dsh-connect-workbuddy（MIT，Copyright (c) 2026 LaoDing）
+ *   — 心跳机制由其沿用自 corrinehu/dsh-workbuddy-connect（MIT）：浏览器端
+ *     无法写文件，其健康只能靠 console.error 上报，因此由宿主写心跳文件，
+ *     缺失即代表宿主从未启动；崩溃后的陈旧心跳通过 PID 存活检查识别。
+ * 改动：文件名与包名改成本插件；额外记录账号池规模，便于 `status` 直接
+ *   报出池子大小。
+ *
+ * @module dsh-workbuddy2api/host-heartbeat
+ */
+/** Basename of the host heartbeat file inside the Harness home. */
+declare const WORKBUDDY2API_HOST_HEARTBEAT_FILENAME = ".workbuddy2api-host-heartbeat.json";
+/** Current on-disk heartbeat format; readers reject others. */
+declare const HEARTBEAT_FORMAT_VERSION = 1;
+/** The package name recorded in the heartbeat, checked by the reader. */
+declare const PACKAGE_NAME = "dsh-workbuddy2api";
+/** On-disk shape of the heartbeat. */
+interface WorkBuddyHostHeartbeat {
+  version: typeof HEARTBEAT_FORMAT_VERSION;
+  package: typeof PACKAGE_NAME;
+  pluginVersion: string;
+  /** Epoch milliseconds when the host registered the provider. */
+  registeredAt: number;
+  /** Host process PID, to distinguish a stale heartbeat after a crash. */
+  pid: number;
+  /** Accounts the pool held when the heartbeat was written. */
+  accounts?: number;
+}
+/** Absolute path of the host heartbeat file. */
+declare function workbuddyHostHeartbeatPath(): string;
+/**
+ * Process start time in epoch milliseconds; undefined when unavailable.
+ *
+ * POSIX reads `ps -o lstart=`; Windows has no such command, so the creation
+ * time is taken from PowerShell's `Get-Process` StartTime, emitted as UTC ISO
+ * 8601 so `Date.parse` understands it without locale assumptions.
+ */
+declare function processStartTimeMs(pid: number): number | undefined;
+/**
+ * Whether the recorded host process still matches the heartbeat's PID.
+ *
+ * A PID can be reused after a crash, so the recorded start time is compared
+ * against the live process: a different start time means a different process.
+ */
+declare function isHeartbeatProcessAlive(heartbeat: WorkBuddyHostHeartbeat): boolean;
+/** Read the heartbeat; absent or unparsable files report undefined. */
+declare function readHostHeartbeat(): Promise<WorkBuddyHostHeartbeat | undefined>;
+/** Write the heartbeat for the current process. */
+declare function writeHostHeartbeat(accounts?: number): Promise<void>;
+/** Remove the heartbeat; called when the plugin is disposed. */
+declare function clearHostHeartbeat(): Promise<void>;
+//#endregion
+//#region src/version.d.ts
+/**
+ * Package version, injected at build time by `tsdown.config.ts`.
+ *
+ * 参考：corrinehu/dsh-workbuddy-connect（MIT）— 版本由构建期 define 注入，
+ *   而非运行时读 package.json（发布包只含 lib/）。
+ * 参考：dingminhua/dsh-connect-workbuddy（MIT，Copyright (c) 2026 LaoDing）
+ *   — 同样的 define 注入形态，本插件沿用。
+ * 改动：常量名改为本插件的 `WORKBUDDY2API_VERSION`。
+ *
+ * @module dsh-workbuddy2api/version
+ */
+/** The npm package version this build was produced from. */
+declare const WORKBUDDY2API_VERSION: string;
+//#endregion
+//#region src/web-status.d.ts
+/** Constructor dependencies. */
+interface WorkBuddyStatusRouteOptions {
+  store: WorkBuddyCredentialStore;
+  pool: WorkBuddyAccountPool;
+  client: Pick<WorkBuddyUpstreamClient, 'fetchCredits' | 'fetchCheckinStatus' | 'claimDailyCheckin'>;
+  /** The last-refreshed model directory (unfiltered) for card display. */
+  displayModels(): readonly WorkBuddyModelInfo[];
+  /** The user's selection, stored as model ids. */
+  enabledModelIds(): readonly string[];
+  /** Model ids the user opted into image input. */
+  imageModelIds(): readonly string[];
+  /** Saved local DSH context budgets by model id. */
+  contextBudgets(): Readonly<Record<string, number | undefined>>;
+  /** Persisted per-account pool state, mirrored to the card for saving. */
+  poolState(): readonly WorkBuddyWebPoolState[];
+  /** The pool policy in force. */
+  policy(): WorkBuddyPoolPolicy;
+  /** Re-read the live catalog from every account and merge it. */
+  discoverModels?(signal?: AbortSignal): Promise<readonly WorkBuddyModelInfo[]>;
+  /** Fetch and cache one account's credits; resolves to the fetched answer. */
+  refreshCredits?(accountId: string): Promise<WorkBuddyCredits>;
+}
+/**
+ * Assemble the card's document: the locally discovered accounts, the pool's
+ * live health per account, the cached credits, and the model directory with
+ * the user's selection. Credit queries never run here — the pool's cache is
+ * read instead, so a 60-second card poll does not hammer N upstream billing
+ * endpoints.
+ */
+declare function workBuddyWebStatus(deps: WorkBuddyStatusRouteOptions): Promise<WorkBuddyWebUsage>;
+/**
+ * Mount the routes on a context where `webServer` is available. The caller
+ * uses `ctx.inject(['webServer'], ...)`, so Desktop startup order cannot make
+ * this registration disappear.
+ */
+declare function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddyStatusRouteOptions): void;
+//#endregion
+//#region src/index.d.ts
+/** Stable Cordis plugin name. */
+declare const name = "dsh-workbuddy2api";
+/** The model registry and settings service required before the provider can register. */
+declare const inject: string[];
+/** Settings namespace for the plugin configuration card. */
+declare const WORKBUDDY2API_SETTINGS_NS: SettingsNamespace;
+/** One persisted model entry; the settings codec rejects unknown keys. */
+interface WorkBuddyPersistedModel {
+  id: string;
+  name: string;
+  contextWindow: number;
+  maxTokens: number;
+  creditMultiplier?: number;
+  reasoning?: {
+    supportedEfforts?: readonly string[];
+    defaultEffort?: string;
+    canDisableThinking?: boolean;
+  };
+  descriptionZh?: string;
+  descriptionEn?: string;
+  supportsToolCall?: boolean;
+}
+/** Plugin configuration. */
+interface Config {
+  /** Explicit WorkBuddy desktop auth-file path, overriding env and platform defaults. */
+  authFile?: string;
+  /** The last-refreshed model directory; what the card displays. */
+  lastCatalog?: WorkBuddyPersistedModel[];
+  /** The user's model selection, as model ids. */
+  enabledModelIds?: string[];
+  /** Model ids the user explicitly opted into image input. */
+  imageModelIds?: string[];
+  /** Local DSH context budget per model id. */
+  contextBudgets?: Record<string, number>;
+  /** Per-account pool switches, weights, and running cooldowns. */
+  poolState?: WorkBuddyPoolStateRecord[];
+  /** Health-policy overrides; absent fields take the plugin defaults. */
+  pool?: Partial<WorkBuddyPoolPolicy>;
+}
+declare const Config: z<Config>;
+/** The persisted pool policy over the defaults, dropping unknown values. */
+declare function resolvePolicy(configured: Partial<WorkBuddyPoolPolicy> | undefined): WorkBuddyPoolPolicy;
+/**
+ * Wire the pool, the loopback shim, and the single provider route.
+ *
+ * Ordering is load-bearing: the shim must hold its ephemeral port before the
+ * provider is constructed, because every model's `baseUrl` is read from the
+ * shim origin at construction time.
+ */
+declare function apply(ctx: Context, config: Config): void;
+//#endregion
+export { Config, DEFAULT_WORKBUDDY_POOL_POLICY, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, FALLBACK_WORKBUDDY_MODELS_UNION, type UpstreamErrorKind, WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, WORKBUDDY2API_ACCOUNT_PARAM, WORKBUDDY2API_CHECKIN_PATH, WORKBUDDY2API_CREDITS_REFRESH_PATH, WORKBUDDY2API_HOST_HEARTBEAT_FILENAME, WORKBUDDY2API_MODELS_REFRESH_PATH, WORKBUDDY2API_POOL_ACTION_PATH, WORKBUDDY2API_PROVIDER, WORKBUDDY2API_PROVIDER_DISPLAY_NAME, WORKBUDDY2API_SETTINGS_NS, WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY2API_USAGE_PATH, WORKBUDDY2API_VERSION, WORKBUDDY_AUTH_FILE_ENV, type WorkBuddyAccountChoice, WorkBuddyAccountPool, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCheckinClaim, type WorkBuddyCheckinStatus, type WorkBuddyContextBudget, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredentialStoreOptions, type WorkBuddyCreditPackage, type WorkBuddyCredits, type WorkBuddyDispatchOutcome, type WorkBuddyHostHeartbeat, type WorkBuddyModelInfo, WorkBuddyPersistedModel, type WorkBuddyPickResult, type WorkBuddyPoolAccount, type WorkBuddyPoolEntry, type WorkBuddyPoolMissReason, type WorkBuddyPoolPolicy, type WorkBuddyPoolState, type WorkBuddyPoolStateRecord, type WorkBuddyReasoning, type WorkBuddyRefreshOutcome, type WorkBuddyRegion, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyWebAccount, type WorkBuddyWebAccountCredits, type WorkBuddyWebCheckin, type WorkBuddyWebCredits, type WorkBuddyWebModel, type WorkBuddyWebPackage, type WorkBuddyWebPoolEntry, type WorkBuddyWebPoolPolicy, type WorkBuddyWebPoolState, type WorkBuddyWebUsage, apply, applyContextBudgets, authFileName, classifyUpstreamError, clearHostHeartbeat, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, deriveCatalog, expiryToMs, inject, isFresher, isHeartbeatProcessAlive, name, nextDay4Am, parseCreditMultiplier, parseReasoning, parseUpstreamModel, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, readHostHeartbeat, regionOf, registerWorkBuddy2ApiStatusRoute, resolvePolicy, selectCliModels, stickyKeyOf, toPersistedWorkBuddyModel, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, writeHostHeartbeat };

@@ -2,7 +2,7 @@
   "name": "dsh-workbuddy2api",
   "displayName": "DSH WorkBuddy2API",
   "description": "Multi-account WorkBuddy account pool for DeepSeek Harness — rotation, session stickiness, cooldown/breaker health, and per-account credits, modelled on workbuddy2api.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Boiser",
   "copyright": "Copyright (c) 2026 dsh-wb2api",
   "license": "MIT",
