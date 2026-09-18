@@ -33,8 +33,11 @@ import {
   WORKBUDDY2API_ACCOUNT_PARAM,
   WORKBUDDY2API_CHECKIN_PATH,
   WORKBUDDY2API_CREDITS_REFRESH_PATH,
+  WORKBUDDY2API_LOGIN_POLL_PATH,
+  WORKBUDDY2API_LOGIN_START_PATH,
   WORKBUDDY2API_MODELS_REFRESH_PATH,
   WORKBUDDY2API_POOL_ACTION_PATH,
+  WORKBUDDY2API_STATE_PARAM,
   WORKBUDDY2API_USAGE_PATH,
 } from './status-paths.ts'
 import type {
@@ -42,18 +45,24 @@ import type {
   WorkBuddyWebAccount,
   WorkBuddyWebAccountCredits,
   WorkBuddyWebCredits,
+  WorkBuddyWebLogin,
   WorkBuddyWebModel,
   WorkBuddyWebPoolState,
   WorkBuddyWebUsage,
 } from './status-paths.ts'
+import { WorkBuddyLoginUnknownStateError } from './login.ts'
+import type { WorkBuddyLoginManager } from './login.ts'
 
 export {
   WORKBUDDY2API_ACCOUNTS_REFRESH_PATH,
   WORKBUDDY2API_ACCOUNT_PARAM,
   WORKBUDDY2API_CHECKIN_PATH,
   WORKBUDDY2API_CREDITS_REFRESH_PATH,
+  WORKBUDDY2API_LOGIN_POLL_PATH,
+  WORKBUDDY2API_LOGIN_START_PATH,
   WORKBUDDY2API_MODELS_REFRESH_PATH,
   WORKBUDDY2API_POOL_ACTION_PATH,
+  WORKBUDDY2API_STATE_PARAM,
   WORKBUDDY2API_USAGE_PATH,
 }
 export type { WorkBuddyWebUsage }
@@ -86,6 +95,11 @@ export interface WorkBuddyStatusRouteOptions {
   discoverModels?(region: WorkBuddyRegion, signal?: AbortSignal): Promise<readonly WorkBuddyModelInfo[]>
   /** Fetch and cache one account's credits inside its own region's pool. */
   refreshCredits?(region: WorkBuddyRegion, accountId: string): Promise<WorkBuddyCredits>
+  /**
+   * The in-process web sign-in. Absent when the host did not wire it, in which
+   * case the two sign-in routes answer 503 instead of failing obscurely.
+   */
+  login?: WorkBuddyLoginManager
 }
 
 /** Redact token-like content before it crosses to the browser. */
@@ -414,6 +428,98 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
       },
     })
 
+    /**
+     * Start a browser sign-in. The authorization URL is returned to the page,
+     * which opens it; the token bundle never crosses this route in either
+     * direction.
+     */
+    const disposeLoginStart = ctx.webServer.register({
+      kind: 'exact',
+      path: WORKBUDDY2API_LOGIN_START_PATH,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (!guard(req, res, 'POST')) return
+        const region = requestRegion(req, res)
+        if (region === undefined) return
+        const login = deps.login
+        if (login === undefined) {
+          json(res, 503, { error: 'web sign-in unavailable' })
+          return
+        }
+        try {
+          const started = await login.start(region)
+          json(res, 200, { region, state: started.state, url: started.url })
+        } catch (error: unknown) {
+          json(res, 502, { error: safeMessage(error) })
+        }
+      },
+    })
+
+    /**
+     * Poll one sign-in. Unfinished answers `waiting`; a completed one answers
+     * the account it created, which the card then re-reads through the normal
+     * status route.
+     */
+    const disposeLoginPoll = ctx.webServer.register({
+      kind: 'exact',
+      path: WORKBUDDY2API_LOGIN_POLL_PATH,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (!guard(req, res, 'GET')) return
+        const region = requestRegion(req, res)
+        if (region === undefined) return
+        const login = deps.login
+        if (login === undefined) {
+          json(res, 503, { error: 'web sign-in unavailable' })
+          return
+        }
+        const url = req.url ?? '/'
+        const at = url.indexOf('?')
+        const state = at === -1 ? null : new URLSearchParams(url.slice(at + 1)).get(WORKBUDDY2API_STATE_PARAM)
+        if (state === null || state === '') {
+          json(res, 400, { error: 'state is required' })
+          return
+        }
+        try {
+          const poll = await login.poll(state)
+          if (!poll.done) {
+            const waiting: WorkBuddyWebLogin = {
+              status: 'waiting',
+              region,
+              ...poll.message === undefined ? {} : { message: poll.message },
+            }
+            json(res, 200, waiting)
+            return
+          }
+          const listed = (await accountsOf(deps, region)).find(entry => entry.id === poll.account.accountId)
+          // The credential is already on disk, so the account list normally
+          // carries it; the fallback only covers a scan that ran mid-write.
+          const account: WorkBuddyWebAccount = listed ?? {
+            id: poll.account.accountId,
+            accountName: poll.account.accountName,
+            ...poll.account.nickname === undefined ? {} : { uin: poll.account.uid },
+            domain: poll.account.domain,
+            region,
+            source: 'dsh',
+            tokenExpiresAtMs: 0,
+            enabled: true,
+            present: true,
+          }
+          const done: WorkBuddyWebLogin = {
+            status: 'done',
+            region,
+            account,
+            ...poll.note === undefined ? {} : { note: poll.note },
+          }
+          json(res, 200, done)
+        } catch (error: unknown) {
+          if (error instanceof WorkBuddyLoginUnknownStateError) {
+            json(res, 404, { error: safeMessage(error) })
+            return
+          }
+          json(res, 502, { error: safeMessage(error) })
+        }
+      },
+    })
+
     const disposePool = ctx.webServer.register({
       kind: 'exact',
       path: WORKBUDDY2API_POOL_ACTION_PATH,
@@ -450,6 +556,8 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
     })
 
     return () => {
+      disposeLoginPoll()
+      disposeLoginStart()
       disposePool()
       disposeModels()
       disposeCheckin()

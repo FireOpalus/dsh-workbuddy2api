@@ -25,6 +25,13 @@ export const WORKBUDDY2API_CREDITS_REFRESH_PATH = '/plugins/dsh-workbuddy2api/cr
 export const WORKBUDDY2API_CHECKIN_PATH = '/plugins/dsh-workbuddy2api/checkin'
 /** Plugin-owned pool control endpoint (reset / release). */
 export const WORKBUDDY2API_POOL_ACTION_PATH = '/plugins/dsh-workbuddy2api/pool'
+/** Plugin-owned web sign-in start endpoint: returns an authorization URL. */
+export const WORKBUDDY2API_LOGIN_START_PATH = '/plugins/dsh-workbuddy2api/login/start'
+/** Plugin-owned web sign-in poll endpoint: reports progress and finishes it. */
+export const WORKBUDDY2API_LOGIN_POLL_PATH = '/plugins/dsh-workbuddy2api/login/poll'
+
+/** Query parameter carrying the sign-in state a poll addresses. */
+export const WORKBUDDY2API_STATE_PARAM = 'state'
 
 /** Query parameter naming the account a card request addresses. */
 export const WORKBUDDY2API_ACCOUNT_PARAM = 'accountId'
@@ -262,6 +269,16 @@ export interface WorkBuddyPoolPolicy {
 
 /** The card's view of one region's policy: the same document, under its web name. */
 export type WorkBuddyWebPoolPolicy = WorkBuddyPoolPolicy
+
+/**
+ * One browser sign-in, as the card drives it. The host never returns the token
+ * bundle to the page — only the account it produced.
+ */
+export type WorkBuddyWebLogin =
+  | { status: 'pending'; state: string; url: string; region: WorkBuddyWebRegion }
+  | { status: 'waiting'; region: WorkBuddyWebRegion; message?: string }
+  | { status: 'done'; region: WorkBuddyWebRegion; account: WorkBuddyWebAccount; note?: string }
+  | { status: 'error'; region: WorkBuddyWebRegion; message: string }
 
 /** The JSON document one region's card tab renders. */
 export type WorkBuddyWebUsage =

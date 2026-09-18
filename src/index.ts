@@ -36,7 +36,7 @@ import z from '@deepseek-ai/schemastery'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-host-webserver'
-import { WorkBuddyCredentialStore } from './auth.ts'
+import { workbuddyAccountId, WorkBuddyCredentialStore } from './auth.ts'
 import { deriveCatalog, fallbackModelsFor, WorkBuddyCatalog } from './catalog.ts'
 import type { WorkBuddyContextBudget, WorkBuddyModelInfo } from './catalog.ts'
 import {
@@ -56,6 +56,7 @@ import type { WorkBuddyPoolPolicy, WorkBuddyPoolStateRecord, WorkBuddyPoolTuning
 import { WorkBuddyUpstreamClient } from './upstream.ts'
 import type { WorkBuddyRegion } from './upstream.ts'
 import { registerWorkBuddy2ApiStatusRoute } from './web-status.ts'
+import { WorkBuddyLoginManager } from './login.ts'
 import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
 
 export {
@@ -134,6 +135,17 @@ export {
   type WorkBuddyUpstreamModel,
 } from './upstream.ts'
 export {
+  loginEndpointsFor,
+  WorkBuddyLoginManager,
+  WorkBuddyLoginUnknownStateError,
+  WORKBUDDY_LOGIN_TTL_MS,
+  type WorkBuddyLoginAccount,
+  type WorkBuddyLoginEndpoints,
+  type WorkBuddyLoginManagerOptions,
+  type WorkBuddyLoginPoll,
+  type WorkBuddyLoginStart,
+} from './login.ts'
+export {
   clearHostHeartbeat,
   isHeartbeatProcessAlive,
   processStartTimeMs,
@@ -157,10 +169,13 @@ export {
   WORKBUDDY2API_ACCOUNT_PARAM,
   WORKBUDDY2API_CHECKIN_PATH,
   WORKBUDDY2API_CREDITS_REFRESH_PATH,
+  WORKBUDDY2API_LOGIN_POLL_PATH,
+  WORKBUDDY2API_LOGIN_START_PATH,
   WORKBUDDY2API_MODELS_REFRESH_PATH,
   WORKBUDDY2API_POOL_ACTION_PATH,
   WORKBUDDY2API_REGION_PARAM,
   WORKBUDDY2API_REGIONS,
+  WORKBUDDY2API_STATE_PARAM,
   WORKBUDDY2API_USAGE_PATH,
   type WorkBuddyPoolPolicy,
   type WorkBuddyPoolStateRecord,
@@ -168,6 +183,7 @@ export {
   type WorkBuddyWebAccountCredits,
   type WorkBuddyWebCheckin,
   type WorkBuddyWebCredits,
+  type WorkBuddyWebLogin,
   type WorkBuddyWebModel,
   type WorkBuddyWebPackage,
   type WorkBuddyWebPoolEntry,
@@ -500,6 +516,57 @@ export function apply(ctx: Context, config: Config): void {
     invalidateCatalog()
   }
 
+  /**
+   * Browser sign-in. Signing in through the card is the multi-account story:
+   * the upstream has no public multi-account API, so an account that is not
+   * already signed in on this machine could previously only be added by
+   * signing in to the desktop app. This runs the same device-authorization
+   * flow the app runs, writes the result into the region's own credential
+   * copy, and puts the account straight into that region's pool.
+   */
+  const login = new WorkBuddyLoginManager({
+    store: region => stacks[region].store,
+    pool: region => stacks[region].pool,
+    onSignedIn: async (region, credential) => {
+      const notes: string[] = []
+      // The new account joins this region's directory: without the refresh a
+      // freshly signed-in account would not appear in the model picker until
+      // the next restart.
+      try {
+        const state = regionStateOf(current(), region)
+        const models = await discoverModels(region)
+        stacks[region].catalog.set(withImageSelection(
+          deriveCatalog(models, new Set(state.enabledModelIds ?? []), state.contextBudgets ?? {}),
+          new Set(state.imageModelIds ?? []),
+        ))
+        invalidateCatalog()
+      } catch (error: unknown) {
+        notes.push('model directory refresh failed: ' + (error instanceof Error ? error.message : String(error)))
+      }
+      // Read the new account's balance straight away, so the card shows credits
+      // instead of "unknown" the moment the sign-in completes.
+      try {
+        const credits = await client.fetchCredits(credential)
+        const accountId = workbuddyAccountId(credential)
+        stacks[region].pool.setCredits(accountId, { total: credits.total, expiringSoon: credits.expiringSoon })
+        // Today's check-in is a separate endpoint and never fatal: the account
+        // is already signed in and usable either way.
+        try {
+          const current = await client.fetchCheckinStatus(credential)
+          if (current.active && !current.todayCheckedIn) {
+            const claim = await client.claimDailyCheckin(credential)
+            notes.push(`checked in: +${claim.credit}`)
+          }
+        } catch (error: unknown) {
+          notes.push('check-in failed: ' + (error instanceof Error ? error.message : String(error)))
+        }
+      } catch (error: unknown) {
+        notes.push('credit query failed: ' + (error instanceof Error ? error.message : String(error)))
+      }
+      return notes.length === 0 ? undefined : notes.join('; ')
+    },
+  })
+
   // Same-origin routes backing the Plugin-configuration card. `webServer` can
   // mount after this row, so wait reactively for it instead of sampling
   // ctx.get() once during apply (which silently loses all routes on Desktop).
@@ -522,6 +589,7 @@ export function apply(ctx: Context, config: Config): void {
       stacks[region].pool.setCredits(accountId, { total: credits.total, expiringSoon: credits.expiringSoon })
       return credits
     },
+    login,
   }))
 
   ctx.settings.installSection(ctx, WORKBUDDY2API_SETTINGS_NS, Config, config, {
@@ -535,6 +603,7 @@ export function apply(ctx: Context, config: Config): void {
   let stopped = false
   ctx.effect(() => () => {
     stopped = true
+    login.dispose()
     for (const region of REGION_KEYS) {
       stacks[region].pool.dispose()
       void stacks[region].shim.close()

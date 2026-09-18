@@ -87,6 +87,12 @@ export const WORKBUDDY2API_CARD_CSS = `
 .dsm-wb2api-context-budget label{display:inline-flex;align-items:center;gap:4px;cursor:pointer}
 .dsm-wb2api-context-budget input{margin:0;accent-color:var(--dsw-alias-brand-primary,#5686fe)}
 .dsm-wb2api-model-capability-note{margin:0;color:var(--dsw-alias-label-tertiary,#999);font-size:12px;line-height:18px}
+.dsm-wb2api-signin{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;padding:11px 12px;border:1px dashed var(--dsw-alias-border-l2,#3a3d45);border-radius:10px;background:var(--dsw-alias-bg-layer-2,#232529)}
+.dsm-wb2api-signin-text{flex:1;min-width:180px;color:var(--dsw-alias-label-tertiary,#999);font-size:11px;line-height:16px}
+.dsm-wb2api-signin-status{flex:1;min-width:180px;display:inline-flex;align-items:center;gap:7px;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:12px;line-height:18px}
+.dsm-wb2api-spinner{flex:none;width:12px;height:12px;border-radius:50%;border:2px solid var(--dsw-alias-border-l2,#3a3d45);border-top-color:var(--dsw-alias-brand-primary,#5686fe);animation:dsm-wb2api-spin .8s linear infinite}
+@keyframes dsm-wb2api-spin{to{transform:rotate(360deg)}}
+.dsm-wb2api-signin-done{flex:1;min-width:180px;color:var(--dsw-alias-state-success-primary,#22a06b);font-size:12px;line-height:18px}
 .dsm-wb2api-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid var(--dsw-alias-border-l2,#36373b);padding-top:12px}
 .dsm-wb2api-save-error{flex:1;min-width:0;color:var(--dsw-alias-state-error-primary,#ef4444);font-size:12px;line-height:16px;text-align:right}
 .dsm-wb2api-actions-buttons{display:flex;align-items:center;justify-content:flex-end;gap:8px}

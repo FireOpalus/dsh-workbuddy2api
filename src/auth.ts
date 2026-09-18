@@ -516,6 +516,15 @@ export class WorkBuddyCredentialStore {
       // account, and a pool with N accounts would hammer the endpoint N times
       // per request. A fresh app sign-in always outlives the margin, so the
       // rule cannot shadow a token the user just obtained.
+      // A copy the plugin obtained through an explicit web sign-in carries the
+      // issuance time of THAT sign-in, which is newer than anything the desktop
+      // app left behind — including a dead-but-not-yet-expired token that would
+      // otherwise win on the expiry comparison below and keep the account
+      // broken after the user just re-signed in.
+      if (own.lastRefreshAtMs !== undefined && own.lastRefreshAtMs > (existing.lastRefreshAtMs ?? 0)) {
+        byId.set(id, own)
+        continue
+      }
       if (own.expiresAtMs <= existing.expiresAtMs) continue
       const dueForRefresh = existing.expiresAtMs <= 0 || existing.expiresAtMs <= now + this.refreshMarginMs
       if (fileRank(existing.filePath) !== 0 || dueForRefresh) byId.set(id, own)
@@ -658,6 +667,53 @@ export class WorkBuddyCredentialStore {
         `workbuddy: token refresh failed and the access token is expired (${String(error)});`
         + ' open the WorkBuddy desktop app once to sign in again',
       )
+    }
+  }
+
+  /**
+   * Persist a credential the plugin obtained ITSELF — currently only through
+   * the card's web sign-in. It lands in this store's own per-account copy, so
+   * the pool treats it exactly like a discovered desktop sign-in, and the
+   * desktop app's files stay untouched.
+   *
+   * A credential for the other region is refused rather than stored: the two
+   * regions are two separate pools, and a mis-filed account would appear in
+   * the wrong tab and be billed through the wrong gateway.
+   */
+  async save(credential: WorkBuddyCredential): Promise<WorkBuddyCredential> {
+    if (!this.matchesRegion(credential.domain)) {
+      throw new Error(
+        `workbuddy: refusing to store a ${regionOf(credential.domain)} credential in the ${this.region ?? 'shared'} store`,
+      )
+    }
+    const stored: WorkBuddyCredential = { ...credential, source: 'dsh' }
+    await this.saveOwn(stored)
+    // Drop any cached refresh for the id this credential now occupies.
+    this.inflight.delete(workbuddyAccountId(stored))
+    return stored
+  }
+
+  /**
+   * Adopt the local identity of an already-known account when a freshly
+   * obtained credential for that same account omits fields the local copy
+   * carries. The sign-in endpoint answers `uid` and `nickname` but not the
+   * billing `uin` the desktop files hold, and the account id is derived from
+   * `uin` first — so without this the same human would occupy two pool
+   * entries, one of which the desktop app keeps refreshing.
+   */
+  async reconcileIdentity(credential: WorkBuddyCredential): Promise<WorkBuddyCredential> {
+    if (!this.matchesRegion(credential.domain)) return credential
+    if (credential.uid === '' && credential.nickname === undefined) return credential
+    const known = (await this.readAll()).find(existing =>
+      (credential.uid !== '' && existing.uid === credential.uid)
+      || (credential.nickname !== undefined && existing.nickname === credential.nickname))
+    if (known === undefined) return credential
+    return {
+      ...credential,
+      ...credential.uin === undefined && known.uin !== undefined ? { uin: known.uin } : {},
+      ...credential.enterpriseId === undefined && known.enterpriseId !== undefined
+        ? { enterpriseId: known.enterpriseId }
+        : {},
     }
   }
 

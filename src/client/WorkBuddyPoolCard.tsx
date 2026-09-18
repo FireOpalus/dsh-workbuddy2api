@@ -25,12 +25,16 @@ import {
   WORKBUDDY2API_ACCOUNT_PARAM,
   WORKBUDDY2API_CHECKIN_PATH,
   WORKBUDDY2API_CREDITS_REFRESH_PATH,
+  WORKBUDDY2API_LOGIN_POLL_PATH,
+  WORKBUDDY2API_LOGIN_START_PATH,
   WORKBUDDY2API_MODELS_REFRESH_PATH,
   WORKBUDDY2API_POOL_ACTION_PATH,
   WORKBUDDY2API_REGIONS,
+  WORKBUDDY2API_STATE_PARAM,
   WORKBUDDY2API_USAGE_PATH,
 } from '../status-paths.ts'
 import type {
+  WorkBuddyWebLogin,
   WorkBuddyWebModel,
   WorkBuddyWebPoolEntry,
   WorkBuddyWebPoolPolicy,
@@ -58,6 +62,17 @@ export type WorkBuddyPoolCardProps =
   & Partial<WorkBuddyPoolCardInjected>
 
 const POLL_INTERVAL_MS = 60_000
+
+/** How often a running browser sign-in is checked, while the card is open. */
+const LOGIN_POLL_INTERVAL_MS = 3_000
+
+/**
+ * The authorization page, remembered across the redirect. The user finishes
+ * the sign-in in a browser tab and comes back to the harness, which reloads
+ * the page — a sign-in kept only in component state would be lost, leaving a
+ * credential on the server that the card no longer knows about.
+ */
+const LOGIN_STORAGE_KEY = 'dsh-workbuddy2api/login'
 
 /** One region's unsaved pool edits. */
 interface WorkBuddyPoolDraft {
@@ -103,6 +118,61 @@ function formatCapacity(value: number | undefined, unknown: string): string {
   if (value >= 1_000_000 && value % 1_000_000 === 0) return `${value / 1_000_000}M`
   if (value >= 1_000 && value % 1_000 === 0) return `${value / 1_000}K`
   return formatNumber(value)
+}
+
+/** One in-flight browser sign-in, as the card tracks it. */
+interface WorkBuddyLoginDraft {
+  region: WorkBuddyWebRegion
+  state: string
+  url: string
+  status: 'waiting' | 'error'
+  message?: string
+  /**
+   * Whether polling this sign-in is pointless. A state the host no longer
+   * knows (expired, or the plugin restarted) never becomes valid again, while
+   * a network or gateway failure may.
+   */
+  fatal?: boolean
+}
+
+/** A completed sign-in's confirmation line, tied to the tab it belongs to. */
+interface WorkBuddyLoginDone {
+  region: WorkBuddyWebRegion
+  text: string
+}
+
+/** Read the remembered sign-in, ignoring anything unreadable. */
+function readStoredLogin(): WorkBuddyLoginDraft | undefined {
+  if (typeof window === 'undefined') return undefined
+  try {
+    const raw = window.localStorage.getItem(LOGIN_STORAGE_KEY)
+    if (raw === null) return undefined
+    const parsed = JSON.parse(raw) as Partial<WorkBuddyLoginDraft>
+    if (typeof parsed.state !== 'string' || typeof parsed.url !== 'string') return undefined
+    if (parsed.region !== 'cn' && parsed.region !== 'global') return undefined
+    return {
+      region: parsed.region,
+      state: parsed.state,
+      url: parsed.url,
+      status: parsed.status === 'error' ? 'error' : 'waiting',
+      ...typeof parsed.message === 'string' ? { message: parsed.message } : {},
+      ...parsed.fatal === true ? { fatal: true } : {},
+    }
+  } catch {
+    return undefined
+  }
+}
+
+/** Remember or forget the running sign-in. */
+function writeStoredLogin(draft: WorkBuddyLoginDraft | undefined): void {
+  if (typeof window === 'undefined') return
+  try {
+    if (draft === undefined) window.localStorage.removeItem(LOGIN_STORAGE_KEY)
+    else window.localStorage.setItem(LOGIN_STORAGE_KEY, JSON.stringify(draft))
+  } catch {
+    // A browser with storage disabled still signs in; it just cannot resume
+    // after a reload.
+  }
 }
 
 /** Locale key for one pool state. */
@@ -160,7 +230,18 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   const [refreshingCredits, setRefreshingCredits] = useState(false)
   const [checkingIn, setCheckingIn] = useState<string | undefined>(undefined)
   const [actionError, setActionError] = useState<string | undefined>(undefined)
+  /** The running browser sign-in, if any; survives a page reload. */
+  const [login, setLogin] = useState<WorkBuddyLoginDraft | undefined>(() => readStoredLogin())
+  /** A finished sign-in's confirmation line, cleared by the next action. */
+  const [loginDone, setLoginDone] = useState<WorkBuddyLoginDone | undefined>(undefined)
   const mounted = useRef(true)
+  const loginRef = useRef<WorkBuddyLoginDraft | undefined>(undefined)
+  loginRef.current = login
+
+  const rememberLogin = useCallback((draft: WorkBuddyLoginDraft | undefined): void => {
+    writeStoredLogin(draft)
+    if (mounted.current) setLogin(draft)
+  }, [])
 
   useEffect(() => {
     mounted.current = true
@@ -217,6 +298,113 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
       controller.abort()
     }
   }, [open, refreshUsage])
+
+  /** Poll the running sign-in once and apply whatever it answered. */
+  const pollLogin = useCallback(async (draft: WorkBuddyLoginDraft): Promise<void> => {
+    const region = draft.region
+    const path = withWorkBuddyRegion(WORKBUDDY2API_LOGIN_POLL_PATH, region)
+    let response: Response
+    try {
+      response = await fetch(`${path}&${WORKBUDDY2API_STATE_PARAM}=${encodeURIComponent(draft.state)}`, {
+        headers: { accept: 'application/json' },
+        credentials: 'same-origin',
+      })
+    } catch (error: unknown) {
+      if (mounted.current) {
+        rememberLogin({
+          ...draft,
+          status: 'error',
+          message: error instanceof Error ? error.message : t('row.requestFailed'),
+        })
+      }
+      return
+    }
+    const body = await response.json().catch(() => undefined) as
+      | (Partial<WorkBuddyWebLogin> & { error?: string })
+      | undefined
+    if (!response.ok) {
+      // 400/404 mean the host has no such sign-in any more; retrying cannot
+      // fix that, so the row becomes a terminal message plus a restart button.
+      rememberLogin({
+        ...draft,
+        status: 'error',
+        message: body?.error ?? `HTTP ${response.status}`,
+        ...response.status === 400 || response.status === 404 ? { fatal: true } : {},
+      })
+      return
+    }
+    const document = body as WorkBuddyWebLogin
+    if (document.status === 'waiting') {
+      rememberLogin({ ...draft, status: 'waiting', ...document.message === undefined ? {} : { message: document.message } })
+      return
+    }
+    if (document.status === 'done') {
+      rememberLogin(undefined)
+      if (mounted.current) {
+        setLoginDone({ region, text: t('row.signInDone', { account: document.account.accountName }) })
+        if (document.note !== undefined) setActionError(document.note)
+      }
+      // The new account has to appear in its own tab's pool and credits.
+      await refreshUsage(region)
+      return
+    }
+    if (document.status === 'error') {
+      rememberLogin({ ...draft, status: 'error', message: document.message })
+    }
+  }, [rememberLogin, refreshUsage, t])
+
+  // One poller for the running sign-in, alive whether or not the card is open,
+  // so a sign-in finished while the user was in the browser is picked up as
+  // soon as they come back.
+  useEffect(() => {
+    if (login === undefined) return
+    const controller = new AbortController()
+    const tick = (): void => {
+      const current = loginRef.current
+      if (current === undefined || current.fatal === true || controller.signal.aborted) return
+      void pollLogin(current)
+    }
+    tick()
+    const timer = window.setInterval(tick, LOGIN_POLL_INTERVAL_MS)
+    return () => {
+      window.clearInterval(timer)
+      controller.abort()
+    }
+    // Deliberately keyed on the identity of the sign-in, not on the draft
+    // object: every poll replaces the draft, and depending on the object would
+    // restart the timer (and re-poll) on each of its own answers.
+  }, [login?.state, login?.region, pollLogin])
+
+  const startLogin = async (): Promise<void> => {
+    setActionError(undefined)
+    setLoginDone(undefined)
+    try {
+      const response = await fetch(withWorkBuddyRegion(WORKBUDDY2API_LOGIN_START_PATH, activeRegion), {
+        method: 'POST',
+        headers: { accept: 'application/json' },
+        credentials: 'same-origin',
+      })
+      const body = await response.json().catch(() => undefined) as
+        | { url?: string; state?: string; error?: string }
+        | undefined
+      if (!response.ok || typeof body?.url !== 'string' || typeof body.state !== 'string') {
+        throw new Error(body?.error ?? `HTTP ${response.status}`)
+      }
+      rememberLogin({ region: activeRegion, state: body.state, url: body.url, status: 'waiting' })
+      // The gateway round trip can outlive the browser's transient activation,
+      // in which case the popup is refused; the row's own "open again" button
+      // is a direct click, so it always works.
+      if (window.open(body.url, '_blank', 'noopener,noreferrer') === null) {
+        if (mounted.current) setActionError(t('row.signInBlocked'))
+      }
+    } catch (error: unknown) {
+      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
+    }
+  }
+
+  const cancelLogin = (): void => {
+    rememberLogin(undefined)
+  }
 
   void settingsRevision
 
@@ -577,6 +765,48 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                     >
                       {busy ? t('row.accountsScanning') : t('row.accountsRescan')}
                     </button>
+                  </div>
+                </div>
+                <div className="dsm-wb2api-signin">
+                  {login === undefined || login.region !== activeRegion
+                    ? <span className="dsm-wb2api-signin-text">
+                        {t('row.signInHint', {
+                          region: activeRegion === 'cn' ? t('row.tabCn') : t('row.tabGlobal'),
+                        })}
+                      </span>
+                    : login.status === 'error'
+                      ? <span className="dsm-wb2api-signin-status">
+                          <span className="dsm-wb2api-error">{login.message}</span>
+                        </span>
+                      : <span className="dsm-wb2api-signin-status">
+                          <span className="dsm-wb2api-spinner" aria-hidden="true" />
+                          {t('row.signInWaiting')}
+                        </span>}
+                  {loginDone === undefined || loginDone.region !== activeRegion
+                    ? null
+                    : <span className="dsm-wb2api-signin-done">{loginDone.text}</span>}
+                  <div className="dsm-wb2api-actions-buttons">
+                    {login !== undefined && login.region === activeRegion
+                      ? <>
+                          <button
+                            type="button"
+                            className="dsm-btn dsm-btn-outline"
+                            onClick={() => { window.open(login.url, '_blank', 'noopener,noreferrer') }}
+                          >
+                            {t('row.signInOpen')}
+                          </button>
+                          <button type="button" className="dsm-btn dsm-btn-outline" onClick={cancelLogin}>
+                            {t('row.signInCancel')}
+                          </button>
+                        </>
+                      : <button
+                          type="button"
+                          className="dsm-btn dsm-btn-primary"
+                          disabled={busy}
+                          onClick={() => { void startLogin() }}
+                        >
+                          {t('row.signIn')}
+                        </button>}
                   </div>
                 </div>
                 {entries.length === 0

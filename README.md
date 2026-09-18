@@ -34,6 +34,9 @@
 - **换号重试** —— 额度不足 / 限流 / 会话失效 / 5xx 自动换一个账号重试
   （默认最多 3 次）；客户端错误（参数写错、内容被拦）直接透传，不浪费别的账号。
 - **并发上限** —— 单账号默认 3、国际版账号 2、整池 8，全可调。
+- **网页登录添加账号** —— 卡片里点「网页登录添加账号」即打开 WorkBuddy 官方
+  登录页，完成登录后凭据自动落进**该 tab 那一侧**的账号池，免重启、免桌面端。
+  与「扫描桌面端 auth 目录」并存：两条路径发现的同一个账号会自动合并成一条池记录。
 - **多账号凭据** —— 扫描 WorkBuddy 桌面端 auth 目录（含带时间戳的历史备份），
   按 `uin` 去重；**每个账号一份独立的刷新副本**，N 个账号同时在线互不覆盖。
   桌面端文件永远只读。
@@ -65,6 +68,12 @@ DSH 模型选择器
 
   两者共用：凭据发现（按区域过滤）、上游客户端、错误分类与健康迁移规则。
   结果回报给所属池；失败且可重试时在该池内换一个账号再来一次。
+
+  添加账号（卡片「网页登录添加账号」，按 tab 决定 realm）
+    -> POST {base}/v2/plugin/auth/state?platform=CLI  取 state + authUrl
+    -> 浏览器完成登录，卡片每 3s GET {base}/v2/plugin/auth/token?state=…
+    -> 完成时 GET {base}/v2/plugin/login/account?state=…（Bearer）取 uid/nickname
+    -> 写入该区域的 .workbuddy2api-auth.<accountId>.json，并热加载进该区域的池
 ```
 
 **账号池不持有 token**：池只决定「这一次用哪个账号 id」，
@@ -97,7 +106,8 @@ shim 再拿这个 id 去凭据库解析 token。这样 token 永远不进入调�
 
 ## 安装
 
-前置：已安装并登录至少一个 WorkBuddy 桌面 App 账号（插件复用 App 的登录状态）。
+前置：无需任何 WorkBuddy 客户端 —— 在插件卡片里用「网页登录添加账号」即可
+（已登录桌面 App 的账号也会被自动发现，两条路径可以混用）。
 
 ```sh
 # 从工作区目录安装（开发期）
@@ -124,6 +134,11 @@ dsh plugin --profile web exec dsh-workbuddy2api logout   # 清除插件自有的
 
 在 **设置 → 插件配置** 里找到「WorkBuddy 账号池」：
 
+- **网页登录添加账号**：点按钮 → 浏览器打开官方登录页 → 登录 → 卡片自动轮询并在
+  完成时把账号加进当前 tab 的池（顺带拉一次积分与模型目录、补一次签到）。
+  一次登录只可能落进发起它的那一侧，登录态存在浏览器 localStorage，
+  中途刷新页面也不会丢；凭据只写插件自有的
+  `$DSH_HOME/.workbuddy2api-auth.<accountId>.json`，**不碰桌面端文件**。
 - **池内账号**：每个账号一行 —— 健康徽标、区域、启用开关、权重、恢复按钮、
   在途 / 成功 / 失败计数、冷却与熔断截止、最近错误、剩余积分、一键签到。
 - **池策略**：在途上限、熔断阈值与时长、降权阈值与时长、限流冷却基数与上限、
@@ -227,8 +242,12 @@ DSH 的 Windows 文件沙箱禁止任何「带管道的子进程」，本机的�
 ## 已知限制
 
 - 依赖 WorkBuddy 客户端接口（非官方开放 API），WorkBuddy 更新后可能需要跟进。
-- **多账号基于桌面端留下的历史 auth 文件**，并非官方多账号 API。
-  桌面端清理备份或退出登录后，对应账号会消失，卡片会把它标成「凭据缺失」。
+- **多账号基于两条路径**：卡片里的网页登录（自己拿到的凭据，与桌面端无关），
+  以及桌面端留下的历史 auth 文件。上游没有公开的多账号 API，
+  因此「同一个账号在别处登录」这件事插件无法感知；桌面端清理备份或退出登录后，
+  对应账号会消失，卡片会把它标成「凭据缺失」。
+- 网页登录只支持 WorkBuddy 官方的设备授权流程（浏览器里完成登录）。
+  没有账号密码直登，也没有验证码代收 —— 那需要用户自己在页面上操作。
 - 同一账号被多个 WorkBuddy 客户端同时刷新时，token 可能互相失效；
   插件的自有副本以「活得更久」为准，不会覆盖桌面端更新的登录。
 - 积分查询按账号打上游计费接口，账号多时请用「刷新积分」按需触发，
@@ -242,7 +261,7 @@ DSH 的 Windows 文件沙箱禁止任何「带管道的子进程」，本机的�
 
 | 项目 | 许可证 | 借鉴内容 |
 |---|---|---|
-| [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | MIT | 账号池调度语义、会话粘性、失败迁移、上游协议 |
+| [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | MIT | 账号池调度语义、会话粘性、失败迁移、上游协议、设备授权登录流程 |
 | [dingminhua/dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) | MIT | DSH 插件内核：凭据发现、上游客户端、shim 加固、适配器、卡片 |
 | [corrinehu/dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect) | MIT | 接入方案的原始验证（经上者转引） |
 | [dingminhua/dsh-connect-trae](https://github.com/dingminhua/dsh-connect-trae) | MIT | 模型管理交互与 `dsm-*` 卡片样式（经上者转引） |

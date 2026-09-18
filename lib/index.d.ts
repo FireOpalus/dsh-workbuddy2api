@@ -30,6 +30,12 @@ declare const WORKBUDDY2API_CREDITS_REFRESH_PATH = "/plugins/dsh-workbuddy2api/c
 declare const WORKBUDDY2API_CHECKIN_PATH = "/plugins/dsh-workbuddy2api/checkin";
 /** Plugin-owned pool control endpoint (reset / release). */
 declare const WORKBUDDY2API_POOL_ACTION_PATH = "/plugins/dsh-workbuddy2api/pool";
+/** Plugin-owned web sign-in start endpoint: returns an authorization URL. */
+declare const WORKBUDDY2API_LOGIN_START_PATH = "/plugins/dsh-workbuddy2api/login/start";
+/** Plugin-owned web sign-in poll endpoint: reports progress and finishes it. */
+declare const WORKBUDDY2API_LOGIN_POLL_PATH = "/plugins/dsh-workbuddy2api/login/poll";
+/** Query parameter carrying the sign-in state a poll addresses. */
+declare const WORKBUDDY2API_STATE_PARAM = "state";
 /** Query parameter naming the account a card request addresses. */
 declare const WORKBUDDY2API_ACCOUNT_PARAM = "accountId";
 /** Query parameter naming the REGION (i.e. which pool) a card request addresses. */
@@ -236,6 +242,29 @@ interface WorkBuddyPoolPolicy {
 }
 /** The card's view of one region's policy: the same document, under its web name. */
 type WorkBuddyWebPoolPolicy = WorkBuddyPoolPolicy;
+/**
+ * One browser sign-in, as the card drives it. The host never returns the token
+ * bundle to the page — only the account it produced.
+ */
+type WorkBuddyWebLogin = {
+  status: 'pending';
+  state: string;
+  url: string;
+  region: WorkBuddyWebRegion;
+} | {
+  status: 'waiting';
+  region: WorkBuddyWebRegion;
+  message?: string;
+} | {
+  status: 'done';
+  region: WorkBuddyWebRegion;
+  account: WorkBuddyWebAccount;
+  note?: string;
+} | {
+  status: 'error';
+  region: WorkBuddyWebRegion;
+  message: string;
+};
 /** The JSON document one region's card tab renders. */
 type WorkBuddyWebUsage = {
   status: 'empty';
@@ -455,6 +484,26 @@ declare class WorkBuddyCredentialStore {
   desktopFilePresent(): Promise<boolean>;
   private needsRefresh;
   private refreshNow;
+  /**
+   * Persist a credential the plugin obtained ITSELF — currently only through
+   * the card's web sign-in. It lands in this store's own per-account copy, so
+   * the pool treats it exactly like a discovered desktop sign-in, and the
+   * desktop app's files stay untouched.
+   *
+   * A credential for the other region is refused rather than stored: the two
+   * regions are two separate pools, and a mis-filed account would appear in
+   * the wrong tab and be billed through the wrong gateway.
+   */
+  save(credential: WorkBuddyCredential): Promise<WorkBuddyCredential>;
+  /**
+   * Adopt the local identity of an already-known account when a freshly
+   * obtained credential for that same account omits fields the local copy
+   * carries. The sign-in endpoint answers `uid` and `nickname` but not the
+   * billing `uin` the desktop files hold, and the account id is derived from
+   * `uin` first — so without this the same human would occupy two pool
+   * entries, one of which the desktop app keeps refreshing.
+   */
+  reconcileIdentity(credential: WorkBuddyCredential): Promise<WorkBuddyCredential>;
   private saveOwn;
 }
 //#endregion
@@ -1008,6 +1057,107 @@ declare function workBuddyThinkingLevelMap(info: WorkBuddyModelInfo): WorkBuddyT
  */
 declare function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkBuddyAdapter;
 //#endregion
+//#region src/login.d.ts
+/** How long an unfinished authorization URL stays pollable. */
+declare const WORKBUDDY_LOGIN_TTL_MS: number;
+/** The three sign-in endpoints of one realm, plus the Origin/Referer to send. */
+interface WorkBuddyLoginEndpoints {
+  state: string;
+  token: string;
+  account: string;
+  origin: string;
+}
+/**
+ * Endpoints for one region. The international product answers on the same
+ * workbuddy.ai origin it signs in on; the domestic one signs in through
+ * codebuddy.cn but issues tokens from copilot.tencent.com.
+ */
+declare function loginEndpointsFor(region: WorkBuddyRegion): WorkBuddyLoginEndpoints;
+/** Answer of WorkBuddyLoginManager.start. */
+interface WorkBuddyLoginStart {
+  state: string;
+  url: string;
+  region: WorkBuddyRegion;
+}
+/** One account the sign-in produced, token-free. */
+interface WorkBuddyLoginAccount {
+  accountId: string;
+  accountName: string;
+  uid: string;
+  nickname?: string;
+  domain: string;
+  region: WorkBuddyRegion;
+}
+/** Answer of WorkBuddyLoginManager.poll. */
+type WorkBuddyLoginPoll = {
+  done: false;
+  message?: string;
+} | {
+  done: true;
+  account: WorkBuddyLoginAccount;
+  /** Credits read right after signing in, when the host could read them. */
+  credits?: {
+    total: number;
+    expiringSoon: number;
+  };
+  /** Non-fatal follow-up result (check-in, credit or catalog refresh). */
+  note?: string;
+};
+/** A poll for a state this manager never issued, or one that expired. */
+declare class WorkBuddyLoginUnknownStateError extends Error {
+  constructor();
+}
+/** Constructor dependencies. */
+interface WorkBuddyLoginManagerOptions {
+  /** Region-scoped credential store that owns the resulting copy. */
+  store(region: WorkBuddyRegion): WorkBuddyCredentialStore;
+  /** Region-scoped pool, so a new account is usable without a restart. */
+  pool(region: WorkBuddyRegion): WorkBuddyAccountPool;
+  /** Run after the credential is persisted; failures are reported, not thrown. */
+  onSignedIn?(region: WorkBuddyRegion, credential: WorkBuddyCredential): Promise<string | undefined>;
+  /** Injected for tests. */
+  fetch?: typeof fetch;
+  now?: () => number;
+  ttlMs?: number;
+}
+/**
+ * In-process device-authorization manager. One instance serves both regions;
+ * every session remembers the region it was started for, so a poll can only
+ * ever write into that region's store and pool.
+ */
+declare class WorkBuddyLoginManager {
+  private readonly options;
+  private readonly fetchImpl;
+  private readonly now;
+  private readonly ttlMs;
+  private readonly sessions;
+  constructor(options: WorkBuddyLoginManagerOptions);
+  /** Unfinished sessions, for diagnostics. */
+  pendingCount(): number;
+  /** Forget every unfinished session; called when the plugin is disposed. */
+  dispose(): void;
+  /**
+   * Begin a sign-in for one region: ask the gateway for a state and an
+   * authorization URL, remember which region asked, and hand the URL back.
+   * The caller opens it in the user's browser.
+   */
+  start(region: WorkBuddyRegion): Promise<WorkBuddyLoginStart>;
+  /**
+   * Poll one sign-in. Unfinished sign-ins answer `{done:false}`; a completed
+   * one yields the credential, which is persisted into the region's own
+   * per-account copy and written back into that region's pool.
+   */
+  poll(state: string): Promise<WorkBuddyLoginPoll>;
+  /** Write the freshly signed-in account into its region's pool and revive it. */
+  private adoptIntoPool;
+  /** Read the signed-in account's identity; a failure is not fatal by itself. */
+  private readAccount;
+  /** Drop sessions whose authorization URL has gone stale. */
+  private collect;
+  /** One JSON request against a sign-in endpoint, envelope already unwrapped. */
+  private request;
+}
+//#endregion
 //#region src/host-heartbeat.d.ts
 /**
  * Host-side heartbeat: a small JSON file written under `$DSH_HOME` once the
@@ -1109,6 +1259,11 @@ interface WorkBuddyStatusRouteOptions {
   discoverModels?(region: WorkBuddyRegion, signal?: AbortSignal): Promise<readonly WorkBuddyModelInfo[]>;
   /** Fetch and cache one account's credits inside its own region's pool. */
   refreshCredits?(region: WorkBuddyRegion, accountId: string): Promise<WorkBuddyCredits>;
+  /**
+   * The in-process web sign-in. Absent when the host did not wire it, in which
+   * case the two sign-in routes answer 503 instead of failing obscurely.
+   */
+  login?: WorkBuddyLoginManager;
 }
 /**
  * Assemble one region's card document: that region's locally discovered
@@ -1211,4 +1366,4 @@ declare function resolvePolicy(configured: Partial<WorkBuddyPoolTuning> | undefi
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { Config, DEFAULT_WORKBUDDY_POOL_POLICY, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, REGION_KEYS, type UpstreamErrorKind, WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, WORKBUDDY2API_ACCOUNT_PARAM, WORKBUDDY2API_CHECKIN_PATH, WORKBUDDY2API_CREDITS_REFRESH_PATH, WORKBUDDY2API_GLOBAL_PROVIDER, WORKBUDDY2API_HOST_HEARTBEAT_FILENAME, WORKBUDDY2API_MODELS_REFRESH_PATH, WORKBUDDY2API_POOL_ACTION_PATH, WORKBUDDY2API_PROVIDER, WORKBUDDY2API_PROVIDERS, WORKBUDDY2API_PROVIDER_DISPLAY_NAME, WORKBUDDY2API_PROVIDER_DISPLAY_NAMES, WORKBUDDY2API_REGIONS, WORKBUDDY2API_REGION_PARAM, WORKBUDDY2API_SETTINGS_NS, WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY2API_USAGE_PATH, WORKBUDDY2API_VERSION, WORKBUDDY_AUTH_FILE_ENV, type WorkBuddyAccountChoice, WorkBuddyAccountPool, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCheckinClaim, type WorkBuddyCheckinStatus, type WorkBuddyContextBudget, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredentialStoreOptions, type WorkBuddyCreditPackage, type WorkBuddyCredits, type WorkBuddyDispatchOutcome, type WorkBuddyHostHeartbeat, type WorkBuddyModelInfo, WorkBuddyPersistedModel, type WorkBuddyPickResult, type WorkBuddyPoolAccount, type WorkBuddyPoolEntry, type WorkBuddyPoolMissReason, type WorkBuddyPoolPolicy, type WorkBuddyPoolState, type WorkBuddyPoolStateRecord, type WorkBuddyPoolTuning, type WorkBuddyReasoning, type WorkBuddyRefreshOutcome, type WorkBuddyRegion, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyWebAccount, type WorkBuddyWebAccountCredits, type WorkBuddyWebCheckin, type WorkBuddyWebCredits, type WorkBuddyWebModel, type WorkBuddyWebPackage, type WorkBuddyWebPoolEntry, type WorkBuddyWebPoolPolicy, type WorkBuddyWebPoolState, type WorkBuddyWebRegion, type WorkBuddyWebUsage, apply, applyContextBudgets, authFileName, classifyUpstreamError, clearHostHeartbeat, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, deriveCatalog, expiryToMs, fallbackModelsFor, inject, isFresher, isHeartbeatProcessAlive, name, nextDay4Am, parseCreditMultiplier, parseReasoning, parseUpstreamModel, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, readHostHeartbeat, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, registerWorkBuddy2ApiStatusRoute, resolvePolicy, selectCliModels, stickyKeyOf, toPersistedWorkBuddyModel, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, writeHostHeartbeat };
+export { Config, DEFAULT_WORKBUDDY_POOL_POLICY, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, REGION_KEYS, type UpstreamErrorKind, WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, WORKBUDDY2API_ACCOUNT_PARAM, WORKBUDDY2API_CHECKIN_PATH, WORKBUDDY2API_CREDITS_REFRESH_PATH, WORKBUDDY2API_GLOBAL_PROVIDER, WORKBUDDY2API_HOST_HEARTBEAT_FILENAME, WORKBUDDY2API_LOGIN_POLL_PATH, WORKBUDDY2API_LOGIN_START_PATH, WORKBUDDY2API_MODELS_REFRESH_PATH, WORKBUDDY2API_POOL_ACTION_PATH, WORKBUDDY2API_PROVIDER, WORKBUDDY2API_PROVIDERS, WORKBUDDY2API_PROVIDER_DISPLAY_NAME, WORKBUDDY2API_PROVIDER_DISPLAY_NAMES, WORKBUDDY2API_REGIONS, WORKBUDDY2API_REGION_PARAM, WORKBUDDY2API_SETTINGS_NS, WORKBUDDY2API_STATE_PARAM, WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY2API_USAGE_PATH, WORKBUDDY2API_VERSION, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_LOGIN_TTL_MS, type WorkBuddyAccountChoice, WorkBuddyAccountPool, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCheckinClaim, type WorkBuddyCheckinStatus, type WorkBuddyContextBudget, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredentialStoreOptions, type WorkBuddyCreditPackage, type WorkBuddyCredits, type WorkBuddyDispatchOutcome, type WorkBuddyHostHeartbeat, type WorkBuddyLoginAccount, type WorkBuddyLoginEndpoints, WorkBuddyLoginManager, type WorkBuddyLoginManagerOptions, type WorkBuddyLoginPoll, type WorkBuddyLoginStart, WorkBuddyLoginUnknownStateError, type WorkBuddyModelInfo, WorkBuddyPersistedModel, type WorkBuddyPickResult, type WorkBuddyPoolAccount, type WorkBuddyPoolEntry, type WorkBuddyPoolMissReason, type WorkBuddyPoolPolicy, type WorkBuddyPoolState, type WorkBuddyPoolStateRecord, type WorkBuddyPoolTuning, type WorkBuddyReasoning, type WorkBuddyRefreshOutcome, type WorkBuddyRegion, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyWebAccount, type WorkBuddyWebAccountCredits, type WorkBuddyWebCheckin, type WorkBuddyWebCredits, type WorkBuddyWebLogin, type WorkBuddyWebModel, type WorkBuddyWebPackage, type WorkBuddyWebPoolEntry, type WorkBuddyWebPoolPolicy, type WorkBuddyWebPoolState, type WorkBuddyWebRegion, type WorkBuddyWebUsage, apply, applyContextBudgets, authFileName, classifyUpstreamError, clearHostHeartbeat, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, deriveCatalog, expiryToMs, fallbackModelsFor, inject, isFresher, isHeartbeatProcessAlive, loginEndpointsFor, name, nextDay4Am, parseCreditMultiplier, parseReasoning, parseUpstreamModel, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, readHostHeartbeat, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, registerWorkBuddy2ApiStatusRoute, resolvePolicy, selectCliModels, stickyKeyOf, toPersistedWorkBuddyModel, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, writeHostHeartbeat };
