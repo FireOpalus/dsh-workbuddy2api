@@ -584,27 +584,43 @@ export class WorkBuddyUpstreamClient {
   }
 
   /**
-   * Read every pooled account's directory and merge the results into one
-   * plugin-wide catalog. Accounts are queried in parallel and a failing account
-   * never fails the merge: the catalog is the union of what the pool can
-   * actually serve, so one expired sign-in must not blank the model picker.
-   * When EVERY account fails the last error is thrown so the caller can report
-   * a real cause instead of an empty catalog.
+   * Read ONE region's pooled accounts' directories and merge them into that
+   * region's catalog.
+   *
+   * Every credential handed in must belong to the same region: this method
+   * merges on model id, and the upstream reuses ids across regions for models
+   * that are billed differently (`deepseek-v4.1-flash` is x0.00 on the
+   * international gateway and x0.03 on the domestic one). Merging across
+   * regions would therefore let one side's rate silently replace the other's,
+   * which is exactly the bug the two-pool split exists to prevent. The region is
+   * asserted rather than assumed so a caller mistake fails loudly.
+   *
+   * Accounts are queried in parallel and a failing account never fails the
+   * merge: the catalog is what the pool can actually serve, so one expired
+   * sign-in must not blank the model picker. When EVERY account fails the first
+   * real cause is thrown instead of returning an empty catalog.
    */
   async fetchModelsForCredentials(
     credentials: readonly WorkBuddyCredential[],
     signal?: AbortSignal,
   ): Promise<WorkBuddyUpstreamModel[]> {
     if (credentials.length === 0) throw new Error('workbuddy: no signed-in account to read a model catalog from')
+    const regions = new Set(credentials.map(credential => regionOf(credential.domain)))
+    if (regions.size > 1) {
+      throw new Error(
+        `workbuddy: refusing to merge model catalogs across regions (${[...regions].join(', ')});`
+        + ' each region owns a separate pool and a separate directory',
+      )
+    }
     const settled = await Promise.allSettled(credentials.map(credential => this.fetchModels(credential, signal)))
     const byId = new Map<string, WorkBuddyUpstreamModel>()
     for (const result of settled) {
       if (result.status !== 'fulfilled') continue
       for (const model of result.value) {
-        const existing = byId.get(model.id)
-        // First writer wins: the pool is ordered by user preference, so the
-        // preferred account's spelling of a shared model is the one displayed.
-        if (existing === undefined) byId.set(model.id, model)
+        // Within one region a repeated id is the same model advertised by several
+        // accounts; the first account's copy wins, which keeps the listing stable
+        // as the pool is reordered.
+        if (!byId.has(model.id)) byId.set(model.id, model)
       }
     }
     if (byId.size === 0) {

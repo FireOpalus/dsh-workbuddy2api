@@ -16,7 +16,9 @@
  *      `$DSH_HOME/.workbuddy2api-auth.<accountId>.json` 文件，因此 N 个账号
  *      同时在线互不覆盖（原实现每区域只能存一个刷新结果）；
  *   3. 新增 `refreshCredential(accountId)` 与 `byIds()`：账号池需要
- *      按 id 定位并刷新任意一个账号，而不是只解析「当前选中的那个」。
+ *      按 id 定位并刷新任意一个账号，而不是只解析「当前选中的那个」；
+ *   4. 新增 `region` 过滤：每个账号池只看得见自己区域的账号，
+ *      两个区域因此是两个互不可见的账号集合。
  *
  * @module dsh-workbuddy2api/auth
  */
@@ -92,6 +94,12 @@ export interface WorkBuddyCredentialStoreOptions {
   authDirs?: readonly string[]
   /** Directory for the per-account refreshed copies; defaults to $DSH_HOME. */
   storeDir?: string
+  /**
+   * Region this store serves. When set, only credentials whose login domain
+   * maps to this region are discovered or resolved — the two regions' pools
+   * run side by side without ever seeing each other's accounts.
+   */
+  region?: WorkBuddyRegion
   /** Performs the upstream token refresh. */
   refresh: (credential: WorkBuddyCredential) => Promise<WorkBuddyRefreshOutcome>
   /** Refresh this long before actual expiry; default five minutes. */
@@ -357,6 +365,7 @@ export class WorkBuddyCredentialStore {
   private readonly refreshMarginMs: number
   private readonly authDirs: readonly string[] | undefined
   private readonly storeDir: string
+  private readonly region: WorkBuddyRegion | undefined
   private desktopPathOverride: string | undefined
   /** In-flight refresh per account id; concurrent callers share one request. */
   private readonly inflight = new Map<string, Promise<WorkBuddyCredential>>()
@@ -366,7 +375,18 @@ export class WorkBuddyCredentialStore {
     this.refreshMarginMs = options.refreshMarginMs ?? 5 * 60 * 1000
     this.authDirs = options.authDirs
     this.storeDir = options.storeDir ?? resolveDshHome()
+    this.region = options.region
     this.desktopPathOverride = options.desktopPath
+  }
+
+  /** Whether a credential's login domain belongs to this store's region. */
+  private matchesRegion(domain: string): boolean {
+    return this.region === undefined || regionOf(domain) === this.region
+  }
+
+  /** The region this store serves, when it is region-scoped. */
+  regionOf(): WorkBuddyRegion | undefined {
+    return this.region
   }
 
   /** Repoint the desktop file or directory; applies on the next read. */
@@ -470,7 +490,7 @@ export class WorkBuddyCredentialStore {
     const byId = new Map<string, WorkBuddyCredential>()
     for (const file of files) {
       const credential = await readAuthFile(file)
-      if (credential === undefined) continue
+      if (credential === undefined || !this.matchesRegion(credential.domain)) continue
       const id = workbuddyAccountId(credential)
       const existing = byId.get(id)
       if (existing === undefined) {
@@ -481,6 +501,7 @@ export class WorkBuddyCredentialStore {
     }
     const now = Date.now()
     for (const [id, own] of await this.readOwns()) {
+      if (!this.matchesRegion(own.domain)) continue
       const existing = byId.get(id)
       if (existing === undefined) {
         byId.set(id, own)

@@ -33,6 +33,12 @@ export const WORKBUDDY2API_CARD_CSS = `
 .dsm-btn-primary{background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-layer-3)}
 .dsm-btn-primary:hover:not(:disabled){opacity:.9}
 .dsm-wb2api-root{display:flex;flex-direction:column;gap:16px;margin:0;padding:16px 0 4px}
+.dsm-wb2api-tabs{display:flex;gap:6px;padding:4px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:10px;background:var(--dsw-alias-bg-layer-3,#2a2c33)}
+.dsm-wb2api-tab{appearance:none;font:inherit;cursor:pointer;flex:1;border:0;border-radius:7px;padding:7px 10px;color:var(--dsw-alias-label-tertiary,#999);font-size:13px;font-weight:500;line-height:18px;background:transparent;transition:color .15s,background .15s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dsm-wb2api-tab:hover:not(.dsm-wb2api-tab-active){color:var(--dsw-alias-label-primary,#e6e6e6)}
+.dsm-wb2api-tab:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#5686fe);outline-offset:1px}
+.dsm-wb2api-tab-active{color:var(--dsw-alias-label-primary,#e6e6e6);background:var(--dsw-alias-bg-layer-2,#232529);box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l2,#3a3d45)}
+.dsm-wb2api-tab-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:baseline}
 .dsm-wb2api-section{display:flex;flex-direction:column;gap:10px}
 .dsm-wb2api-section-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
 .dsm-wb2api-section-title{margin:0;color:var(--dsw-alias-label-primary,#e6e6e6);font-size:14px;font-weight:600;line-height:20px}

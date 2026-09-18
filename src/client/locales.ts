@@ -11,10 +11,14 @@
  */
 
 export const en = {
-  'row.title': 'WorkBuddy account pool (dsh-workbuddy2api)',
-  'row.desc': 'Serve WorkBuddy models from a pool of locally signed-in accounts — weighted rotation, session stickiness, cooldown/breaker health, and per-account credits.',
+  'row.title': 'WorkBuddy account pools (dsh-workbuddy2api)',
+  'row.desc': 'Two independent account pools — domestic and international — each with weighted rotation, session stickiness, cooldown/breaker health, and its own model directory.',
   'row.expand': 'Expand',
   'row.collapse': 'Collapse',
+  'row.tabCn': 'Domestic',
+  'row.tabGlobal': 'International',
+  'row.tabHint': 'These are two separate providers with separate pools and separate model directories. Models are listed per provider, so a model that both gateways carry keeps its own credit rate on each side.',
+  'row.providerLabel': 'Provider {provider}',
   'row.empty': 'No WorkBuddy sign-in found',
   'row.emptyHint': 'Sign in once in the WorkBuddy desktop app, then press “Detect accounts again”.',
   'row.requestFailed': 'Request failed',
@@ -86,9 +90,13 @@ export type WorkBuddySettingsKey = keyof typeof en
 
 export const zh: Record<WorkBuddySettingsKey, string> = {
   'row.title': 'WorkBuddy 账号池（dsh-workbuddy2api）',
-  'row.desc': '用本机已登录的多个 WorkBuddy 账号共同提供模型：加权轮换、会话粘性、冷却/熔断健康度与按账号积分。',
+  'row.desc': '国内版与国际版是两个独立账号池，各有加权轮换、会话粘性、冷却/熔断健康度，以及自己那份模型目录。',
   'row.expand': '展开',
   'row.collapse': '收起',
+  'row.tabCn': '国内版',
+  'row.tabGlobal': '国际版',
+  'row.tabHint': '这是两个独立供应商：账号池、模型目录都分开。模型按供应商分别列出，因此两个网关都有的模型各自保留自己的积分倍率。',
+  'row.providerLabel': '供应商 {provider}',
   'row.empty': '没有检测到 WorkBuddy 登录',
   'row.emptyHint': '在 WorkBuddy 桌面 App 里登录一次，然后点「重新检测账号」。',
   'row.requestFailed': '请求失败',

@@ -1,8 +1,8 @@
 {
   "name": "dsh-workbuddy2api",
   "displayName": "DSH WorkBuddy2API",
-  "description": "Multi-account WorkBuddy account pool for DeepSeek Harness — rotation, session stickiness, cooldown/breaker health, and per-account credits, modelled on workbuddy2api.",
-  "version": "0.1.1",
+  "description": "用本机多个 WorkBuddy 账号组成两个独立账号池（国内版 / 国际版），加权轮换、会话粘性、冷却熔断、换号重试。",
+  "version": "0.2.0",
   "author": "Boiser",
   "copyright": "Copyright (c) 2026 dsh-wb2api",
   "license": "MIT",

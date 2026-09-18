@@ -7,9 +7,9 @@
  *     `safeMessage` 脱敏、schemaVersion 字段、以及「宿主心跳 + 桌面端凭据
  *     文件 + 登录态」三项联合诊断的结构，均由该项目沿用自
  *     corrinehu/dsh-workbuddy-connect（MIT）。
- * 改动：诊断对象从「每个区域一个账号」改为「账号池」，`status` 报告每个
- *   账号的健康、冷却与余额；新增 `pool` 子命令直接打印池快照（含权重、
- *   在途、连续失败、冷却截止），无需浏览器即可确认多账号调度状态。
+ * 改动：诊断对象按区域分开报告 —— 两个区域是两个独立账号池，
+ *   `status` / `pool` 分别列出每个池的账号、健康、余额；
+ *   `logout` 清除两个区域的全部插件自有凭据副本。
  *
  * @module dsh-workbuddy2api/bin
  */
@@ -22,15 +22,25 @@ import {
   WORKBUDDY_AUTH_FILE_ENV,
   WorkBuddyCredentialStore,
 } from './auth.ts'
-import { FALLBACK_WORKBUDDY_MODELS_UNION } from './catalog.ts'
+import { fallbackModelsFor } from './catalog.ts'
 import { DEFAULT_WORKBUDDY_POOL_POLICY, WorkBuddyAccountPool } from './pool.ts'
 import { WorkBuddyUpstreamClient } from './upstream.ts'
+import type { WorkBuddyRegion } from './upstream.ts'
 import { WORKBUDDY2API_VERSION } from './version.ts'
 import { isHeartbeatProcessAlive, readHostHeartbeat, workbuddyHostHeartbeatPath } from './host-heartbeat.ts'
 
 type Action = 'doctor' | 'logout' | 'pool' | 'status'
 
 const JSON_SCHEMA_VERSION = 1
+
+/** Both regions, in reporting order. */
+const REGIONS: readonly WorkBuddyRegion[] = ['cn', 'global']
+
+/** Region labels for human output. */
+const REGION_LABELS: Readonly<Record<WorkBuddyRegion, string>> = {
+  cn: 'CN (domestic)',
+  global: 'Global',
+}
 
 /** Remove token-like strings from an unexpected diagnostic message. */
 function safeMessage(error: unknown): string {
@@ -45,8 +55,8 @@ function printHelp(): void {
     'Usage: dsh-workbuddy2api <doctor|status|pool|logout> [--json]',
     '',
     '  doctor   secret-free sign-in, credential-path, and host diagnostics',
-    '  status   every pooled account: health, cooldown, and remaining credit',
-    '  pool     the live pool snapshot (weights, in-flight, failures, cooldowns)',
+    '  status   every pooled account per region: health, cooldown, and credit',
+    '  pool     each region\'s live pool snapshot (weights, in-flight, failures)',
     '  logout   remove every plugin-owned credential copy (the desktop app keeps its sign-in)',
     '  --json   emit one secret-free JSON document (doctor/status/pool only)',
     '',
@@ -57,37 +67,40 @@ function printJson(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value)}\n`)
 }
 
-/** A store plus a pool over the real machine's credentials. */
-function makePool(): { store: WorkBuddyCredentialStore; pool: WorkBuddyAccountPool; client: WorkBuddyUpstreamClient } {
-  const client = new WorkBuddyUpstreamClient()
-  const store = new WorkBuddyCredentialStore({ refresh: credential => client.refreshToken(credential) })
-  const pool = new WorkBuddyAccountPool({ list: () => store.accounts() })
-  return { store, pool, client }
+/** A region-scoped store over the real machine's credentials. */
+function makeStore(region: WorkBuddyRegion, client: WorkBuddyUpstreamClient): WorkBuddyCredentialStore {
+  return new WorkBuddyCredentialStore({
+    region,
+    refresh: credential => client.refreshToken(credential),
+  })
 }
 
 async function doctor(jsonOutput: boolean): Promise<number> {
-  const { store, pool } = makePool()
-  const desktopPresent = await store.desktopFilePresent()
+  const client = new WorkBuddyUpstreamClient()
+  const anyStore = new WorkBuddyCredentialStore({ refresh: credential => client.refreshToken(credential) })
+  const desktopPresent = await anyStore.desktopFilePresent()
   const heartbeat = await readHostHeartbeat()
   const hostAlive = heartbeat !== undefined && isHeartbeatProcessAlive(heartbeat)
-  let accounts: Awaited<ReturnType<WorkBuddyCredentialStore['accounts']>> = []
-  let scanError: string | undefined
-  try {
-    accounts = await store.accounts()
-  } catch (error: unknown) {
-    scanError = safeMessage(error)
-  }
+  const regionLists = await Promise.all(REGIONS.map(async region => {
+    try {
+      return { region, accounts: await makeStore(region, client).accounts(), error: undefined }
+    } catch (error: unknown) {
+      return { region, accounts: [], error: safeMessage(error) }
+    }
+  }))
+  const totalAccounts = regionLists.reduce((sum, entry) => sum + entry.accounts.length, 0)
   const report = {
     schemaVersion: JSON_SCHEMA_VERSION,
     package: 'dsh-workbuddy2api',
     version: WORKBUDDY2API_VERSION,
     node: process.version,
     desktopAuthFile: {
-      path: store.desktopAuthPath() ?? '(no platform default; set WORKBUDDY_AUTH_FILE)',
+      path: anyStore.desktopAuthPath() ?? '(no platform default; set WORKBUDDY_AUTH_FILE)',
       dir: defaultDesktopAuthDirs()[0] ?? '(no platform default)',
       candidates: defaultDesktopAuthCandidates(),
       present: desktopPresent,
     },
+    providerRoutes: { cn: 'workbuddy2api', global: 'workbuddy2api-global' },
     hostHeartbeat: {
       path: workbuddyHostHeartbeatPath(),
       present: heartbeat !== undefined,
@@ -95,121 +108,144 @@ async function doctor(jsonOutput: boolean): Promise<number> {
       ...heartbeat?.accounts === undefined ? {} : { accounts: heartbeat.accounts },
       processAlive: hostAlive,
     },
-    accounts: accounts.map(account => ({
-      id: account.id,
-      accountName: account.accountName,
-      region: account.region,
-      domain: account.domain === '' ? undefined : account.domain,
-      source: account.source,
-      tokenExpiresAt: new Date(account.tokenExpiresAtMs).toISOString(),
-    })),
-    ...scanError === undefined ? {} : { scanError },
-    fallbackModels: FALLBACK_WORKBUDDY_MODELS_UNION.length,
+    regions: Object.fromEntries(regionLists.map(({ region, accounts, error }) => [region, {
+      accounts: accounts.map(account => ({
+        id: account.id,
+        accountName: account.accountName,
+        domain: account.domain === '' ? undefined : account.domain,
+        source: account.source,
+        tokenExpiresAt: new Date(account.tokenExpiresAtMs).toISOString(),
+      })),
+      ...error === undefined ? {} : { error },
+      fallbackModels: fallbackModelsFor(region).length,
+    }])),
     poolPolicy: DEFAULT_WORKBUDDY_POOL_POLICY,
     hints: [
-      ...accounts.length > 0 ? [] : ['Sign in once in the WorkBuddy desktop app, then run status again.'],
+      ...totalAccounts > 0 ? [] : ['Sign in once in the WorkBuddy desktop app (either region), then run status again.'],
       ...desktopPresent ? [] : [`No WorkBuddy desktop auth file at the expected path; set ${WORKBUDDY_AUTH_FILE_ENV} if it lives elsewhere.`],
-      ...hostAlive ? [] : ['Host bundle not running in this DSH profile (or the process exited). The browser card and provider are unavailable until DSH starts the plugin.'],
+      ...hostAlive ? [] : ['Host bundle not running in this DSH profile (or the process exited). The browser card and providers are unavailable until DSH starts the plugin.'],
     ],
   }
-  void pool
   if (jsonOutput) {
     printJson(report)
   } else {
     process.stdout.write([
       `WorkBuddy2API ${WORKBUDDY2API_VERSION} on ${process.version}`,
-      `Desktop auth file: ${report.desktopAuthFile.present ? 'present' : 'missing'} (${report.desktopAuthFile.path})`,
+      `Desktop auth file: ${desktopPresent ? 'present' : 'missing'} (${report.desktopAuthFile.path})`,
       `Host bundle: ${hostAlive ? `running (pid ${heartbeat?.pid})` : heartbeat !== undefined ? 'stale heartbeat (process exited)' : 'not started'}`,
-      `Local accounts: ${accounts.length}`,
-      ...accounts.map(account => `  - ${account.accountName} (${account.id}, ${account.region})${account.domain === '' ? '' : ` · ${account.domain}`} expires ${new Date(account.tokenExpiresAtMs).toISOString()}`),
-      `Static fallback models: ${report.fallbackModels}`,
+      ...regionLists.flatMap(({ region, accounts, error }) => [
+        `${REGION_LABELS[region]} — provider ${region === 'global' ? 'workbuddy2api-global' : 'workbuddy2api'}: ${accounts.length} account(s)`,
+        ...error === undefined ? [] : [`  scan error: ${error}`],
+        ...accounts.map(account => `  - ${account.accountName} (${account.id})${account.domain === '' ? '' : ` · ${account.domain}`} expires ${new Date(account.tokenExpiresAtMs).toISOString()}`),
+      ]),
       ...report.hints.map(hint => `Hint: ${hint}`),
       '',
     ].join('\n'))
   }
-  return accounts.length > 0 && desktopPresent ? 0 : 1
+  return totalAccounts > 0 && desktopPresent ? 0 : 1
 }
 
-/** Refresh the pool from disk and report every account. */
-async function status(jsonOutput: boolean): Promise<number> {
-  const { store, pool, client } = makePool()
-  const heartbeat = await readHostHeartbeat()
-  const hostAlive = heartbeat !== undefined && isHeartbeatProcessAlive(heartbeat)
-  const hostState = hostAlive ? 'running' : heartbeat !== undefined ? 'stale' : 'not-started'
+/** One region's pool plus its per-account credit probe. */
+async function regionStatus(region: WorkBuddyRegion, client: WorkBuddyUpstreamClient): Promise<{
+  region: WorkBuddyRegion
+  provider: string
+  entries: Awaited<ReturnType<WorkBuddyAccountPool['snapshot']>>
+  credits: { accountId: string; total?: number; expiringSoon?: number; error?: string }[]
+}> {
+  const store = makeStore(region, client)
+  const pool = new WorkBuddyAccountPool({ list: () => store.accounts() })
   await pool.refresh()
   const entries = pool.snapshot()
-  interface CreditProbe {
-    credits?: number
-    expiringSoon?: number
-    error?: string
-  }
-  const credits = await Promise.all(entries.map(async (entry): Promise<CreditProbe> => {
-    if (!entry.present) return { error: 'credential file missing' }
+  const credits = await Promise.all(entries.map(async (entry) => {
+    if (!entry.present) return { accountId: entry.accountId, error: 'credential file missing' }
     try {
       const credential = await store.resolve(entry.accountId)
       const answer = await client.fetchCredits(credential)
       pool.setCredits(entry.accountId, { total: answer.total, expiringSoon: answer.expiringSoon })
-      return { credits: answer.total, expiringSoon: answer.expiringSoon }
+      return { accountId: entry.accountId, total: answer.total, expiringSoon: answer.expiringSoon }
     } catch (error: unknown) {
-      return { error: safeMessage(error) }
+      return { accountId: entry.accountId, error: safeMessage(error) }
     }
   }))
-  const merged = entries.map((entry, index) => ({ ...entry, ...credits[index] as CreditProbe }))
+  pool.dispose()
+  return {
+    region,
+    provider: region === 'global' ? 'workbuddy2api-global' : 'workbuddy2api',
+    entries: entries.map((entry, index) => ({ ...entry, ...credits[index] })),
+    credits,
+  }
+}
+
+async function status(jsonOutput: boolean): Promise<number> {
+  const client = new WorkBuddyUpstreamClient()
+  const heartbeat = await readHostHeartbeat()
+  const hostAlive = heartbeat !== undefined && isHeartbeatProcessAlive(heartbeat)
+  const hostState = hostAlive ? 'running' : heartbeat !== undefined ? 'stale' : 'not-started'
+  const fragments = await Promise.all(REGIONS.map(region => regionStatus(region, client)))
+  const signedIn = fragments.some(fragment => fragment.entries.some(entry => entry.present && entry.enabled))
   if (jsonOutput) {
     printJson({
       schemaVersion: JSON_SCHEMA_VERSION,
       package: 'dsh-workbuddy2api',
       version: WORKBUDDY2API_VERSION,
-      accounts: merged,
+      regions: Object.fromEntries(fragments.map(fragment => [fragment.region, fragment])),
       hostBundle: hostState,
     })
   } else {
     process.stdout.write([
-      ...merged.flatMap(entry => [
-        `${entry.accountName} (${entry.accountId}, ${entry.region}) — ${entry.state}${entry.enabled ? '' : ' / disabled'}`,
-        ...entry.cooldownUntil === undefined ? [] : [`  cooldown(${entry.cooldownKind ?? 'soft'}) until ${new Date(entry.cooldownUntil).toISOString()}`],
-        ...entry.breakerUntil === undefined ? [] : [`  breaker until ${new Date(entry.breakerUntil).toISOString()}`],
-        ...entry.degradedUntil === undefined ? [] : [`  degraded until ${new Date(entry.degradedUntil).toISOString()}`],
-        `  ok ${entry.successes} / failed ${entry.failures} / in-flight ${entry.inFlight}`,
-        ...entry.credits === undefined
-          ? entry.error === undefined ? [] : [`  credit: unavailable (${entry.error})`]
-          : [`  credit: ${entry.credits}${entry.creditsExpiringSoon === undefined || entry.creditsExpiringSoon === 0 ? '' : ` (expiring soon ${entry.creditsExpiringSoon})`}`],
-        ...entry.lastError === undefined ? [] : [`  last error: ${entry.lastError}`],
+      ...fragments.flatMap(fragment => [
+        `${REGION_LABELS[fragment.region]} — provider ${fragment.provider}: ${fragment.entries.length} account(s)`,
+        ...fragment.entries.flatMap(entry => [
+          `  ${entry.accountName} (${entry.accountId}) — ${entry.state}${entry.enabled ? '' : ' / disabled'}`,
+          ...entry.cooldownUntil === undefined ? [] : [`    cooldown(${entry.cooldownKind ?? 'soft'}) until ${new Date(entry.cooldownUntil).toISOString()}`],
+          ...entry.breakerUntil === undefined ? [] : [`    breaker until ${new Date(entry.breakerUntil).toISOString()}`],
+          ...entry.degradedUntil === undefined ? [] : [`    degraded until ${new Date(entry.degradedUntil).toISOString()}`],
+          `    ok ${entry.successes} / failed ${entry.failures} / in-flight ${entry.inFlight}`,
+        ]),
+        ...fragment.credits.flatMap(probe => probe.error === undefined
+          ? [`  credit ${probe.accountId.slice(0, 8)}…: ${probe.total}${probe.expiringSoon === undefined || probe.expiringSoon === 0 ? '' : ` (expiring soon ${probe.expiringSoon})`}`]
+          : [`  credit ${probe.accountId.slice(0, 8)}…: unavailable (${probe.error})`]),
       ]),
       `Host bundle: ${hostAlive ? `running (pid ${heartbeat?.pid})` : hostState === 'stale' ? 'stale heartbeat (DSH process exited)' : 'not started in this profile'}`,
-      'Client card: load failures are logged to the browser console only; the host provider is unaffected.',
+      'Client card: load failures are logged to the browser console only; the host providers are unaffected.',
       '',
     ].join('\n'))
   }
-  return entries.some(entry => entry.present && entry.enabled) ? 0 : 1
+  return signedIn ? 0 : 1
 }
 
-/** Print the live pool snapshot without touching the network. */
+/** Print each region's live pool snapshot without touching the network. */
 async function poolStatus(jsonOutput: boolean): Promise<number> {
-  const { pool } = makePool()
-  await pool.refresh()
-  const entries = pool.snapshot()
-  const policy = pool.currentPolicy()
+  const client = new WorkBuddyUpstreamClient()
+  const fragments = await Promise.all(REGIONS.map(async region => {
+    const store = makeStore(region, client)
+    const pool = new WorkBuddyAccountPool({ list: () => store.accounts() })
+    await pool.refresh()
+    const snapshot = { region, entries: pool.snapshot(), policy: pool.currentPolicy(), sticky: pool.stickySize() }
+    pool.dispose()
+    return snapshot
+  }))
   if (jsonOutput) {
     printJson({
       schemaVersion: JSON_SCHEMA_VERSION,
       package: 'dsh-workbuddy2api',
       version: WORKBUDDY2API_VERSION,
-      entries,
-      policy,
-      stickyBindings: pool.stickySize(),
+      regions: Object.fromEntries(fragments.map(fragment => [fragment.region, fragment])),
     })
   } else {
     process.stdout.write([
-      ...entries.map(entry => [
-        `${entry.accountName} (${entry.accountId}, ${entry.region}) — ${entry.state}`,
-        `  weight ${entry.weight} · priority ${entry.priority} · in-flight ${entry.inFlight}`,
-        `  ok ${entry.successes} / failed ${entry.failures} / consecutive ${entry.consecutiveFailures} / cooldowns ${entry.cooldownCount}`,
-        ...entry.credits === undefined ? [] : [`  credits ${entry.credits}`],
-        ...entry.lastUsedAt === undefined ? [] : [`  last used ${new Date(entry.lastUsedAt).toISOString()}`],
-      ].join('\n')),
-      `Policy: in-flight ${policy.maxInFlightPerAccount}/account (global ${policy.maxInFlightGlobalPerAccount}), total ${policy.maxInFlightTotal}; breaker ${policy.breakerThreshold} failures → ${policy.breakerCooldownMs}ms (max ${policy.breakerCooldownMaxMs}ms); soft cooldown ${policy.softRateCooldownMs}ms (max ${policy.softRateCooldownMaxMs}ms)`,
-      `Sticky bindings: ${pool.stickySize()} (ttl ${policy.stickyTtlMs}ms)`,
+      ...fragments.flatMap(fragment => [
+        `${REGION_LABELS[fragment.region]} — provider ${fragment.region === 'global' ? 'workbuddy2api-global' : 'workbuddy2api'}`,
+        ...fragment.entries.length === 0 ? ['  (no accounts in this region)'] : [],
+        ...fragment.entries.flatMap(entry => [
+          `  ${entry.accountName} (${entry.accountId}) — ${entry.state}`,
+          `    weight ${entry.weight} · priority ${entry.priority} · in-flight ${entry.inFlight}`,
+          `    ok ${entry.successes} / failed ${entry.failures} / consecutive ${entry.consecutiveFailures} / cooldowns ${entry.cooldownCount}`,
+          ...entry.credits === undefined ? [] : [`    credits ${entry.credits}`],
+        ]),
+        `  policy: in-flight ${fragment.policy.maxInFlightPerAccount}/account (global cap ${fragment.policy.maxInFlightGlobalPerAccount}), total ${fragment.policy.maxInFlightTotal}`,
+        `  sticky bindings: ${fragment.sticky} (ttl ${fragment.policy.stickyTtlMs}ms)`,
+      ]),
       '',
     ].join('\n'))
   }
@@ -244,9 +280,11 @@ export async function run(argv: readonly string[]): Promise<number> {
       case 'pool':
         return await poolStatus(jsonOutput)
       case 'logout': {
-        const { store } = makePool()
-        await store.logout()
-        process.stdout.write('WorkBuddy2API: removed the plugin-owned per-account credential copies; the desktop app\'s sign-ins are untouched\n')
+        // Both regions write per-account copies into the same store directory,
+        // so logout must sweep it once per region to cover every account.
+        const client = new WorkBuddyUpstreamClient()
+        for (const region of REGIONS) await makeStore(region, client).logout()
+        process.stdout.write('WorkBuddy2API: removed the plugin-owned per-account credential copies for both regions; the desktop app\'s sign-ins are untouched\n')
         return 0
       }
     }

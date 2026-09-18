@@ -11,9 +11,10 @@ import { AttachmentStore } from "@deepseek-ai/dsh-attachment";
  *   — 「同源只读路由 + 一份与浏览器共享的 node-free 类型定义」的 host↔client
  *     桥梁形态来自该项目（其源自 dsh-connect-trae，并注明沿用
  *     corrinehu/dsh-workbuddy-connect 的 status-route 模式）。
- * 改动：路由路径改用本插件 id；文档结构从「一个账号 + 一份目录」改成
- *   「账号池 + 每账号健康 + 一份合并目录」，并新增池操作路由
- *   （启用/停用/重置/权重）与积分刷新路由。
+ * 改动：
+ *   1. 文档结构从「一个账号 + 一份目录」改成「账号池 + 每账号健康 + 一份目录」；
+ *   2. 区域（cn | global）从可选字段升级为路由、配置与 provider 的主键 ——
+ *      国内版与国际版是两个独立账号池、两个独立 provider、两份独立目录。
  *
  * @module dsh-workbuddy2api/status-paths
  */
@@ -27,10 +28,42 @@ declare const WORKBUDDY2API_ACCOUNTS_REFRESH_PATH = "/plugins/dsh-workbuddy2api/
 declare const WORKBUDDY2API_CREDITS_REFRESH_PATH = "/plugins/dsh-workbuddy2api/credits/refresh";
 /** Plugin-owned daily check-in action endpoint. */
 declare const WORKBUDDY2API_CHECKIN_PATH = "/plugins/dsh-workbuddy2api/checkin";
-/** Plugin-owned pool control endpoint (enable / disable / reset / weight). */
+/** Plugin-owned pool control endpoint (reset / release). */
 declare const WORKBUDDY2API_POOL_ACTION_PATH = "/plugins/dsh-workbuddy2api/pool";
 /** Query parameter naming the account a card request addresses. */
 declare const WORKBUDDY2API_ACCOUNT_PARAM = "accountId";
+/** Query parameter naming the REGION (i.e. which pool) a card request addresses. */
+declare const WORKBUDDY2API_REGION_PARAM = "region";
+/**
+ * Both regions, in tab order.
+ *
+ * The two regions are NOT a display grouping: each owns a separate account
+ * pool, a separate provider route, and a separate model directory. They must
+ * stay separate because the upstream reuses one model id for different things
+ * per region — `deepseek-v4.1-flash` is a free promotional model on the
+ * international gateway and a paid one on the domestic gateway — so merging
+ * the two directories silently replaces one region's rate with the other's.
+ */
+declare const WORKBUDDY2API_REGIONS: readonly WorkBuddyWebRegion[];
+/**
+ * Address one region's status route. Every card request carries the region
+ * whose tab the user is on, so a tab can only ever read and write its own
+ * pool, credits, and model slot.
+ */
+declare function withWorkBuddyRegion(path: string, region: WorkBuddyWebRegion): string;
+/**
+ * Read the region parameter off a status-route URL. Absent means the domestic
+ * tab (`cn`); a present-but-unknown value returns undefined so the route can
+ * answer 400 instead of silently addressing the wrong pool.
+ */
+declare function regionOfStatusUrl(url: string): WorkBuddyWebRegion | undefined;
+/**
+ * Region of the signed-in credential: the CN app (`codebuddy.cn` /
+ * `workbuddy.cn`) or the international WorkBuddy AI app (`workbuddy.ai` /
+ * `codebuddy.ai`). The card uses this to pick the pool and model slot a tab
+ * reads and writes.
+ */
+type WorkBuddyWebRegion = 'cn' | 'global';
 /** One credit package as the upstream returns it, node-free. */
 interface WorkBuddyWebCreditPackage {
   packageName: string;
@@ -97,9 +130,11 @@ interface WorkBuddyWebAccount {
   accountName: string;
   uin?: string;
   domain: string;
-  region: 'cn' | 'global';
+  region: WorkBuddyWebRegion;
   source: 'desktop' | 'dsh';
   tokenExpiresAtMs: number;
+  /** Whether this account's pool currently counts it as enabled. */
+  enabled: boolean;
   /** Whether a credential file for this account is still on disk. */
   present: boolean;
 }
@@ -107,7 +142,7 @@ interface WorkBuddyWebAccount {
 interface WorkBuddyWebPoolEntry {
   accountId: string;
   accountName: string;
-  region: 'cn' | 'global';
+  region: WorkBuddyWebRegion;
   enabled: boolean;
   weight: number;
   priority: number;
@@ -140,30 +175,6 @@ interface WorkBuddyWebAccountCredits {
   checkinError?: string;
 }
 type WorkBuddyWebPackage = WorkBuddyWebCreditPackage;
-/** The JSON document the plugin card renders. */
-type WorkBuddyWebUsage = {
-  status: 'empty';
-  accounts: readonly WorkBuddyWebAccount[];
-  pool: readonly WorkBuddyWebPoolEntry[];
-  message?: string;
-} | {
-  status: 'ready';
-  /** The account the pool would pick right now, for the card's headline. */
-  activeAccountId?: string;
-  accounts: readonly WorkBuddyWebAccount[];
-  pool: readonly WorkBuddyWebPoolEntry[];
-  credits: readonly WorkBuddyWebAccountCredits[];
-  models: readonly WorkBuddyWebModel[];
-  enabledModelIds: readonly string[];
-  imageModelIds: readonly string[];
-  /** Persisted per-account pool state, so the card can save it back. */
-  poolState: readonly WorkBuddyWebPoolState[];
-  /** Effective pool policy, so the card can display and edit it. */
-  policy: WorkBuddyWebPoolPolicy;
-} | {
-  status: 'error';
-  message: string;
-};
 /**
  * The persisted per-account pool slice. Declared node-free because the browser
  * half saves it back verbatim through `settingsScope`; `pool.ts` owns the
@@ -183,14 +194,18 @@ interface WorkBuddyPoolStateRecord {
 /** The card's view of the persisted pool slice: the same document. */
 type WorkBuddyWebPoolState = WorkBuddyPoolStateRecord;
 /**
- * Health-policy knobs for the account pool. Declared here (node-free) so the
- * browser half and the host's `pool.ts` share ONE definition; every default is
- * the workbuddy2api default and lives in `pool.ts`.
+ * Health-policy knobs for one account pool. Declared here (node-free) so the
+ * browser half and the host's `pool.ts` share ONE definition; the defaults live
+ * in `pool.ts`.
+ *
+ * Each region carries its OWN policy: the international gateway enforces a
+ * visibly tighter WAF, so its pool keeps a lower concurrency ceiling and a
+ * longer cooldown than the domestic one.
  */
 interface WorkBuddyPoolPolicy {
   /** Concurrent requests per account; 0 means unlimited. */
   maxInFlightPerAccount: number;
-  /** Concurrent requests per international (global) account; <=0 falls back to 2. */
+  /** Ceiling for this region's accounts when the region is the global one. */
   maxInFlightGlobalPerAccount: number;
   /** Concurrent requests across the whole pool; 0 means unlimited. */
   maxInFlightTotal: number;
@@ -219,8 +234,33 @@ interface WorkBuddyPoolPolicy {
   /** Ignore credit- and idle-based weighting, picking uniformly. */
   balanceAware: boolean;
 }
-/** The card's view of the policy: the same document, under its web name. */
+/** The card's view of one region's policy: the same document, under its web name. */
 type WorkBuddyWebPoolPolicy = WorkBuddyPoolPolicy;
+/** The JSON document one region's card tab renders. */
+type WorkBuddyWebUsage = {
+  status: 'empty';
+  region: WorkBuddyWebRegion;
+  accounts: readonly WorkBuddyWebAccount[];
+  pool: readonly WorkBuddyWebPoolEntry[];
+  message?: string;
+} | {
+  status: 'ready';
+  region: WorkBuddyWebRegion;
+  accounts: readonly WorkBuddyWebAccount[];
+  pool: readonly WorkBuddyWebPoolEntry[];
+  credits: readonly WorkBuddyWebAccountCredits[];
+  models: readonly WorkBuddyWebModel[];
+  enabledModelIds: readonly string[];
+  imageModelIds: readonly string[];
+  /** Persisted per-account pool state, so the card can save it back. */
+  poolState: readonly WorkBuddyWebPoolState[];
+  /** Effective pool policy, so the card can display and edit it. */
+  policy: WorkBuddyWebPoolPolicy;
+} | {
+  status: 'error';
+  region: WorkBuddyWebRegion;
+  message: string;
+};
 //#endregion
 //#region src/auth.d.ts
 /** Normalized WorkBuddy credential, timestamps in epoch milliseconds. */
@@ -283,6 +323,12 @@ interface WorkBuddyCredentialStoreOptions {
   authDirs?: readonly string[];
   /** Directory for the per-account refreshed copies; defaults to $DSH_HOME. */
   storeDir?: string;
+  /**
+   * Region this store serves. When set, only credentials whose login domain
+   * maps to this region are discovered or resolved — the two regions' pools
+   * run side by side without ever seeing each other's accounts.
+   */
+  region?: WorkBuddyRegion;
   /** Performs the upstream token refresh. */
   refresh: (credential: WorkBuddyCredential) => Promise<WorkBuddyRefreshOutcome>;
   /** Refresh this long before actual expiry; default five minutes. */
@@ -350,10 +396,15 @@ declare class WorkBuddyCredentialStore {
   private readonly refreshMarginMs;
   private readonly authDirs;
   private readonly storeDir;
+  private readonly region;
   private desktopPathOverride;
   /** In-flight refresh per account id; concurrent callers share one request. */
   private readonly inflight;
   constructor(options: WorkBuddyCredentialStoreOptions);
+  /** Whether a credential's login domain belongs to this store's region. */
+  private matchesRegion;
+  /** The region this store serves, when it is region-scoped. */
+  regionOf(): WorkBuddyRegion | undefined;
   /** Repoint the desktop file or directory; applies on the next read. */
   setDesktopPath(path: string | undefined): void;
   /** The auth-file path candidates, in probe order. */
@@ -540,12 +591,21 @@ declare class WorkBuddyUpstreamClient {
    */
   fetchModels(credential: WorkBuddyCredential, signal?: AbortSignal): Promise<readonly WorkBuddyUpstreamModel[]>;
   /**
-   * Read every pooled account's directory and merge the results into one
-   * plugin-wide catalog. Accounts are queried in parallel and a failing account
-   * never fails the merge: the catalog is the union of what the pool can
-   * actually serve, so one expired sign-in must not blank the model picker.
-   * When EVERY account fails the last error is thrown so the caller can report
-   * a real cause instead of an empty catalog.
+   * Read ONE region's pooled accounts' directories and merge them into that
+   * region's catalog.
+   *
+   * Every credential handed in must belong to the same region: this method
+   * merges on model id, and the upstream reuses ids across regions for models
+   * that are billed differently (`deepseek-v4.1-flash` is x0.00 on the
+   * international gateway and x0.03 on the domestic one). Merging across
+   * regions would therefore let one side's rate silently replace the other's,
+   * which is exactly the bug the two-pool split exists to prevent. The region is
+   * asserted rather than assumed so a caller mistake fails loudly.
+   *
+   * Accounts are queried in parallel and a failing account never fails the
+   * merge: the catalog is what the pool can actually serve, so one expired
+   * sign-in must not blank the model picker. When EVERY account fails the first
+   * real cause is thrown instead of returning an empty catalog.
    */
   fetchModelsForCredentials(credentials: readonly WorkBuddyCredential[], signal?: AbortSignal): Promise<WorkBuddyUpstreamModel[]>;
   /** Query today's check-in status without changing account state. */
@@ -821,29 +881,34 @@ type WorkBuddyContextBudget = number;
 declare const FALLBACK_WORKBUDDY_MODELS: readonly WorkBuddyModelInfo[];
 /**
  * Static CLI models captured from the INTERNATIONAL gateway's desktop-channel
- * product config (`www.workbuddy.ai/v3/config`, 2026-09-11).
+ * product config (`www.workbuddy.ai/v3/config`, 2026-09-11). The two regions
+ * expose different rosters, so a global account must never be seeded with the
+ * CN list.
  */
 declare const FALLBACK_WORKBUDDY_MODELS_GLOBAL: readonly WorkBuddyModelInfo[];
 /**
- * The union of both regions' fallbacks, CN entries first and duplicates
- * resolved in favour of the CN spelling (its context/output numbers are the
- * ones the CN gateway serves). The union matters because ONE provider now
- * serves every pooled account: seeding it with a single region's roster would
- * hide the other region's models until the first live refresh lands.
+ * Static fallback directory for one region. Each region's provider must never be
+ * seeded with the other region's roster: the two gateways can bill the same id
+ * differently, so a shared list would misreport rates before the first refresh.
  */
-declare const FALLBACK_WORKBUDDY_MODELS_UNION: readonly WorkBuddyModelInfo[];
+declare function fallbackModelsFor(region: WorkBuddyRegion): readonly WorkBuddyModelInfo[];
 /** Apply the saved local DSH budget; models above 200K default to 200K. */
 declare function applyContextBudgets(catalog: readonly WorkBuddyModelInfo[], budgets?: Readonly<Record<string, WorkBuddyContextBudget | undefined>>): WorkBuddyModelInfo[];
 /**
- * Derive the runtime catalog from the last-refreshed directory plus the user's
- * selection. An empty selection falls back to the whole directory: a plugin
- * that has never been configured must still serve models rather than nothing.
+ * Derive one region's runtime catalog from its last-refreshed directory plus the
+ * user's selection within that region. An empty selection falls back to the
+ * whole directory: a plugin that has never been configured must still serve
+ * models rather than nothing.
  */
 declare function deriveCatalog(catalog: readonly WorkBuddyModelInfo[], enabled: ReadonlySet<string>, budgets?: Readonly<Record<string, WorkBuddyContextBudget | undefined>>): WorkBuddyModelInfo[];
-/** Mutable catalog shared by the shim's `/v1/models` and the adapter. */
+/** Mutable catalog shared by one region's shim `/v1/models` and its adapter. */
 declare class WorkBuddyCatalog {
   private models;
-  constructor(seed?: readonly WorkBuddyModelInfo[]);
+  /**
+   * @param region Seeds the static fallback for THIS region, so the provider has
+   * a usable roster from the first moment without borrowing the other side's.
+   */
+  constructor(region?: WorkBuddyRegion);
   /** Current entries; the fallback list until the upstream answer lands. */
   current(): readonly WorkBuddyModelInfo[];
   /** Replace the list; callers invalidate their adapter snapshot after this. */
@@ -889,16 +954,30 @@ interface WorkBuddyShimOptions {
 declare function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShim;
 //#endregion
 //#region src/adapter.d.ts
-/** Provider route this bundle owns. */
+/** Provider route the domestic account pool registers as. */
 declare const WORKBUDDY2API_PROVIDER = "workbuddy2api";
-/** Human-readable provider name, shown in the DSH model picker. */
-declare const WORKBUDDY2API_PROVIDER_DISPLAY_NAME = "WorkBuddy 账号池";
+/** Provider route the international account pool registers as. */
+declare const WORKBUDDY2API_GLOBAL_PROVIDER = "workbuddy2api-global";
+/** The provider id each region registers as. */
+declare const WORKBUDDY2API_PROVIDERS: Readonly<Record<WorkBuddyRegion, string>>;
+/** Region a provider route id belongs to. */
+declare function regionOfProvider(provider: string): WorkBuddyRegion | undefined;
+/** Human-readable provider names, shown in the DSH model picker. */
+declare const WORKBUDDY2API_PROVIDER_DISPLAY_NAMES: Readonly<Record<WorkBuddyRegion, string>>;
+/** Default display name, kept for callers that do not name a region. */
+declare const WORKBUDDY2API_PROVIDER_DISPLAY_NAME: string;
 /** Provider idle ceiling while one stream read is outstanding. */
 declare const WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS = 300000;
 /** Constructor dependencies. */
 interface WorkBuddyAdapterOptions {
   shim: WorkBuddyShim;
   catalog: WorkBuddyCatalog;
+  /** The pool this adapter fronts; selects the provider id and display name. */
+  region: WorkBuddyRegion;
+  /** Overrides the provider route id; defaults to the region's route. */
+  provider?: string;
+  /** Overrides the provider display name; defaults to the region's name. */
+  displayName?: string;
   /** Resolve the durable attachment service at request time, when present. */
   resolveAttachments?: () => AttachmentStore | undefined;
 }
@@ -1002,47 +1081,54 @@ declare function clearHostHeartbeat(): Promise<void>;
 declare const WORKBUDDY2API_VERSION: string;
 //#endregion
 //#region src/web-status.d.ts
-/** Constructor dependencies. */
+/** Constructor dependencies. Every region-scoped accessor takes the region. */
 interface WorkBuddyStatusRouteOptions {
-  store: WorkBuddyCredentialStore;
-  pool: WorkBuddyAccountPool;
+  /** The region-scoped credential store backing that region's requests. */
+  store(region: WorkBuddyRegion): WorkBuddyCredentialStore;
+  /** The region's own account pool. */
+  pool(region: WorkBuddyRegion): WorkBuddyAccountPool;
   client: Pick<WorkBuddyUpstreamClient, 'fetchCredits' | 'fetchCheckinStatus' | 'claimDailyCheckin'>;
-  /** The last-refreshed model directory (unfiltered) for card display. */
-  displayModels(): readonly WorkBuddyModelInfo[];
-  /** The user's selection, stored as model ids. */
-  enabledModelIds(): readonly string[];
-  /** Model ids the user opted into image input. */
-  imageModelIds(): readonly string[];
-  /** Saved local DSH context budgets by model id. */
-  contextBudgets(): Readonly<Record<string, number | undefined>>;
+  /**
+   * The requested region's last-refreshed model directory (unfiltered) for card
+   * display. Region-scoped because the two gateways expose different rosters
+   * AND can bill the same id differently; showing one region's directory on the
+   * other is the bug the two-pool split exists to prevent.
+   */
+  displayModels(region: WorkBuddyRegion): readonly WorkBuddyModelInfo[];
+  /** The requested region's selection, stored as model ids. */
+  enabledModelIds(region: WorkBuddyRegion): readonly string[];
+  /** Model ids the user opted into image input, for the requested region. */
+  imageModelIds(region: WorkBuddyRegion): readonly string[];
+  /** Saved local DSH context budgets by model id, for the requested region. */
+  contextBudgets(region: WorkBuddyRegion): Readonly<Record<string, number | undefined>>;
   /** Persisted per-account pool state, mirrored to the card for saving. */
-  poolState(): readonly WorkBuddyWebPoolState[];
-  /** The pool policy in force. */
-  policy(): WorkBuddyPoolPolicy;
-  /** Re-read the live catalog from every account and merge it. */
-  discoverModels?(signal?: AbortSignal): Promise<readonly WorkBuddyModelInfo[]>;
-  /** Fetch and cache one account's credits; resolves to the fetched answer. */
-  refreshCredits?(accountId: string): Promise<WorkBuddyCredits>;
+  poolState(region: WorkBuddyRegion): readonly WorkBuddyWebPoolState[];
+  /** The requested region's pool policy in force. */
+  policy(region: WorkBuddyRegion): WorkBuddyPoolTuning;
+  /** Re-read one region's live catalog from that region's own accounts. */
+  discoverModels?(region: WorkBuddyRegion, signal?: AbortSignal): Promise<readonly WorkBuddyModelInfo[]>;
+  /** Fetch and cache one account's credits inside its own region's pool. */
+  refreshCredits?(region: WorkBuddyRegion, accountId: string): Promise<WorkBuddyCredits>;
 }
 /**
- * Assemble the card's document: the locally discovered accounts, the pool's
- * live health per account, the cached credits, and the model directory with
- * the user's selection. Credit queries never run here — the pool's cache is
- * read instead, so a 60-second card poll does not hammer N upstream billing
- * endpoints.
+ * Assemble one region's card document: that region's locally discovered
+ * accounts, its pool's live health per account, its cached credits, and its
+ * model directory with the user's selection within it. Credit queries never run
+ * here — the pool's cache is read instead, so a 60-second card poll does not
+ * hammer N upstream billing endpoints.
  */
-declare function workBuddyWebStatus(deps: WorkBuddyStatusRouteOptions): Promise<WorkBuddyWebUsage>;
+declare function workBuddyWebStatus(deps: WorkBuddyStatusRouteOptions, region: WorkBuddyRegion): Promise<WorkBuddyWebUsage>;
 /**
- * Mount the routes on a context where `webServer` is available. The caller
- * uses `ctx.inject(['webServer'], ...)`, so Desktop startup order cannot make
- * this registration disappear.
+ * Mount the routes on a context where `webServer` is available. The caller uses
+ * `ctx.inject(['webServer'], ...)`, so Desktop startup order cannot make this
+ * registration disappear.
  */
 declare function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddyStatusRouteOptions): void;
 //#endregion
 //#region src/index.d.ts
 /** Stable Cordis plugin name. */
 declare const name = "dsh-workbuddy2api";
-/** The model registry and settings service required before the provider can register. */
+/** The model registry and settings service required before providers can register. */
 declare const inject: string[];
 /** Settings namespace for the plugin configuration card. */
 declare const WORKBUDDY2API_SETTINGS_NS: SettingsNamespace;
@@ -1062,33 +1148,67 @@ interface WorkBuddyPersistedModel {
   descriptionEn?: string;
   supportsToolCall?: boolean;
 }
+/** One region's model directory and the user's selection within it. */
+interface WorkBuddyRegionState {
+  /** The last-refreshed directory for this region; what the card displays. */
+  lastCatalog?: WorkBuddyPersistedModel[];
+  /** The user's selection in this region, as model ids. */
+  enabledModelIds?: string[];
+  /** Model ids the user explicitly opted into image input. */
+  imageModelIds?: string[];
+  /** Local DSH context budget per model id, for this region. */
+  contextBudgets?: Record<string, number>;
+  /** Per-account pool switches, weights, and running cooldowns. */
+  poolState?: WorkBuddyPoolStateRecord[];
+  /** Health-policy overrides for this region's pool. */
+  pool?: Partial<WorkBuddyPoolTuning>;
+}
 /** Plugin configuration. */
 interface Config {
   /** Explicit WorkBuddy desktop auth-file path, overriding env and platform defaults. */
   authFile?: string;
-  /** The last-refreshed model directory; what the card displays. */
+  /**
+   * Per-region state, keyed `cn` | `global`. Each region's provider, pool,
+   * catalog, and card tab read and write ONLY their own slot, so changing
+   * anything on one side never touches the other.
+   */
+  regions?: Partial<Record<WorkBuddyRegion, WorkBuddyRegionState>>;
+  /** @deprecated 0.1.x merged directory. Accepted so old settings still load; never read. */
   lastCatalog?: WorkBuddyPersistedModel[];
-  /** The user's model selection, as model ids. */
+  /** @deprecated See {@link Config.lastCatalog}. */
   enabledModelIds?: string[];
-  /** Model ids the user explicitly opted into image input. */
+  /** @deprecated See {@link Config.lastCatalog}. */
   imageModelIds?: string[];
-  /** Local DSH context budget per model id. */
+  /** @deprecated See {@link Config.lastCatalog}. */
   contextBudgets?: Record<string, number>;
-  /** Per-account pool switches, weights, and running cooldowns. */
+  /** @deprecated See {@link Config.lastCatalog}. */
   poolState?: WorkBuddyPoolStateRecord[];
-  /** Health-policy overrides; absent fields take the plugin defaults. */
-  pool?: Partial<WorkBuddyPoolPolicy>;
+  /** @deprecated See {@link Config.lastCatalog}. */
+  pool?: Partial<WorkBuddyPoolTuning>;
 }
-declare const Config: z<Config>;
-/** The persisted pool policy over the defaults, dropping unknown values. */
-declare function resolvePolicy(configured: Partial<WorkBuddyPoolPolicy> | undefined): WorkBuddyPoolPolicy;
 /**
- * Wire the pool, the loopback shim, and the single provider route.
+ * The plugin configuration schema.
  *
- * Ordering is load-bearing: the shim must hold its ephemeral port before the
- * provider is constructed, because every model's `baseUrl` is read from the
- * shim origin at construction time.
+ * The shape is asserted once at the export boundary rather than per field: a
+ * cast inside an object literal cannot carry a nested generic such as
+ * `z<Partial<Record<Region, State>>>` — the parser loses the expression context
+ * at the closing brackets — so the single outer assertion is both the portable
+ * form and the one place a reader has to check.
+ */
+declare const Config: z<Config>;
+/** Every region, in card tab order. */
+declare const REGION_KEYS: readonly WorkBuddyRegion[];
+/** One region's saved state, or an empty state when it was never configured. */
+declare function regionStateOf(config: Config, region: WorkBuddyRegion): WorkBuddyRegionState;
+/** One region's persisted policy over the defaults, dropping unknown values. */
+declare function resolvePolicy(configured: Partial<WorkBuddyPoolTuning> | undefined): WorkBuddyPoolTuning;
+/**
+ * Start both regions' loopback endpoints, register the `workbuddy2api` (CN) and
+ * `workbuddy2api-global` (international) providers, and refresh each region's
+ * model catalog from its own accounts. Each region's static fallback catalog
+ * serves from the first moment, so an offline upstream never leaves a provider
+ * empty.
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { Config, DEFAULT_WORKBUDDY_POOL_POLICY, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, FALLBACK_WORKBUDDY_MODELS_UNION, type UpstreamErrorKind, WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, WORKBUDDY2API_ACCOUNT_PARAM, WORKBUDDY2API_CHECKIN_PATH, WORKBUDDY2API_CREDITS_REFRESH_PATH, WORKBUDDY2API_HOST_HEARTBEAT_FILENAME, WORKBUDDY2API_MODELS_REFRESH_PATH, WORKBUDDY2API_POOL_ACTION_PATH, WORKBUDDY2API_PROVIDER, WORKBUDDY2API_PROVIDER_DISPLAY_NAME, WORKBUDDY2API_SETTINGS_NS, WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY2API_USAGE_PATH, WORKBUDDY2API_VERSION, WORKBUDDY_AUTH_FILE_ENV, type WorkBuddyAccountChoice, WorkBuddyAccountPool, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCheckinClaim, type WorkBuddyCheckinStatus, type WorkBuddyContextBudget, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredentialStoreOptions, type WorkBuddyCreditPackage, type WorkBuddyCredits, type WorkBuddyDispatchOutcome, type WorkBuddyHostHeartbeat, type WorkBuddyModelInfo, WorkBuddyPersistedModel, type WorkBuddyPickResult, type WorkBuddyPoolAccount, type WorkBuddyPoolEntry, type WorkBuddyPoolMissReason, type WorkBuddyPoolPolicy, type WorkBuddyPoolState, type WorkBuddyPoolStateRecord, type WorkBuddyReasoning, type WorkBuddyRefreshOutcome, type WorkBuddyRegion, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyWebAccount, type WorkBuddyWebAccountCredits, type WorkBuddyWebCheckin, type WorkBuddyWebCredits, type WorkBuddyWebModel, type WorkBuddyWebPackage, type WorkBuddyWebPoolEntry, type WorkBuddyWebPoolPolicy, type WorkBuddyWebPoolState, type WorkBuddyWebUsage, apply, applyContextBudgets, authFileName, classifyUpstreamError, clearHostHeartbeat, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, deriveCatalog, expiryToMs, inject, isFresher, isHeartbeatProcessAlive, name, nextDay4Am, parseCreditMultiplier, parseReasoning, parseUpstreamModel, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, readHostHeartbeat, regionOf, registerWorkBuddy2ApiStatusRoute, resolvePolicy, selectCliModels, stickyKeyOf, toPersistedWorkBuddyModel, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, writeHostHeartbeat };
+export { Config, DEFAULT_WORKBUDDY_POOL_POLICY, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, REGION_KEYS, type UpstreamErrorKind, WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, WORKBUDDY2API_ACCOUNT_PARAM, WORKBUDDY2API_CHECKIN_PATH, WORKBUDDY2API_CREDITS_REFRESH_PATH, WORKBUDDY2API_GLOBAL_PROVIDER, WORKBUDDY2API_HOST_HEARTBEAT_FILENAME, WORKBUDDY2API_MODELS_REFRESH_PATH, WORKBUDDY2API_POOL_ACTION_PATH, WORKBUDDY2API_PROVIDER, WORKBUDDY2API_PROVIDERS, WORKBUDDY2API_PROVIDER_DISPLAY_NAME, WORKBUDDY2API_PROVIDER_DISPLAY_NAMES, WORKBUDDY2API_REGIONS, WORKBUDDY2API_REGION_PARAM, WORKBUDDY2API_SETTINGS_NS, WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY2API_USAGE_PATH, WORKBUDDY2API_VERSION, WORKBUDDY_AUTH_FILE_ENV, type WorkBuddyAccountChoice, WorkBuddyAccountPool, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCheckinClaim, type WorkBuddyCheckinStatus, type WorkBuddyContextBudget, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredentialStoreOptions, type WorkBuddyCreditPackage, type WorkBuddyCredits, type WorkBuddyDispatchOutcome, type WorkBuddyHostHeartbeat, type WorkBuddyModelInfo, WorkBuddyPersistedModel, type WorkBuddyPickResult, type WorkBuddyPoolAccount, type WorkBuddyPoolEntry, type WorkBuddyPoolMissReason, type WorkBuddyPoolPolicy, type WorkBuddyPoolState, type WorkBuddyPoolStateRecord, type WorkBuddyPoolTuning, type WorkBuddyReasoning, type WorkBuddyRefreshOutcome, type WorkBuddyRegion, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyWebAccount, type WorkBuddyWebAccountCredits, type WorkBuddyWebCheckin, type WorkBuddyWebCredits, type WorkBuddyWebModel, type WorkBuddyWebPackage, type WorkBuddyWebPoolEntry, type WorkBuddyWebPoolPolicy, type WorkBuddyWebPoolState, type WorkBuddyWebRegion, type WorkBuddyWebUsage, apply, applyContextBudgets, authFileName, classifyUpstreamError, clearHostHeartbeat, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, deriveCatalog, expiryToMs, fallbackModelsFor, inject, isFresher, isHeartbeatProcessAlive, name, nextDay4Am, parseCreditMultiplier, parseReasoning, parseUpstreamModel, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, readHostHeartbeat, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, registerWorkBuddy2ApiStatusRoute, resolvePolicy, selectCliModels, stickyKeyOf, toPersistedWorkBuddyModel, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, writeHostHeartbeat };

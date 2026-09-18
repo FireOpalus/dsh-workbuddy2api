@@ -282,6 +282,25 @@ describe('WorkBuddyCredentialStore', () => {
     expect(await store.desktopFilePresent()).toBe(true)
   })
 
+  it('scopes discovery to one region when the store is region-bound', async () => {
+    await writeAuth('workbuddy-desktop.info', { uin: 'CN1', domain: 'www.codebuddy.cn' })
+    await writeAuth('workbuddy-desktop.2026-08-01T00.info', { uin: 'GL1', domain: 'www.workbuddy.ai' })
+    const base = {
+      desktopPath: join(authDir, 'workbuddy-desktop.info'),
+      storeDir,
+      refresh: async () => { throw new Error('not used') },
+    }
+    const cn = new WorkBuddyCredentialStore({ ...base, region: 'cn' as const })
+    const global = new WorkBuddyCredentialStore({ ...base, region: 'global' as const })
+    const unscoped = new WorkBuddyCredentialStore(base)
+    expect((await cn.accounts()).map(account => account.uin)).toEqual(['CN1'])
+    expect((await global.accounts()).map(account => account.uin)).toEqual(['GL1'])
+    expect((await unscoped.accounts()).map(account => account.uin).sort()).toEqual(['CN1', 'GL1'])
+    // A region-scoped store cannot resolve the other region's account at all.
+    const foreign = (await global.accounts())[0]?.id as string
+    await expect(cn.resolve(foreign)).rejects.toThrow(/no signed-in WorkBuddy account/)
+  })
+
   it('reports signed-out for an unknown account instead of throwing', async () => {
     const store = new WorkBuddyCredentialStore({
       desktopPath: join(authDir, 'missing.info'),

@@ -175,29 +175,43 @@ describe('WorkBuddyUpstreamClient', () => {
     vi.unstubAllGlobals()
   })
 
-  it('merges every account\'s directory into one catalog', async () => {
+  it('merges the accounts of ONE region and keeps that region\'s rate for a shared id', async () => {
     const client = new WorkBuddyUpstreamClient()
-    const cnModels: WorkBuddyUpstreamModel[] = [
-      { id: 'shared', name: 'CN Shared', contextWindow: 10, maxTokens: 1 },
-      { id: 'cn-only', name: 'CN Only', contextWindow: 10, maxTokens: 1 },
+    const first: WorkBuddyUpstreamModel[] = [
+      { id: 'shared', name: 'Shared', contextWindow: 10, maxTokens: 1, creditMultiplier: 0 },
+      { id: 'first-only', name: 'First Only', contextWindow: 10, maxTokens: 1 },
     ]
-    const globalModels: WorkBuddyUpstreamModel[] = [
-      { id: 'shared', name: 'Global Shared', contextWindow: 20, maxTokens: 2 },
-      { id: 'global-only', name: 'Global Only', contextWindow: 20, maxTokens: 2 },
+    const second: WorkBuddyUpstreamModel[] = [
+      { id: 'shared', name: 'Shared', contextWindow: 10, maxTokens: 1 },
+      { id: 'second-only', name: 'Second Only', contextWindow: 10, maxTokens: 1 },
     ]
     vi.spyOn(client, 'fetchModels').mockImplementation(async target => {
-      if (target.domain === 'codebuddy.ai') return globalModels
-      if (target.domain === 'broken.cn') throw new Error('account is dead')
-      return cnModels
+      if (target.uid === 'dead') throw new Error('account is dead')
+      return target.uid === 'second' ? second : first
     })
     const merged = await client.fetchModelsForCredentials([
+      credential({ uid: 'first' }),
+      credential({ uid: 'second' }),
+      credential({ uid: 'dead' }),
+    ])
+    expect(merged.map(model => model.id)).toEqual(['shared', 'first-only', 'second-only'])
+    // Within a region a repeated id is the same model; the first account's copy
+    // wins so the listing stays stable as the pool is reordered.
+    expect(merged[0]?.creditMultiplier).toBe(0)
+    vi.restoreAllMocks()
+  })
+
+  it('REFUSES to merge across regions, because one id can mean two rates', async () => {
+    const client = new WorkBuddyUpstreamClient()
+    const fetchModels = vi.spyOn(client, 'fetchModels').mockResolvedValue([
+      { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1, maxTokens: 1, creditMultiplier: 0 },
+    ])
+    await expect(client.fetchModelsForCredentials([
       credential({ domain: 'codebuddy.cn' }),
       credential({ domain: 'codebuddy.ai' }),
-      credential({ domain: 'broken.cn' }),
-    ])
-    expect(merged.map(model => model.id)).toEqual(['shared', 'cn-only', 'global-only'])
-    // First writer wins, so the pool's preference order decides the spelling.
-    expect(merged[0]?.name).toBe('CN Shared')
+    ])).rejects.toThrow(/refusing to merge model catalogs across regions/)
+    // The guard runs before any network work, so nothing was fetched.
+    expect(fetchModels).not.toHaveBeenCalled()
     vi.restoreAllMocks()
   })
 

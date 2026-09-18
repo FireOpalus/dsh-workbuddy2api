@@ -8,8 +8,10 @@
  *     的构造、`getModels` 委托给实时读取的做法，均来自该项目；
  *   DSH 插件结构与 provider 注册的思路参照
  *     franksong2702/dsh-codex-connect（Apache-2.0），经其转引。
- * 改动：provider 只有一条（账号池在其后），因此 provider id 固定为
- *   `workbuddy2api`，不再按区域实例化。
+ * 改动：provider 按区域实例化 —— `workbuddy2api`（国内版账号池）与
+ *   `workbuddy2api-global`（国际版账号池）。两边各有自己的账号池、
+ *   模型目录与 shim，因此同一个上游 model id（`deepseek-v4.1-flash`）
+ *   在两个区域可以各自保留自己的积分倍率而不互相覆盖。
  *
  * @module dsh-workbuddy2api/adapter
  */
@@ -23,12 +25,36 @@ import type { ResolvedPiAiProviderProfile } from '@deepseek-ai/dsh-llm-pi-ai'
 import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import type { WorkBuddyCatalog, WorkBuddyModelInfo } from './catalog.ts'
 import type { WorkBuddyShim } from './shim.ts'
+import type { WorkBuddyRegion } from './upstream.ts'
 
-/** Provider route this bundle owns. */
+/** Provider route the domestic account pool registers as. */
 export const WORKBUDDY2API_PROVIDER = 'workbuddy2api'
 
-/** Human-readable provider name, shown in the DSH model picker. */
-export const WORKBUDDY2API_PROVIDER_DISPLAY_NAME = 'WorkBuddy 账号池'
+/** Provider route the international account pool registers as. */
+export const WORKBUDDY2API_GLOBAL_PROVIDER = 'workbuddy2api-global'
+
+/** The provider id each region registers as. */
+export const WORKBUDDY2API_PROVIDERS: Readonly<Record<WorkBuddyRegion, string>> = {
+  cn: WORKBUDDY2API_PROVIDER,
+  global: WORKBUDDY2API_GLOBAL_PROVIDER,
+}
+
+/** Region a provider route id belongs to. */
+export function regionOfProvider(provider: string): WorkBuddyRegion | undefined {
+  for (const [region, id] of Object.entries(WORKBUDDY2API_PROVIDERS) as [WorkBuddyRegion, string][]) {
+    if (id === provider) return region
+  }
+  return undefined
+}
+
+/** Human-readable provider names, shown in the DSH model picker. */
+export const WORKBUDDY2API_PROVIDER_DISPLAY_NAMES: Readonly<Record<WorkBuddyRegion, string>> = {
+  cn: 'WorkBuddy 账号池',
+  global: 'WorkBuddy 账号池（国际版）',
+}
+
+/** Default display name, kept for callers that do not name a region. */
+export const WORKBUDDY2API_PROVIDER_DISPLAY_NAME = WORKBUDDY2API_PROVIDER_DISPLAY_NAMES.cn
 
 /** Provider idle ceiling while one stream read is outstanding. */
 export const WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS = 300_000
@@ -71,6 +97,12 @@ const NO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const
 export interface WorkBuddyAdapterOptions {
   shim: WorkBuddyShim
   catalog: WorkBuddyCatalog
+  /** The pool this adapter fronts; selects the provider id and display name. */
+  region: WorkBuddyRegion
+  /** Overrides the provider route id; defaults to the region's route. */
+  provider?: string
+  /** Overrides the provider display name; defaults to the region's name. */
+  displayName?: string
   /** Resolve the durable attachment service at request time, when present. */
   resolveAttachments?: () => AttachmentStore | undefined
 }
@@ -118,13 +150,13 @@ export function workBuddyThinkingLevelMap(info: WorkBuddyModelInfo): WorkBuddyTh
 }
 
 /** Build one pi-ai model descriptor pointing at the loopback shim. */
-function toPiModel(info: WorkBuddyModelInfo, baseUrl: string): Model<Api> {
+function toPiModel(info: WorkBuddyModelInfo, baseUrl: string, providerId: string): Model<Api> {
   const thinkingLevelMap = workBuddyThinkingLevelMap(info)
   return {
     id: info.id,
     name: workBuddyDisplayName(info),
     api: 'openai-completions',
-    provider: WORKBUDDY2API_PROVIDER,
+    provider: providerId,
     baseUrl,
     input: workBuddyModelInput(info),
     cost: NO_COST,
@@ -142,18 +174,20 @@ function toPiModel(info: WorkBuddyModelInfo, baseUrl: string): Model<Api> {
  * applies from the first snapshot after startup.
  */
 export function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkBuddyAdapter {
-  const { shim, catalog, resolveAttachments } = options
+  const { shim, catalog, resolveAttachments, region } = options
+  const providerId = options.provider ?? WORKBUDDY2API_PROVIDERS[region]
+  const providerName = options.displayName ?? WORKBUDDY2API_PROVIDER_DISPLAY_NAMES[region]
 
   const buildModels = (): Model<Api>[] => {
     // The OpenAI SDK pi-ai drives appends `/chat/completions` to baseURL, so
     // the shim's routes line up with the `/v1` prefix in place.
     const baseUrl = `${shim.baseUrl()}/v1`
-    return catalog.current().map(info => toPiModel(info, baseUrl))
+    return catalog.current().map(info => toPiModel(info, baseUrl, providerId))
   }
 
   const base = createProvider({
-    id: WORKBUDDY2API_PROVIDER,
-    name: WORKBUDDY2API_PROVIDER_DISPLAY_NAME,
+    id: providerId,
+    name: providerName,
     auth: {
       apiKey: {
         name: 'WorkBuddy account-pool loopback token',
@@ -175,8 +209,8 @@ export function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkBu
   const provider: Provider = { ...base, getModels: () => buildModels() }
 
   const profile: ResolvedPiAiProviderProfile = {
-    provider: WORKBUDDY2API_PROVIDER,
-    displayName: WORKBUDDY2API_PROVIDER_DISPLAY_NAME,
+    provider: providerId,
+    displayName: providerName,
     streamIdleTimeoutMs: WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS,
     retryPolicy: resolveRetryPolicy(undefined, 'dsh-workbuddy2api retryPolicy'),
     configuredMaxTokens: new Map(),
@@ -189,7 +223,7 @@ export function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkBu
 
   // Replacing (not mutating) the map is what `invalidate` uses to force the
   // adapter's next profiles read to rebuild its snapshot.
-  let profiles = new Map<string, ResolvedPiAiProviderProfile>([[WORKBUDDY2API_PROVIDER, profile]])
+  let profiles = new Map<string, ResolvedPiAiProviderProfile>([[providerId, profile]])
 
   const adapter = new PiAiAdapter({
     profiles: () => profiles,
@@ -205,7 +239,7 @@ export function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkBu
   return {
     adapter,
     invalidate: () => {
-      profiles = new Map<string, ResolvedPiAiProviderProfile>([[WORKBUDDY2API_PROVIDER, profile]])
+      profiles = new Map<string, ResolvedPiAiProviderProfile>([[providerId, profile]])
     },
   }
 }

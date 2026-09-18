@@ -4,8 +4,8 @@
 [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 那套账号池语义在它们之间调度：
 加权轮换、会话粘性、冷却 / 熔断 / 降权健康度、换号重试。
 
-一个 provider（`workbuddy2api`）站在整个账号池前面 —— 国内版与国际版账号
-**同池共存**，模型目录取两边的并集，任意一次对话只会落在其中一个账号上。
+**两个 provider、两个账号池、两份模型目录** —— `workbuddy2api`（国内版账号）
+与 `workbuddy2api-global`（国际版账号）互不相通，各自轮换、各自计费。
 
 ## 为什么需要它
 
@@ -39,8 +39,13 @@
   桌面端文件永远只读。
 - **按账号积分与签到** —— 卡片里逐个账号显示剩余积分、即将过期额度，
   并提供一键签到；积分按需刷新，不随卡片轮询打上游。
-- **双区域共存** —— 国内版（`copilot.tencent.com`）与国际版
-  （`workbuddy.ai` / `codebuddy.ai`）账号同池，模型目录取并集。
+- **两个独立账号池** —— 国内版（`copilot.tencent.com`，provider `workbuddy2api`）
+  与国际版（`workbuddy.ai` / `codebuddy.ai`，provider `workbuddy2api-global`）
+  各有自己的账号、健康、权重、策略与模型目录。**为什么必须分开**：上游对同一个
+  model id 在两个区域给出不同语义 —— `deepseek-v4.1-flash` 在国际版是 x0.00 的
+  免费促销模型，在国内版是 x0.03 的收费模型。合并目录会让一边的倍率覆盖另一边的，
+  而且请求按 id 路由时落到哪个账号取决于池子的选号结果，**显示的倍率会与实际扣费
+  不一致**。分开之后，选中的 provider 就是倍率与路由的唯一依据。
 - **安全 loopback shim** —— 随机端口 + 进程内随机 secret，
   四重入站校验（Host / Origin / Content-Type / bearer），真实 token 不交给 pi-ai。
 - **CLI 诊断** —— `doctor` / `status` / `pool` / `logout`，支持 `--json`。
@@ -48,16 +53,18 @@
 ## 工作原理
 
 ```text
-DSH（模型选择器里是 workbuddy2api 的模型）
-  -> PiAiAdapter（provider: workbuddy2api）
-  -> 安全 loopback shim（随机端口 + 进程内 secret）
-  -> 账号池 pick()：会话粘性 → 健康过滤 → 加权随机
-  -> 账号 A/B/C 的凭据（各自独立，按需刷新）
-  -> 国内版 https://copilot.tencent.com/v2/chat/completions
-     国际版 https://www.workbuddy.ai/v2/chat/completions（或 codebuddy.ai）
-  -> WorkBuddy SSE
-  -> 结果回报给池（成功清零计数 / 失败按分类迁移）
-  -> 失败且可重试时换一个账号再来一次
+DSH 模型选择器
+  ├─ provider workbuddy2api（国内版）
+  │    -> PiAiAdapter -> 安全 loopback shim（随机端口 + 进程内 secret）
+  │    -> 国内账号池 pick()：会话粘性 → 健康过滤 → 加权随机
+  │    -> 账号 A/B/… 的凭据（各自独立，按需刷新）
+  │    -> https://copilot.tencent.com/v2/chat/completions
+  └─ provider workbuddy2api-global（国际版）
+       -> 同样的四层，但账号池、目录、shim 完全独立
+       -> https://www.workbuddy.ai/v2/chat/completions（或 codebuddy.ai）
+
+  两者共用：凭据发现（按区域过滤）、上游客户端、错误分类与健康迁移规则。
+  结果回报给所属池；失败且可重试时在该池内换一个账号再来一次。
 ```
 
 **账号池不持有 token**：池只决定「这一次用哪个账号 id」，

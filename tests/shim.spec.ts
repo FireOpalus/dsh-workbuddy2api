@@ -66,7 +66,10 @@ async function makeShim(
   for (const [index, uin] of uins.entries()) {
     await writeAuth(index === 0 ? 'workbuddy-desktop.info' : `workbuddy-desktop.2026-08-0${index}T00.info`, uin)
   }
+  // Region-scoped like the real host: the shim in front of ONE region's pool
+  // must never reach around it to the other region's accounts.
   const store = new WorkBuddyCredentialStore({
+    region: 'cn',
     desktopPath: join(authDir, 'workbuddy-desktop.info'),
     storeDir,
     refresh: async () => { throw new Error('refresh must not be needed') },
@@ -81,7 +84,7 @@ async function makeShim(
   const shim = createWorkBuddyShim({
     store,
     pool,
-    catalog: new WorkBuddyCatalog(),
+    catalog: new WorkBuddyCatalog('cn'),
     ...options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts },
     client: {
       async chatStream(credential, bodyJson): Promise<WorkBuddyChatResult> {
@@ -292,6 +295,7 @@ describe('shim multi-account dispatch', () => {
 
   it('answers a clear pool error when no account is signed in', async () => {
     const store = new WorkBuddyCredentialStore({
+      region: 'cn',
       desktopPath: join(authDir, 'missing.info'),
       storeDir,
       refresh: async () => { throw new Error('not used') },
@@ -300,7 +304,7 @@ describe('shim multi-account dispatch', () => {
     const shim = createWorkBuddyShim({
       store,
       pool,
-      catalog: new WorkBuddyCatalog(),
+      catalog: new WorkBuddyCatalog('cn'),
       client: { async chatStream() { throw new Error('must not be called') } },
     })
     await shim.ready

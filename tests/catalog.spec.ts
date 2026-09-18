@@ -1,19 +1,21 @@
 /**
- * Runtime catalog derivation.
+ * Runtime catalog derivation, per region.
  *
  * 参考：dingminhua/dsh-connect-workbuddy（MIT，Copyright (c) 2026 LaoDing）
  *   — 用例对应其 catalog 测试：空选择等于全选、预算只压缩长上下文模型、
  *     目录不允许为空。
- * 改动：fallback 是双区域并集（本插件一个 provider 服务两个区域的账号）。
+ * 改动：区域拆分后，重点用例变成「一个区域的目录里绝不会出现另一个区域的
+ *   名单」——这正是 0.1.x 合并目录造成 `deepseek-v4.1-flash` 倍率被覆盖的
+ *   那个 bug 的回归防线。
  */
 
 import { describe, expect, it } from 'vitest'
 import {
   applyContextBudgets,
   deriveCatalog,
+  fallbackModelsFor,
   FALLBACK_WORKBUDDY_MODELS,
   FALLBACK_WORKBUDDY_MODELS_GLOBAL,
-  FALLBACK_WORKBUDDY_MODELS_UNION,
   WorkBuddyCatalog,
 } from '../src/catalog.ts'
 import type { WorkBuddyModelInfo } from '../src/catalog.ts'
@@ -23,15 +25,29 @@ const models: WorkBuddyModelInfo[] = [
   { id: 'large', name: 'Large', contextWindow: 1_000_000, maxTokens: 32_000 },
 ]
 
-describe('fallback directory', () => {
-  it('is the union of both regions, CN spellings first, without duplicates', () => {
-    const ids = FALLBACK_WORKBUDDY_MODELS_UNION.map(model => model.id)
-    expect(new Set(ids).size).toBe(ids.length)
-    expect(FALLBACK_WORKBUDDY_MODELS_UNION.length)
-      .toBeGreaterThanOrEqual(Math.max(FALLBACK_WORKBUDDY_MODELS.length, FALLBACK_WORKBUDDY_MODELS_GLOBAL.length))
-    // A model only the CN roster carries, and one only the global roster does.
-    expect(ids).toContain('deepseek-v4-pro')
-    expect(ids).toContain('gpt-6-astra')
+describe('per-region fallback directories', () => {
+  it('returns each region its own roster and never the other one\'s', () => {
+    expect(fallbackModelsFor('cn')).toBe(FALLBACK_WORKBUDDY_MODELS)
+    expect(fallbackModelsFor('global')).toBe(FALLBACK_WORKBUDDY_MODELS_GLOBAL)
+    const cnIds = new Set(fallbackModelsFor('cn').map(model => model.id))
+    const globalIds = new Set(fallbackModelsFor('global').map(model => model.id))
+    // A model only the CN roster carries.
+    expect(cnIds.has('deepseek-v4-pro')).toBe(true)
+    expect(globalIds.has('deepseek-v4-pro')).toBe(false)
+    // A model only the international roster carries.
+    expect(globalIds.has('gpt-6-astra')).toBe(true)
+    expect(cnIds.has('gpt-6-astra')).toBe(false)
+  })
+
+  it('rates the shared deepseek-v4.1-flash id per region instead of picking one', () => {
+    // THE regression this split exists for: both gateways carry the same id at
+    // different rates, so each region's own list has to keep its own number.
+    const cn = fallbackModelsFor('cn').find(model => model.id === 'deepseek-v4.1-flash')
+    const global = fallbackModelsFor('global').find(model => model.id === 'deepseek-v4.1-flash')
+    expect(cn?.creditMultiplier).toBe(0.03)
+    expect(global?.creditMultiplier).toBe(0)
+    // And the international side additionally carries the Singapore variant.
+    expect(fallbackModelsFor('global').some(model => model.id === 'deepseek-v4.1-flash-sg')).toBe(true)
   })
 })
 
@@ -59,12 +75,16 @@ describe('deriveCatalog', () => {
 })
 
 describe('WorkBuddyCatalog', () => {
-  it('starts from the fallback and refuses to become empty', () => {
-    const catalog = new WorkBuddyCatalog()
-    expect(catalog.current().length).toBeGreaterThan(0)
-    catalog.set(models)
-    expect(catalog.current().map(model => model.id)).toEqual(['small', 'large'])
-    expect(() => catalog.set([])).toThrow(/cannot be empty/)
+  it('seeds from ITS OWN region and refuses to become empty', () => {
+    const global = new WorkBuddyCatalog('global')
+    expect(global.current().some(model => model.id === 'gpt-6-astra')).toBe(true)
+    expect(global.current().some(model => model.id === 'deepseek-v4-pro')).toBe(false)
+    const cn = new WorkBuddyCatalog('cn')
+    expect(cn.current().some(model => model.id === 'deepseek-v4-pro')).toBe(true)
+    expect(cn.current().some(model => model.id === 'gpt-6-astra')).toBe(false)
+    cn.set(models)
+    expect(cn.current().map(model => model.id)).toEqual(['small', 'large'])
+    expect(() => cn.set([])).toThrow(/cannot be empty/)
   })
 
   it('copies the entries it is given', () => {

@@ -2,19 +2,13 @@
  * WorkBuddy account-pool card contributed to Harness Plugin configuration.
  *
  * 参考：dingminhua/dsh-connect-workbuddy（MIT，Copyright (c) 2026 LaoDing）
- *   — 卡片的整体结构（折叠外壳 / 账号状态行 / 积分区 / 模型表 / 操作按钮行）、
- *     模块加载时注入一次 `<style>` 的写法、草稿态与 dirty 标记的保存流程、
- *     60 秒轮询与 AbortController 清理、`IconChevronDownOutline14` 的使用，
- *     均来自该项目（其 TraeUsageCard 又源自 dsh-connect-trae /
- *     dsh-subagent-default-model）。
- * 改动：
- *   1. 卡片主体从「一个账号 + 一份目录」改为「账号池」：每个账号一行，
- *      显示健康徽标、在途/成功/失败计数、冷却截止、最近错误、积分，
- *      并提供启用开关、权重输入、恢复按钮；
- *   2. 新增池策略表单（在途上限、熔断、降权、限流冷却、粘性 TTL、余额排序），
- *      与账号开关一起构成这份卡片的草稿与保存内容；
- *   3. 积分不再每次轮询都打上游：轮询读池内缓存，显式点「刷新积分」才查询，
- *      因为多账号下每次轮询都要打 N 个上游计费接口。
+ *   — 卡片结构（折叠外壳 / 账号状态行 / 积分区 / 模型表 / 操作按钮行）、
+ *     加载时注入一次 `<style>`、草稿态与 dirty 标记的保存流程、
+ *     60 秒轮询与 AbortController 清理、区域 tab 栏与按区域隔离的草稿，
+ *     均来自该项目。
+ * 改动：每个 tab 不再只是「换个账号看同一份目录」，而是一个**独立账号池**：
+ *   该区域自己的 provider、账号、健康、权重、积分、策略与模型目录。
+ *   切 tab 不会触碰另一个池的任何状态。
  *
  * @module dsh-workbuddy2api/client/WorkBuddyPoolCard
  */
@@ -26,12 +20,14 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 import { IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   toPersistedWorkBuddyModel,
+  withWorkBuddyRegion,
   WORKBUDDY2API_ACCOUNTS_REFRESH_PATH,
   WORKBUDDY2API_ACCOUNT_PARAM,
   WORKBUDDY2API_CHECKIN_PATH,
   WORKBUDDY2API_CREDITS_REFRESH_PATH,
   WORKBUDDY2API_MODELS_REFRESH_PATH,
   WORKBUDDY2API_POOL_ACTION_PATH,
+  WORKBUDDY2API_REGIONS,
   WORKBUDDY2API_USAGE_PATH,
 } from '../status-paths.ts'
 import type {
@@ -39,6 +35,7 @@ import type {
   WorkBuddyWebPoolEntry,
   WorkBuddyWebPoolPolicy,
   WorkBuddyWebPoolState,
+  WorkBuddyWebRegion,
   WorkBuddyWebUsage,
 } from '../status-paths.ts'
 import { WORKBUDDY2API_PLUGIN_ICON } from './icon.ts'
@@ -62,13 +59,13 @@ export type WorkBuddyPoolCardProps =
 
 const POLL_INTERVAL_MS = 60_000
 
-/** One unsaved edit set: per-account switches plus the pool policy. */
+/** One region's unsaved pool edits. */
 interface WorkBuddyPoolDraft {
   accounts: Map<string, { enabled: boolean; weight: number }>
   policy: WorkBuddyWebPoolPolicy
 }
 
-/** Model-selection draft, kept separate so a policy edit never drops it. */
+/** One region's unsaved model edits. */
 interface WorkBuddyModelDraft {
   models: WorkBuddyWebModel[]
   enabledIds: Set<string>
@@ -108,18 +105,56 @@ function formatCapacity(value: number | undefined, unknown: string): string {
   return formatNumber(value)
 }
 
-/** The read-only fallback document used before the first fetch resolves. */
-const EMPTY_USAGE: WorkBuddyWebUsage = { status: 'empty', accounts: [], pool: [] }
+/** Locale key for one pool state. */
+function stateKeyOf(state: WorkBuddyWebPoolEntry['state']): WorkBuddySettingsKey {
+  switch (state) {
+    case 'ready': return 'row.stateReady'
+    case 'cooldown': return 'row.stateCooldown'
+    case 'degraded': return 'row.stateDegraded'
+    case 'missing': return 'row.stateMissing'
+    default: return 'row.stateDisabled'
+  }
+}
 
-/** Render the account pool, its credits, its policy, and the model selection. */
+/** The empty placeholder each tab starts from. */
+function emptyUsage(region: WorkBuddyWebRegion): WorkBuddyWebUsage {
+  return { status: 'empty', region, accounts: [], pool: [] }
+}
+
+/** Numeric policy fields the card edits; `seconds` fields are shown in seconds. */
+const policyFields: readonly {
+  key: keyof WorkBuddyWebPoolPolicy
+  label: WorkBuddySettingsKey
+  kind: 'count' | 'seconds' | 'boolean'
+}[] = [
+  { key: 'maxInFlightPerAccount', label: 'row.policyInFlight', kind: 'count' },
+  { key: 'maxInFlightGlobalPerAccount', label: 'row.policyInFlightGlobal', kind: 'count' },
+  { key: 'maxInFlightTotal', label: 'row.policyInFlightTotal', kind: 'count' },
+  { key: 'breakerThreshold', label: 'row.policyBreaker', kind: 'count' },
+  { key: 'breakerCooldownMs', label: 'row.policyBreakerCooldown', kind: 'seconds' },
+  { key: 'breakerCooldownMaxMs', label: 'row.policyBreakerMax', kind: 'seconds' },
+  { key: 'degradeThreshold', label: 'row.policyDegrade', kind: 'count' },
+  { key: 'degradeCooldownMs', label: 'row.policyDegradeCooldown', kind: 'seconds' },
+  { key: 'degradeCooldownMaxMs', label: 'row.policyDegradeMax', kind: 'seconds' },
+  { key: 'softRateCooldownMs', label: 'row.policySoftRate', kind: 'seconds' },
+  { key: 'softRateCooldownMaxMs', label: 'row.policySoftRateMax', kind: 'seconds' },
+  { key: 'stickyTtlMs', label: 'row.policySticky', kind: 'seconds' },
+  { key: 'balanceAware', label: 'row.policyBalanceAware', kind: 'boolean' },
+]
+
+/** Render the two account pools, their credits, policies, and model selection. */
 export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) {
   if (t === undefined) throw new Error('WorkBuddy pool card requires its translation function')
   const [open, setOpen] = useState(false)
-  const [usage, setUsage] = useState<WorkBuddyWebUsage>(EMPTY_USAGE)
+  const [activeRegion, setActiveRegion] = useState<WorkBuddyWebRegion>('cn')
+  /** Last-known usage per region, so tab dots survive tab switches. */
+  const [statusByRegion, setStatusByRegion] = useState<Partial<Record<WorkBuddyWebRegion, WorkBuddyWebUsage>>>({})
   const [busy, setBusy] = useState(false)
   const [settingsRevision, setSettingsRevision] = useState(0)
-  const [poolDraft, setPoolDraft] = useState<WorkBuddyPoolDraft | undefined>(undefined)
-  const [modelDraft, setModelDraft] = useState<WorkBuddyModelDraft | undefined>(undefined)
+  /** Per-region unsaved pool edits; a draft on one tab is never dropped by
+   * switching to the other tab, only by that tab's discard/save. */
+  const [poolDrafts, setPoolDrafts] = useState<Partial<Record<WorkBuddyWebRegion, WorkBuddyPoolDraft>>>({})
+  const [modelDrafts, setModelDrafts] = useState<Partial<Record<WorkBuddyWebRegion, WorkBuddyModelDraft>>>({})
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | undefined>(undefined)
   const [refreshingCredits, setRefreshingCredits] = useState(false)
@@ -134,9 +169,12 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
 
   useEffect(() => settingsScope?.subscribe(() => { setSettingsRevision(value => value + 1) }), [settingsScope])
 
-  const refreshUsage = useCallback(async (signal?: AbortSignal): Promise<WorkBuddyWebUsage | undefined> => {
+  const refreshUsage = useCallback(async (
+    region: WorkBuddyWebRegion,
+    signal?: AbortSignal,
+  ): Promise<WorkBuddyWebUsage | undefined> => {
     try {
-      const response = await fetch(WORKBUDDY2API_USAGE_PATH, {
+      const response = await fetch(withWorkBuddyRegion(WORKBUDDY2API_USAGE_PATH, region), {
         headers: { accept: 'application/json' },
         credentials: 'same-origin',
         ...signal === undefined ? {} : { signal },
@@ -144,11 +182,16 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
       const value: unknown = await response.json().catch(() => undefined)
       if (!response.ok) throw new Error(`HTTP ${response.status}`)
       const document = value as WorkBuddyWebUsage
-      if (mounted.current && signal?.aborted !== true) setUsage(document)
+      if (mounted.current && signal?.aborted !== true) {
+        setStatusByRegion(previous => ({ ...previous, [region]: document }))
+      }
       return document
     } catch (error: unknown) {
       if (mounted.current && signal?.aborted !== true) {
-        setUsage({ status: 'error', message: error instanceof Error ? error.message : t('row.requestFailed') })
+        setStatusByRegion(previous => ({
+          ...previous,
+          [region]: { status: 'error', region, message: error instanceof Error ? error.message : t('row.requestFailed') },
+        }))
       }
       return undefined
     }
@@ -157,14 +200,18 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   useEffect(() => {
     if (!open) return
     const controller = new AbortController()
-    void refreshUsage(controller.signal)
+    void refreshUsage(activeRegion, controller.signal)
     return () => { controller.abort() }
-  }, [open, refreshUsage])
+  }, [open, activeRegion, refreshUsage])
 
+  // Each tab polls ITS OWN pool; both are live at once, so the dot on the
+  // inactive tab keeps reflecting that region's real health.
   useEffect(() => {
     if (!open) return
     const controller = new AbortController()
-    const timer = window.setInterval(() => { void refreshUsage(controller.signal) }, POLL_INTERVAL_MS)
+    const timer = window.setInterval(() => {
+      for (const region of WORKBUDDY2API_REGIONS) void refreshUsage(region, controller.signal)
+    }, POLL_INTERVAL_MS)
     return () => {
       window.clearInterval(timer)
       controller.abort()
@@ -173,23 +220,37 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
 
   void settingsRevision
 
+  const usage = statusByRegion[activeRegion] ?? emptyUsage(activeRegion)
   const writable = settingsScope?.getSnapshot().writable === true
+  const entries: readonly WorkBuddyWebPoolEntry[] =
+    usage.status === 'ready' || usage.status === 'empty' ? usage.pool : []
   const savedPoolState: readonly WorkBuddyWebPoolState[] = usage.status === 'ready' ? usage.poolState : []
   const savedPolicy: WorkBuddyWebPoolPolicy | undefined = usage.status === 'ready' ? usage.policy : undefined
-  const entries: readonly WorkBuddyWebPoolEntry[] = usage.status === 'ready' || usage.status === 'empty' ? usage.pool : []
 
+  const poolDraft = poolDrafts[activeRegion]
+  const modelDraft = modelDrafts[activeRegion]
   const activeAccounts = poolDraft?.accounts ?? new Map(entries.map(entry => [entry.accountId, {
     enabled: entry.enabled,
     weight: entry.weight,
   }]))
   const activePolicy = poolDraft?.policy ?? savedPolicy
-  const poolDirty = poolDraft !== undefined
-  const modelsDirty = modelDraft !== undefined
+
+  /** The context budgets saved in settings for the active region. */
+  function savedContextBudgets(): Record<string, number> {
+    const configured = settingsScope?.getSnapshot().value as
+      | { regions?: Record<string, { contextBudgets?: unknown }> }
+      | undefined
+    const value = configured?.regions?.[activeRegion]?.contextBudgets
+    return typeof value === 'object' && value !== null ? value as Record<string, number> : {}
+  }
 
   const editPool = (edit: (current: WorkBuddyPoolDraft) => WorkBuddyPoolDraft): void => {
-    setPoolDraft(previous => edit(previous ?? {
-      accounts: new Map(entries.map(entry => [entry.accountId, { enabled: entry.enabled, weight: entry.weight }])),
-      policy: savedPolicy ?? FALLBACK_POLICY,
+    setPoolDrafts(previous => ({
+      ...previous,
+      [activeRegion]: edit(previous[activeRegion] ?? {
+        accounts: new Map(entries.map(entry => [entry.accountId, { enabled: entry.enabled, weight: entry.weight }])),
+        policy: savedPolicy ?? FALLBACK_POLICY,
+      }),
     }))
   }
 
@@ -215,169 +276,15 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
     editPool(current => ({ ...current, policy: { ...current.policy, [field]: value } }))
   }
 
-  const discardPool = (): void => { setPoolDraft(undefined) }
-  const discardModels = (): void => { setModelDraft(undefined) }
-
-  const saveAll = async (): Promise<void> => {
-    if (settingsScope === undefined) return
-    setSaving(true)
-    setSaveError(undefined)
-    try {
-      if (poolDraft !== undefined) {
-        const records: WorkBuddyWebPoolState[] = savedPoolState.map(record => {
-          const edited = poolDraft.accounts.get(record.accountId)
-          return edited === undefined
-            ? record
-            : { ...record, enabled: edited.enabled, weight: Math.min(Math.max(Math.round(edited.weight), 1), 100) }
-        })
-        for (const [accountId, edited] of poolDraft.accounts) {
-          if (records.some(record => record.accountId === accountId)) continue
-          records.push({
-            accountId,
-            enabled: edited.enabled,
-            weight: Math.min(Math.max(Math.round(edited.weight), 1), 100),
-            priority: 100,
-          })
-        }
-        await settingsScope.set('poolState', records)
-        await settingsScope.set('pool', { ...poolDraft.policy })
-      }
-      if (modelDraft !== undefined) {
-        // `toPersistedWorkBuddyModel` strips the card-only fields BY KEY:
-        // explicit `undefined` values are rejected by the settings write's
-        // strict JSON codec, which used to fail the whole save silently.
-        await settingsScope.set('lastCatalog', modelDraft.models.map(toPersistedWorkBuddyModel))
-        await settingsScope.set('enabledModelIds', [...modelDraft.enabledIds])
-        await settingsScope.set('imageModelIds', [...modelDraft.imageIds])
-        await settingsScope.set('contextBudgets', modelDraft.contextBudgets)
-      }
-      setPoolDraft(undefined)
-      setModelDraft(undefined)
-      await refreshUsage()
-    } catch (error: unknown) {
-      // Drafts stay dirty on failure, so the button remains pressable for a retry.
-      if (mounted.current) setSaveError(error instanceof Error ? error.message : t('row.requestFailed'))
-    } finally {
-      if (mounted.current) setSaving(false)
-    }
-  }
-
-  const rescanAccounts = async (): Promise<void> => {
-    setBusy(true)
-    setActionError(undefined)
-    try {
-      const response = await fetch(WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, {
-        method: 'POST', headers: { accept: 'application/json' }, credentials: 'same-origin',
-      })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      await refreshUsage()
-    } catch (error: unknown) {
-      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
-    } finally {
-      if (mounted.current) setBusy(false)
-    }
-  }
-
-  const refreshCredits = async (): Promise<void> => {
-    setRefreshingCredits(true)
-    setActionError(undefined)
-    try {
-      const response = await fetch(WORKBUDDY2API_CREDITS_REFRESH_PATH, {
-        method: 'POST', headers: { accept: 'application/json' }, credentials: 'same-origin',
-      })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      await refreshUsage()
-    } catch (error: unknown) {
-      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
-    } finally {
-      if (mounted.current) setRefreshingCredits(false)
-    }
-  }
-
-  const resetAccount = async (accountId: string): Promise<void> => {
-    setActionError(undefined)
-    try {
-      const response = await fetch(WORKBUDDY2API_POOL_ACTION_PATH, {
-        method: 'POST',
-        headers: { accept: 'application/json', 'content-type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify({ action: 'reset', accountId }),
-      })
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      await refreshUsage()
-    } catch (error: unknown) {
-      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
-    }
-  }
-
-  const claimCheckin = async (accountId: string): Promise<void> => {
-    setCheckingIn(accountId)
-    setActionError(undefined)
-    try {
-      const response = await fetch(`${WORKBUDDY2API_CHECKIN_PATH}?${WORKBUDDY2API_ACCOUNT_PARAM}=${encodeURIComponent(accountId)}`, {
-        method: 'POST', headers: { accept: 'application/json' }, credentials: 'same-origin',
-      })
-      const body = await response.json().catch(() => undefined) as { error?: string } | undefined
-      if (!response.ok) throw new Error(body?.error ?? `HTTP ${response.status}`)
-      await refreshUsage()
-    } catch (error: unknown) {
-      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
-    } finally {
-      if (mounted.current) setCheckingIn(undefined)
-    }
-  }
-
-  const refreshModels = async (): Promise<void> => {
-    setBusy(true)
-    setActionError(undefined)
-    try {
-      const response = await fetch(WORKBUDDY2API_MODELS_REFRESH_PATH, {
-        method: 'POST', headers: { accept: 'application/json' }, credentials: 'same-origin',
-      })
-      const body = await response.json() as { models?: WorkBuddyWebModel[]; error?: string }
-      if (!response.ok || !Array.isArray(body.models)) throw new Error(body.error ?? `HTTP ${response.status}`)
-      const fresh = body.models
-      const freshIds = new Set(fresh.map(model => model.id))
-      // Re-map the user's CURRENT selections onto the fresh catalog by model id,
-      // so renames and additions never silently lose enabled choices, image
-      // opt-ins, or context budgets.
-      const source = modelDraft ?? (usage.status === 'ready' ? {
-        models: usage.models,
-        enabledIds: new Set(usage.enabledModelIds),
-        imageIds: new Set(usage.imageModelIds),
-        contextBudgets: savedContextBudgets(),
-      } : undefined)
-      const stillBudgets: Record<string, number> = {}
-      for (const id of freshIds) {
-        const budget = source?.contextBudgets[id]
-        if (typeof budget === 'number') stillBudgets[id] = budget
-      }
-      setModelDraft({
-        models: fresh,
-        enabledIds: new Set([...(source?.enabledIds ?? [])].filter(id => freshIds.has(id))),
-        imageIds: new Set([...(source?.imageIds ?? [])].filter(id => freshIds.has(id))),
-        contextBudgets: stillBudgets,
-      })
-    } catch (error: unknown) {
-      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
-    } finally {
-      if (mounted.current) setBusy(false)
-    }
-  }
-
-  /** The context budgets saved in settings, as the model draft needs them. */
-  function savedContextBudgets(): Record<string, number> {
-    const configured = settingsScope?.getSnapshot().value as { contextBudgets?: unknown } | undefined
-    const value = configured?.contextBudgets
-    return typeof value === 'object' && value !== null ? value as Record<string, number> : {}
-  }
-
   const editModels = (edit: (current: WorkBuddyModelDraft) => WorkBuddyModelDraft): void => {
-    setModelDraft(previous => edit(previous ?? {
-      models: usage.status === 'ready' ? [...usage.models] : [],
-      enabledIds: new Set(usage.status === 'ready' ? usage.enabledModelIds : []),
-      imageIds: new Set(usage.status === 'ready' ? usage.imageModelIds : []),
-      contextBudgets: savedContextBudgets(),
+    setModelDrafts(previous => ({
+      ...previous,
+      [activeRegion]: edit(previous[activeRegion] ?? {
+        models: usage.status === 'ready' ? [...usage.models] : [],
+        enabledIds: new Set(usage.status === 'ready' ? usage.enabledModelIds : []),
+        imageIds: new Set(usage.status === 'ready' ? usage.imageModelIds : []),
+        contextBudgets: savedContextBudgets(),
+      }),
     }))
   }
 
@@ -401,11 +308,188 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
     editModels(current => ({ ...current, contextBudgets: { ...current.contextBudgets, [modelId]: budget } }))
   }
 
-  const title = t('row.title')
-  const statusLabel = usage.status === 'ready'
-    ? t('row.accountsTitle')
-    : usage.status === 'error' ? t('row.requestFailed') : t('row.empty')
+  const discard = (): void => {
+    setPoolDrafts(previous => {
+      const next = { ...previous }
+      delete next[activeRegion]
+      return next
+    })
+    setModelDrafts(previous => {
+      const next = { ...previous }
+      delete next[activeRegion]
+      return next
+    })
+  }
 
+  const saveAll = async (): Promise<void> => {
+    if (settingsScope === undefined) return
+    setSaving(true)
+    setSaveError(undefined)
+    try {
+      const configured = settingsScope.getSnapshot().value as { regions?: Record<string, unknown> } | undefined
+      const configuredRegions = typeof configured?.regions === 'object' && configured.regions !== null
+        ? configured.regions
+        : {}
+      const slot: Record<string, unknown> = {
+        ...(configuredRegions[activeRegion] as Record<string, unknown> | undefined ?? {}),
+      }
+      if (poolDraft !== undefined) {
+        const records: WorkBuddyWebPoolState[] = savedPoolState.map(record => {
+          const edited = poolDraft.accounts.get(record.accountId)
+          return edited === undefined
+            ? record
+            : { ...record, enabled: edited.enabled, weight: Math.min(Math.max(Math.round(edited.weight), 1), 100) }
+        })
+        for (const [accountId, edited] of poolDraft.accounts) {
+          if (records.some(record => record.accountId === accountId)) continue
+          records.push({
+            accountId,
+            enabled: edited.enabled,
+            weight: Math.min(Math.max(Math.round(edited.weight), 1), 100),
+            priority: 100,
+          })
+        }
+        slot.poolState = records
+        slot.pool = { ...poolDraft.policy }
+      }
+      if (modelDraft !== undefined) {
+        // `toPersistedWorkBuddyModel` strips the card-only fields BY KEY:
+        // explicit `undefined` values are rejected by the settings write's
+        // strict JSON codec, which used to fail the whole save silently.
+        slot.lastCatalog = modelDraft.models.map(toPersistedWorkBuddyModel)
+        slot.enabledModelIds = [...modelDraft.enabledIds]
+        slot.imageModelIds = [...modelDraft.imageIds]
+        slot.contextBudgets = modelDraft.contextBudgets
+      }
+      // Write ONLY this region's slot: the other region's picks are untouched.
+      await settingsScope.set('regions', { ...configuredRegions, [activeRegion]: slot })
+      setPoolDrafts(previous => {
+        const next = { ...previous }
+        delete next[activeRegion]
+        return next
+      })
+      setModelDrafts(previous => {
+        const next = { ...previous }
+        delete next[activeRegion]
+        return next
+      })
+      await refreshUsage(activeRegion)
+    } catch (error: unknown) {
+      // Drafts stay dirty on failure, so the button remains pressable for a retry.
+      if (mounted.current) setSaveError(error instanceof Error ? error.message : t('row.requestFailed'))
+    } finally {
+      if (mounted.current) setSaving(false)
+    }
+  }
+
+  const rescanAccounts = async (): Promise<void> => {
+    setBusy(true)
+    setActionError(undefined)
+    try {
+      const response = await fetch(withWorkBuddyRegion(WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, activeRegion), {
+        method: 'POST', headers: { accept: 'application/json' }, credentials: 'same-origin',
+      })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      await refreshUsage(activeRegion)
+    } catch (error: unknown) {
+      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
+    } finally {
+      if (mounted.current) setBusy(false)
+    }
+  }
+
+  const refreshCredits = async (): Promise<void> => {
+    setRefreshingCredits(true)
+    setActionError(undefined)
+    try {
+      const response = await fetch(withWorkBuddyRegion(WORKBUDDY2API_CREDITS_REFRESH_PATH, activeRegion), {
+        method: 'POST', headers: { accept: 'application/json' }, credentials: 'same-origin',
+      })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      await refreshUsage(activeRegion)
+    } catch (error: unknown) {
+      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
+    } finally {
+      if (mounted.current) setRefreshingCredits(false)
+    }
+  }
+
+  const resetAccount = async (accountId: string): Promise<void> => {
+    setActionError(undefined)
+    try {
+      const response = await fetch(withWorkBuddyRegion(WORKBUDDY2API_POOL_ACTION_PATH, activeRegion), {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ action: 'reset', accountId }),
+      })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      await refreshUsage(activeRegion)
+    } catch (error: unknown) {
+      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
+    }
+  }
+
+  const claimCheckin = async (accountId: string): Promise<void> => {
+    setCheckingIn(accountId)
+    setActionError(undefined)
+    try {
+      const path = withWorkBuddyRegion(WORKBUDDY2API_CHECKIN_PATH, activeRegion)
+      const response = await fetch(`${path}&${WORKBUDDY2API_ACCOUNT_PARAM}=${encodeURIComponent(accountId)}`, {
+        method: 'POST', headers: { accept: 'application/json' }, credentials: 'same-origin',
+      })
+      const body = await response.json().catch(() => undefined) as { error?: string } | undefined
+      if (!response.ok) throw new Error(body?.error ?? `HTTP ${response.status}`)
+      await refreshUsage(activeRegion)
+    } catch (error: unknown) {
+      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
+    } finally {
+      if (mounted.current) setCheckingIn(undefined)
+    }
+  }
+
+  const refreshModels = async (): Promise<void> => {
+    setBusy(true)
+    setActionError(undefined)
+    try {
+      const response = await fetch(withWorkBuddyRegion(WORKBUDDY2API_MODELS_REFRESH_PATH, activeRegion), {
+        method: 'POST', headers: { accept: 'application/json' }, credentials: 'same-origin',
+      })
+      const body = await response.json() as { models?: WorkBuddyWebModel[]; error?: string }
+      if (!response.ok || !Array.isArray(body.models)) throw new Error(body.error ?? `HTTP ${response.status}`)
+      const fresh = body.models
+      const freshIds = new Set(fresh.map(model => model.id))
+      // Re-map the user's CURRENT selections (draft first, then saved) onto the
+      // fresh catalog by model id, so renames and additions never silently lose
+      // enabled choices, image opt-ins, or context budgets.
+      const source = modelDraft ?? (usage.status === 'ready' ? {
+        models: usage.models,
+        enabledIds: new Set(usage.enabledModelIds),
+        imageIds: new Set(usage.imageModelIds),
+        contextBudgets: savedContextBudgets(),
+      } : undefined)
+      const stillBudgets: Record<string, number> = {}
+      for (const id of freshIds) {
+        const budget = source?.contextBudgets[id]
+        if (typeof budget === 'number') stillBudgets[id] = budget
+      }
+      setModelDrafts(previous => ({
+        ...previous,
+        [activeRegion]: {
+          models: fresh,
+          enabledIds: new Set([...(source?.enabledIds ?? [])].filter(id => freshIds.has(id))),
+          imageIds: new Set([...(source?.imageIds ?? [])].filter(id => freshIds.has(id))),
+          contextBudgets: stillBudgets,
+        },
+      }))
+    } catch (error: unknown) {
+      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
+    } finally {
+      if (mounted.current) setBusy(false)
+    }
+  }
+
+  const title = t('row.title')
   const visibleModels = modelDraft?.models ?? (usage.status === 'ready' ? usage.models : [])
   const activeEnabledIds = modelDraft?.enabledIds ?? new Set(usage.status === 'ready' ? usage.enabledModelIds : [])
   const activeImageIds = modelDraft?.imageIds ?? new Set(usage.status === 'ready' ? usage.imageModelIds : [])
@@ -413,7 +497,7 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   const creditsByAccount = new Map(
     (usage.status === 'ready' ? usage.credits : []).map(credit => [credit.accountId, credit]),
   )
-  const dirty = poolDirty || modelsDirty
+  const dirty = poolDraft !== undefined || modelDraft !== undefined
 
   return (
     <li className={`dsm-plugin-card${open ? ' dsm-plugin-card-open' : ''}`}>
@@ -439,11 +523,42 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
       <div className="dsm-plugin-card-body" hidden={!open}>
         {open
           ? <div className="dsm-wb2api-root">
+              <div className="dsm-wb2api-tabs" role="tablist" aria-label={title}>
+                {WORKBUDDY2API_REGIONS.map(region => {
+                  const regionUsage = statusByRegion[region]
+                  const dot = regionUsage === undefined
+                    ? 'var(--dsw-alias-label-dimmed, #9aa0a6)'
+                    : regionUsage.status === 'ready'
+                      ? 'var(--dsw-alias-state-success-primary, #22a06b)'
+                      : regionUsage.status === 'error'
+                        ? 'var(--dsw-alias-state-error-primary, #d92d20)'
+                        : 'var(--dsw-alias-label-dimmed, #9aa0a6)'
+                  return (
+                    <button
+                      key={region}
+                      type="button"
+                      role="tab"
+                      aria-selected={region === activeRegion}
+                      className={`dsm-wb2api-tab${region === activeRegion ? ' dsm-wb2api-tab-active' : ''}`}
+                      onClick={() => { setActiveRegion(region) }}
+                    >
+                      <span aria-hidden="true" className="dsm-wb2api-tab-dot" style={{ background: dot }} />
+                      {region === 'cn' ? t('row.tabCn') : t('row.tabGlobal')}
+                    </button>
+                  )
+                })}
+              </div>
+              <p className="dsm-wb2api-section-sub">{t('row.tabHint')}</p>
+
               <section className="dsm-wb2api-section" aria-label={t('row.accountsTitle')}>
                 <div className="dsm-wb2api-section-head">
                   <div>
                     <h3 className="dsm-wb2api-section-title">{t('row.accountsTitle')}</h3>
-                    <p className="dsm-wb2api-section-sub">{t('row.accountsHint')}</p>
+                    <p className="dsm-wb2api-section-sub">
+                      {t('row.providerLabel', {
+                        provider: activeRegion === 'global' ? 'workbuddy2api-global' : 'workbuddy2api',
+                      })}
+                    </p>
                   </div>
                   <div className="dsm-wb2api-actions-buttons">
                     <button
@@ -466,7 +581,7 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                 </div>
                 {entries.length === 0
                   ? <p className="dsm-wb2api-text">
-                      {usage.status === 'empty' ? usage.message ?? t('row.emptyHint') : statusLabel}
+                      {usage.status === 'empty' ? usage.message ?? t('row.emptyHint') : t('row.empty')}
                     </p>
                   : <div className="dsm-wb2api-account-list">
                       {entries.map(entry => {
@@ -478,7 +593,6 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                           <div className="dsm-wb2api-account" key={entry.accountId}>
                             <div className="dsm-wb2api-account-head">
                               <span className="dsm-wb2api-account-name">{entry.accountName}</span>
-                              <span className="dsm-wb2api-account-region">{entry.region === 'global' ? 'Global' : 'CN'}</span>
                               <span className={`dsm-wb2api-badge dsm-wb2api-badge-${entry.state}`}>
                                 {t(stateKeyOf(entry.state))}
                               </span>
@@ -655,7 +769,7 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                                 ? <label>
                                     <input
                                       type="radio"
-                                      name={`context-${model.id}`}
+                                      name={`context-${activeRegion}-${model.id}`}
                                       checked={(activeContextBudgets[model.id] ?? 200_000) === 200_000}
                                       disabled={!writable || saving}
                                       onChange={() => { setContextBudget(model.id, 200_000) }}
@@ -666,7 +780,7 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                               <label>
                                 <input
                                   type="radio"
-                                  name={`context-${model.id}`}
+                                  name={`context-${activeRegion}-${model.id}`}
                                   checked={model.nativeContextWindow <= 200_000
                                     || activeContextBudgets[model.id] === model.nativeContextWindow}
                                   disabled={model.nativeContextWindow <= 200_000 || !writable || saving}
@@ -704,7 +818,7 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                     type="button"
                     className="dsm-btn dsm-btn-outline"
                     disabled={!dirty || saving}
-                    onClick={() => { discardPool(); discardModels() }}
+                    onClick={discard}
                   >
                     {t('row.discard')}
                   </button>
@@ -724,38 +838,6 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
     </li>
   )
 }
-
-/** Locale key for one pool state. */
-function stateKeyOf(state: WorkBuddyWebPoolEntry['state']): WorkBuddySettingsKey {
-  switch (state) {
-    case 'ready': return 'row.stateReady'
-    case 'cooldown': return 'row.stateCooldown'
-    case 'degraded': return 'row.stateDegraded'
-    case 'missing': return 'row.stateMissing'
-    default: return 'row.stateDisabled'
-  }
-}
-
-/** Numeric policy fields the card edits; `seconds` fields are shown in seconds. */
-const policyFields: readonly {
-  key: keyof WorkBuddyWebPoolPolicy
-  label: WorkBuddySettingsKey
-  kind: 'count' | 'seconds' | 'boolean'
-}[] = [
-  { key: 'maxInFlightPerAccount', label: 'row.policyInFlight', kind: 'count' },
-  { key: 'maxInFlightGlobalPerAccount', label: 'row.policyInFlightGlobal', kind: 'count' },
-  { key: 'maxInFlightTotal', label: 'row.policyInFlightTotal', kind: 'count' },
-  { key: 'breakerThreshold', label: 'row.policyBreaker', kind: 'count' },
-  { key: 'breakerCooldownMs', label: 'row.policyBreakerCooldown', kind: 'seconds' },
-  { key: 'breakerCooldownMaxMs', label: 'row.policyBreakerMax', kind: 'seconds' },
-  { key: 'degradeThreshold', label: 'row.policyDegrade', kind: 'count' },
-  { key: 'degradeCooldownMs', label: 'row.policyDegradeCooldown', kind: 'seconds' },
-  { key: 'degradeCooldownMaxMs', label: 'row.policyDegradeMax', kind: 'seconds' },
-  { key: 'softRateCooldownMs', label: 'row.policySoftRate', kind: 'seconds' },
-  { key: 'softRateCooldownMaxMs', label: 'row.policySoftRateMax', kind: 'seconds' },
-  { key: 'stickyTtlMs', label: 'row.policySticky', kind: 'seconds' },
-  { key: 'balanceAware', label: 'row.policyBalanceAware', kind: 'boolean' },
-]
 
 /** Policy values used before the first usage document arrives. */
 const FALLBACK_POLICY: WorkBuddyWebPoolPolicy = {

@@ -10,9 +10,12 @@
  *     以及「积分查询失败降级为 creditsError 而非让整个文档失败」的处理，
  *     均来自该项目（其源自 dsh-connect-trae，单条 status 路由的原始形态
  *     来自 corrinehu/dsh-workbuddy-connect）。
- * 改动：文档结构由「单账号 + 单目录」改为「账号池 + 每账号健康 + 合并目录」；
- *   积分从「每次轮询都打上游」改为「读池内缓存 + 显式刷新路由」，
- *   因为多账号下每次轮询都要打 N 个上游接口。
+ * 改动：
+ *   1. 文档结构由「单账号 + 单目录」改为「账号池 + 每账号健康 + 该区域目录」；
+ *   2. **每条路由都按 `?region=cn|global` 参数化** —— 两个区域是两套独立的
+ *      pool / store / catalog，一个 tab 的请求只可能读写自己那一套；
+ *   3. 积分从「每次轮询都打上游」改为「读池内缓存 + 显式刷新路由」，
+ *      因为多账号下每次轮询都要打 N 个上游计费接口。
  *
  * @module dsh-workbuddy2api/web-status
  */
@@ -22,9 +25,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { WorkBuddyCredentialStore } from './auth.ts'
 import type { WorkBuddyModelInfo } from './catalog.ts'
-import type { WorkBuddyAccountPool, WorkBuddyPoolPolicy } from './pool.ts'
-import type { WorkBuddyCredits, WorkBuddyUpstreamClient } from './upstream.ts'
+import type { WorkBuddyAccountPool, WorkBuddyPoolTuning } from './pool.ts'
+import type { WorkBuddyCredits, WorkBuddyRegion, WorkBuddyUpstreamClient } from './upstream.ts'
 import {
+  regionOfStatusUrl,
   WORKBUDDY2API_ACCOUNTS_REFRESH_PATH,
   WORKBUDDY2API_ACCOUNT_PARAM,
   WORKBUDDY2API_CHECKIN_PATH,
@@ -34,11 +38,11 @@ import {
   WORKBUDDY2API_USAGE_PATH,
 } from './status-paths.ts'
 import type {
+  WorkBuddyPoolPolicy,
   WorkBuddyWebAccount,
   WorkBuddyWebAccountCredits,
   WorkBuddyWebCredits,
   WorkBuddyWebModel,
-  WorkBuddyWebPoolEntry,
   WorkBuddyWebPoolState,
   WorkBuddyWebUsage,
 } from './status-paths.ts'
@@ -54,27 +58,34 @@ export {
 }
 export type { WorkBuddyWebUsage }
 
-/** Constructor dependencies. */
+/** Constructor dependencies. Every region-scoped accessor takes the region. */
 export interface WorkBuddyStatusRouteOptions {
-  store: WorkBuddyCredentialStore
-  pool: WorkBuddyAccountPool
+  /** The region-scoped credential store backing that region's requests. */
+  store(region: WorkBuddyRegion): WorkBuddyCredentialStore
+  /** The region's own account pool. */
+  pool(region: WorkBuddyRegion): WorkBuddyAccountPool
   client: Pick<WorkBuddyUpstreamClient, 'fetchCredits' | 'fetchCheckinStatus' | 'claimDailyCheckin'>
-  /** The last-refreshed model directory (unfiltered) for card display. */
-  displayModels(): readonly WorkBuddyModelInfo[]
-  /** The user's selection, stored as model ids. */
-  enabledModelIds(): readonly string[]
-  /** Model ids the user opted into image input. */
-  imageModelIds(): readonly string[]
-  /** Saved local DSH context budgets by model id. */
-  contextBudgets(): Readonly<Record<string, number | undefined>>
+  /**
+   * The requested region's last-refreshed model directory (unfiltered) for card
+   * display. Region-scoped because the two gateways expose different rosters
+   * AND can bill the same id differently; showing one region's directory on the
+   * other is the bug the two-pool split exists to prevent.
+   */
+  displayModels(region: WorkBuddyRegion): readonly WorkBuddyModelInfo[]
+  /** The requested region's selection, stored as model ids. */
+  enabledModelIds(region: WorkBuddyRegion): readonly string[]
+  /** Model ids the user opted into image input, for the requested region. */
+  imageModelIds(region: WorkBuddyRegion): readonly string[]
+  /** Saved local DSH context budgets by model id, for the requested region. */
+  contextBudgets(region: WorkBuddyRegion): Readonly<Record<string, number | undefined>>
   /** Persisted per-account pool state, mirrored to the card for saving. */
-  poolState(): readonly WorkBuddyWebPoolState[]
-  /** The pool policy in force. */
-  policy(): WorkBuddyPoolPolicy
-  /** Re-read the live catalog from every account and merge it. */
-  discoverModels?(signal?: AbortSignal): Promise<readonly WorkBuddyModelInfo[]>
-  /** Fetch and cache one account's credits; resolves to the fetched answer. */
-  refreshCredits?(accountId: string): Promise<WorkBuddyCredits>
+  poolState(region: WorkBuddyRegion): readonly WorkBuddyWebPoolState[]
+  /** The requested region's pool policy in force. */
+  policy(region: WorkBuddyRegion): WorkBuddyPoolTuning
+  /** Re-read one region's live catalog from that region's own accounts. */
+  discoverModels?(region: WorkBuddyRegion, signal?: AbortSignal): Promise<readonly WorkBuddyModelInfo[]>
+  /** Fetch and cache one account's credits inside its own region's pool. */
+  refreshCredits?(region: WorkBuddyRegion, accountId: string): Promise<WorkBuddyCredits>
 }
 
 /** Redact token-like content before it crosses to the browser. */
@@ -168,20 +179,13 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   }
 }
 
-/**
- * Assemble the card's document: the locally discovered accounts, the pool's
- * live health per account, the cached credits, and the model directory with
- * the user's selection. Credit queries never run here — the pool's cache is
- * read instead, so a 60-second card poll does not hammer N upstream billing
- * endpoints.
- */
-export async function workBuddyWebStatus(deps: WorkBuddyStatusRouteOptions): Promise<WorkBuddyWebUsage> {
-  try {
-    await deps.pool.refresh()
-  } catch (error: unknown) {
-    return { status: 'error', message: safeMessage(error) }
-  }
-  const accounts: WorkBuddyWebAccount[] = (await deps.store.accounts()).map(account => ({
+/** One region's account list, token-free, annotated with its pool's switch. */
+async function accountsOf(
+  deps: WorkBuddyStatusRouteOptions,
+  region: WorkBuddyRegion,
+): Promise<WorkBuddyWebAccount[]> {
+  const pool = deps.pool(region)
+  return (await deps.store(region).accounts()).map(account => ({
     id: account.id,
     accountName: account.accountName,
     ...account.uin === undefined ? {} : { uin: account.uin },
@@ -189,49 +193,70 @@ export async function workBuddyWebStatus(deps: WorkBuddyStatusRouteOptions): Pro
     region: account.region,
     source: account.source,
     tokenExpiresAtMs: account.tokenExpiresAtMs,
+    enabled: pool.entryView(account.id)?.enabled ?? true,
     present: true,
   }))
-  const pool = deps.pool.snapshot()
+}
+
+/**
+ * Assemble one region's card document: that region's locally discovered
+ * accounts, its pool's live health per account, its cached credits, and its
+ * model directory with the user's selection within it. Credit queries never run
+ * here — the pool's cache is read instead, so a 60-second card poll does not
+ * hammer N upstream billing endpoints.
+ */
+export async function workBuddyWebStatus(
+  deps: WorkBuddyStatusRouteOptions,
+  region: WorkBuddyRegion,
+): Promise<WorkBuddyWebUsage> {
+  const pool = deps.pool(region)
+  try {
+    await pool.refresh()
+  } catch (error: unknown) {
+    return { status: 'error', region, message: safeMessage(error) }
+  }
+  let accounts: WorkBuddyWebAccount[]
+  try {
+    accounts = await accountsOf(deps, region)
+  } catch (error: unknown) {
+    return { status: 'error', region, message: safeMessage(error) }
+  }
+  const entries = pool.snapshot()
   if (accounts.length === 0) {
     return {
       status: 'empty',
+      region,
       accounts: [],
-      pool,
-      message: 'sign in once in the WorkBuddy desktop app, then refresh the account pool',
+      pool: entries,
+      message: region === 'global'
+        ? 'no international WorkBuddy sign-in found; sign in once in the WorkBuddy AI app, then refresh this tab'
+        : 'no domestic WorkBuddy sign-in found; sign in once in the WorkBuddy desktop app, then refresh this tab',
     }
   }
-  const credits: WorkBuddyWebAccountCredits[] = pool.map(entry => ({
+  const credits: WorkBuddyWebAccountCredits[] = entries.map(entry => ({
     accountId: entry.accountId,
     ...entry.credits === undefined ? {} : {
-      credits: {
-        total: entry.credits,
-        packages: [],
-        expiringSoon: entry.creditsExpiringSoon ?? 0,
-      },
+      credits: { total: entry.credits, packages: [], expiringSoon: entry.creditsExpiringSoon ?? 0 },
     },
   }))
   return {
     status: 'ready',
+    region,
     accounts,
-    pool,
+    pool: entries,
     credits,
-    models: deps.displayModels().map(model => toWebModel(model, deps.contextBudgets())),
-    enabledModelIds: [...deps.enabledModelIds()],
-    imageModelIds: [...deps.imageModelIds()],
-    poolState: [...deps.poolState()],
-    policy: deps.policy(),
+    models: deps.displayModels(region).map(model => toWebModel(model, deps.contextBudgets(region))),
+    enabledModelIds: [...deps.enabledModelIds(region)],
+    imageModelIds: [...deps.imageModelIds(region)],
+    poolState: [...deps.poolState(region)],
+    policy: deps.policy(region),
   }
 }
 
-/** Map the pool's card view into the browser-facing entry shape. */
-function toWebPoolEntry(entry: WorkBuddyWebPoolEntry): WorkBuddyWebPoolEntry {
-  return { ...entry }
-}
-
 /**
- * Mount the routes on a context where `webServer` is available. The caller
- * uses `ctx.inject(['webServer'], ...)`, so Desktop startup order cannot make
- * this registration disappear.
+ * Mount the routes on a context where `webServer` is available. The caller uses
+ * `ctx.inject(['webServer'], ...)`, so Desktop startup order cannot make this
+ * registration disappear.
  */
 export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddyStatusRouteOptions): void {
   ctx.effect(() => {
@@ -247,13 +272,29 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
       return true
     }
 
+    /**
+     * The region a request addresses, or a 400 answer. Absent means the
+     * domestic tab; an unknown value is refused rather than guessed, so a
+     * malformed request can never silently address the wrong pool.
+     */
+    const requestRegion = (req: IncomingMessage, res: ServerResponse): WorkBuddyRegion | undefined => {
+      const region = regionOfStatusUrl(req.url ?? '/')
+      if (region === undefined) {
+        json(res, 400, { error: 'unknown region' })
+        return undefined
+      }
+      return region
+    }
+
     const disposeUsage = ctx.webServer.register({
       kind: 'exact',
       path: WORKBUDDY2API_USAGE_PATH,
       handler: async (req: IncomingMessage, res: ServerResponse) => {
         if (!guard(req, res, 'GET')) return
+        const region = requestRegion(req, res)
+        if (region === undefined) return
         try {
-          json(res, 200, await workBuddyWebStatus(deps))
+          json(res, 200, await workBuddyWebStatus(deps, region))
         } catch (error: unknown) {
           json(res, 500, { error: safeMessage(error) })
         }
@@ -265,20 +306,14 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
       path: WORKBUDDY2API_ACCOUNTS_REFRESH_PATH,
       handler: async (req: IncomingMessage, res: ServerResponse) => {
         if (!guard(req, res, 'POST')) return
+        const region = requestRegion(req, res)
+        if (region === undefined) return
         try {
-          await deps.pool.refresh()
+          await deps.pool(region).refresh()
           json(res, 200, {
-            accounts: (await deps.store.accounts()).map(account => ({
-              id: account.id,
-              accountName: account.accountName,
-              ...account.uin === undefined ? {} : { uin: account.uin },
-              domain: account.domain,
-              region: account.region,
-              source: account.source,
-              tokenExpiresAtMs: account.tokenExpiresAtMs,
-              present: true,
-            })),
-            pool: deps.pool.snapshot().map(toWebPoolEntry),
+            region,
+            accounts: await accountsOf(deps, region),
+            pool: deps.pool(region).snapshot(),
           })
         } catch (error: unknown) {
           json(res, 500, { error: safeMessage(error) })
@@ -291,24 +326,29 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
       path: WORKBUDDY2API_CREDITS_REFRESH_PATH,
       handler: async (req: IncomingMessage, res: ServerResponse) => {
         if (!guard(req, res, 'POST')) return
+        const region = requestRegion(req, res)
+        if (region === undefined) return
         if (deps.refreshCredits === undefined) {
           json(res, 503, { error: 'credit refresh unavailable' })
           return
         }
         try {
-          await deps.pool.refresh()
-          const wanted = requestAccountId(req) === undefined
-            ? deps.pool.snapshot().map(entry => entry.accountId)
-            : [requestAccountId(req) as string]
+          await deps.pool(region).refresh()
+          const named = requestAccountId(req)
+          const wanted = named === undefined
+            ? deps.pool(region).snapshot().map(entry => entry.accountId)
+            : [named]
+          const refreshCredits = deps.refreshCredits
           const results = await Promise.allSettled(wanted.map(async accountId => ({
             accountId,
-            credits: await (deps.refreshCredits as (id: string) => Promise<WorkBuddyCredits>)(accountId),
+            credits: await refreshCredits(region, accountId),
           })))
           json(res, 200, {
+            region,
             credits: results.map((result, index) => result.status === 'fulfilled'
               ? { accountId: wanted[index], credits: toCredits(result.value.credits) }
               : { accountId: wanted[index], creditsError: safeMessage(result.reason) }),
-            pool: deps.pool.snapshot().map(toWebPoolEntry),
+            pool: deps.pool(region).snapshot(),
           })
         } catch (error: unknown) {
           json(res, 500, { error: safeMessage(error) })
@@ -321,24 +361,31 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
       path: WORKBUDDY2API_CHECKIN_PATH,
       handler: async (req: IncomingMessage, res: ServerResponse) => {
         if (!guard(req, res, 'POST')) return
+        const region = requestRegion(req, res)
+        if (region === undefined) return
         const accountId = requestAccountId(req)
         if (accountId === undefined) {
           json(res, 400, { error: 'accountId is required' })
           return
         }
         try {
-          const credential = await deps.store.resolve(accountId)
+          const credential = await deps.store(region).resolve(accountId)
           const current = await deps.client.fetchCheckinStatus(credential)
           if (!current.active) {
             json(res, 409, { error: 'check-in activity is not active' })
             return
           }
           if (current.todayCheckedIn) {
-            json(res, 200, { alreadyCheckedIn: true, checkin: current })
+            json(res, 200, { region, alreadyCheckedIn: true, checkin: current })
             return
           }
           const claim = await deps.client.claimDailyCheckin(credential)
-          json(res, 200, { alreadyCheckedIn: false, claim, checkin: await deps.client.fetchCheckinStatus(credential) })
+          json(res, 200, {
+            region,
+            alreadyCheckedIn: false,
+            claim,
+            checkin: await deps.client.fetchCheckinStatus(credential),
+          })
         } catch (error: unknown) {
           json(res, 500, { error: safeMessage(error) })
         }
@@ -350,13 +397,17 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
       path: WORKBUDDY2API_MODELS_REFRESH_PATH,
       handler: async (req: IncomingMessage, res: ServerResponse) => {
         if (!guard(req, res, 'POST')) return
+        const region = requestRegion(req, res)
+        if (region === undefined) return
         if (deps.discoverModels === undefined) {
           json(res, 503, { error: 'model refresh unavailable' })
           return
         }
         try {
-          const models = await deps.discoverModels()
-          json(res, 200, { models: models.map(model => toWebModel(model, deps.contextBudgets())) })
+          // The refreshed catalog belongs to the requested region, so its
+          // context budgets come from that same region's slot.
+          const models = await deps.discoverModels(region)
+          json(res, 200, { region, models: models.map(model => toWebModel(model, deps.contextBudgets(region))) })
         } catch (error: unknown) {
           json(res, 500, { error: safeMessage(error) })
         }
@@ -368,6 +419,8 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
       path: WORKBUDDY2API_POOL_ACTION_PATH,
       handler: async (req: IncomingMessage, res: ServerResponse) => {
         if (!guard(req, res, 'POST')) return
+        const region = requestRegion(req, res)
+        if (region === undefined) return
         try {
           const body = await readJsonBody(req)
           const action = typeof body['action'] === 'string' ? body['action'] : ''
@@ -377,15 +430,19 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
             return
           }
           if (action === 'reset') {
-            deps.pool.reset(accountId)
+            deps.pool(region).reset(accountId)
           } else if (action === 'release') {
             // Operator escape hatch for a slot leaked by a crashed request.
-            deps.pool.release(accountId)
+            deps.pool(region).release(accountId)
           } else {
             json(res, 400, { error: `unknown pool action: ${action}` })
             return
           }
-          json(res, 200, { pool: deps.pool.snapshot().map(toWebPoolEntry), poolState: [...deps.poolState()] })
+          json(res, 200, {
+            region,
+            pool: deps.pool(region).snapshot(),
+            poolState: [...deps.poolState(region)],
+          })
         } catch (error: unknown) {
           json(res, 500, { error: safeMessage(error) })
         }

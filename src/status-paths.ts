@@ -5,9 +5,10 @@
  *   — 「同源只读路由 + 一份与浏览器共享的 node-free 类型定义」的 host↔client
  *     桥梁形态来自该项目（其源自 dsh-connect-trae，并注明沿用
  *     corrinehu/dsh-workbuddy-connect 的 status-route 模式）。
- * 改动：路由路径改用本插件 id；文档结构从「一个账号 + 一份目录」改成
- *   「账号池 + 每账号健康 + 一份合并目录」，并新增池操作路由
- *   （启用/停用/重置/权重）与积分刷新路由。
+ * 改动：
+ *   1. 文档结构从「一个账号 + 一份目录」改成「账号池 + 每账号健康 + 一份目录」；
+ *   2. 区域（cn | global）从可选字段升级为路由、配置与 provider 的主键 ——
+ *      国内版与国际版是两个独立账号池、两个独立 provider、两份独立目录。
  *
  * @module dsh-workbuddy2api/status-paths
  */
@@ -22,11 +23,55 @@ export const WORKBUDDY2API_ACCOUNTS_REFRESH_PATH = '/plugins/dsh-workbuddy2api/a
 export const WORKBUDDY2API_CREDITS_REFRESH_PATH = '/plugins/dsh-workbuddy2api/credits/refresh'
 /** Plugin-owned daily check-in action endpoint. */
 export const WORKBUDDY2API_CHECKIN_PATH = '/plugins/dsh-workbuddy2api/checkin'
-/** Plugin-owned pool control endpoint (enable / disable / reset / weight). */
+/** Plugin-owned pool control endpoint (reset / release). */
 export const WORKBUDDY2API_POOL_ACTION_PATH = '/plugins/dsh-workbuddy2api/pool'
 
 /** Query parameter naming the account a card request addresses. */
 export const WORKBUDDY2API_ACCOUNT_PARAM = 'accountId'
+
+/** Query parameter naming the REGION (i.e. which pool) a card request addresses. */
+export const WORKBUDDY2API_REGION_PARAM = 'region'
+
+/**
+ * Both regions, in tab order.
+ *
+ * The two regions are NOT a display grouping: each owns a separate account
+ * pool, a separate provider route, and a separate model directory. They must
+ * stay separate because the upstream reuses one model id for different things
+ * per region — `deepseek-v4.1-flash` is a free promotional model on the
+ * international gateway and a paid one on the domestic gateway — so merging
+ * the two directories silently replaces one region's rate with the other's.
+ */
+export const WORKBUDDY2API_REGIONS: readonly WorkBuddyWebRegion[] = ['cn', 'global']
+
+/**
+ * Address one region's status route. Every card request carries the region
+ * whose tab the user is on, so a tab can only ever read and write its own
+ * pool, credits, and model slot.
+ */
+export function withWorkBuddyRegion(path: string, region: WorkBuddyWebRegion): string {
+  return `${path}?${WORKBUDDY2API_REGION_PARAM}=${region}`
+}
+
+/**
+ * Read the region parameter off a status-route URL. Absent means the domestic
+ * tab (`cn`); a present-but-unknown value returns undefined so the route can
+ * answer 400 instead of silently addressing the wrong pool.
+ */
+export function regionOfStatusUrl(url: string): WorkBuddyWebRegion | undefined {
+  const at = url.indexOf('?')
+  const value = at === -1 ? null : new URLSearchParams(url.slice(at + 1)).get(WORKBUDDY2API_REGION_PARAM)
+  if (value === null || value === '') return 'cn'
+  return (WORKBUDDY2API_REGIONS as readonly string[]).includes(value) ? value as WorkBuddyWebRegion : undefined
+}
+
+/**
+ * Region of the signed-in credential: the CN app (`codebuddy.cn` /
+ * `workbuddy.cn`) or the international WorkBuddy AI app (`workbuddy.ai` /
+ * `codebuddy.ai`). The card uses this to pick the pool and model slot a tab
+ * reads and writes.
+ */
+export type WorkBuddyWebRegion = 'cn' | 'global'
 
 /** One credit package as the upstream returns it, node-free. */
 export interface WorkBuddyWebCreditPackage {
@@ -104,9 +149,11 @@ export interface WorkBuddyWebAccount {
   accountName: string
   uin?: string
   domain: string
-  region: 'cn' | 'global'
+  region: WorkBuddyWebRegion
   source: 'desktop' | 'dsh'
   tokenExpiresAtMs: number
+  /** Whether this account's pool currently counts it as enabled. */
+  enabled: boolean
   /** Whether a credential file for this account is still on disk. */
   present: boolean
 }
@@ -115,7 +162,7 @@ export interface WorkBuddyWebAccount {
 export interface WorkBuddyWebPoolEntry {
   accountId: string
   accountName: string
-  region: 'cn' | 'global'
+  region: WorkBuddyWebRegion
   enabled: boolean
   weight: number
   priority: number
@@ -151,26 +198,6 @@ export interface WorkBuddyWebAccountCredits {
 
 export type WorkBuddyWebPackage = WorkBuddyWebCreditPackage
 
-/** The JSON document the plugin card renders. */
-export type WorkBuddyWebUsage =
-  | { status: 'empty'; accounts: readonly WorkBuddyWebAccount[]; pool: readonly WorkBuddyWebPoolEntry[]; message?: string }
-  | {
-    status: 'ready'
-    /** The account the pool would pick right now, for the card's headline. */
-    activeAccountId?: string
-    accounts: readonly WorkBuddyWebAccount[]
-    pool: readonly WorkBuddyWebPoolEntry[]
-    credits: readonly WorkBuddyWebAccountCredits[]
-    models: readonly WorkBuddyWebModel[]
-    enabledModelIds: readonly string[]
-    imageModelIds: readonly string[]
-    /** Persisted per-account pool state, so the card can save it back. */
-    poolState: readonly WorkBuddyWebPoolState[]
-    /** Effective pool policy, so the card can display and edit it. */
-    policy: WorkBuddyWebPoolPolicy
-  }
-  | { status: 'error'; message: string }
-
 /**
  * The persisted per-account pool slice. Declared node-free because the browser
  * half saves it back verbatim through `settingsScope`; `pool.ts` owns the
@@ -192,14 +219,18 @@ export interface WorkBuddyPoolStateRecord {
 export type WorkBuddyWebPoolState = WorkBuddyPoolStateRecord
 
 /**
- * Health-policy knobs for the account pool. Declared here (node-free) so the
- * browser half and the host's `pool.ts` share ONE definition; every default is
- * the workbuddy2api default and lives in `pool.ts`.
+ * Health-policy knobs for one account pool. Declared here (node-free) so the
+ * browser half and the host's `pool.ts` share ONE definition; the defaults live
+ * in `pool.ts`.
+ *
+ * Each region carries its OWN policy: the international gateway enforces a
+ * visibly tighter WAF, so its pool keeps a lower concurrency ceiling and a
+ * longer cooldown than the domestic one.
  */
 export interface WorkBuddyPoolPolicy {
   /** Concurrent requests per account; 0 means unlimited. */
   maxInFlightPerAccount: number
-  /** Concurrent requests per international (global) account; <=0 falls back to 2. */
+  /** Ceiling for this region's accounts when the region is the global one. */
   maxInFlightGlobalPerAccount: number
   /** Concurrent requests across the whole pool; 0 means unlimited. */
   maxInFlightTotal: number
@@ -229,5 +260,30 @@ export interface WorkBuddyPoolPolicy {
   balanceAware: boolean
 }
 
-/** The card's view of the policy: the same document, under its web name. */
+/** The card's view of one region's policy: the same document, under its web name. */
 export type WorkBuddyWebPoolPolicy = WorkBuddyPoolPolicy
+
+/** The JSON document one region's card tab renders. */
+export type WorkBuddyWebUsage =
+  | {
+    status: 'empty'
+    region: WorkBuddyWebRegion
+    accounts: readonly WorkBuddyWebAccount[]
+    pool: readonly WorkBuddyWebPoolEntry[]
+    message?: string
+  }
+  | {
+    status: 'ready'
+    region: WorkBuddyWebRegion
+    accounts: readonly WorkBuddyWebAccount[]
+    pool: readonly WorkBuddyWebPoolEntry[]
+    credits: readonly WorkBuddyWebAccountCredits[]
+    models: readonly WorkBuddyWebModel[]
+    enabledModelIds: readonly string[]
+    imageModelIds: readonly string[]
+    /** Persisted per-account pool state, so the card can save it back. */
+    poolState: readonly WorkBuddyWebPoolState[]
+    /** Effective pool policy, so the card can display and edit it. */
+    policy: WorkBuddyWebPoolPolicy
+  }
+  | { status: 'error'; region: WorkBuddyWebRegion; message: string }
