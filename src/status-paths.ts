@@ -321,10 +321,15 @@ export interface WorkBuddyWebTaskReport {
 
 /** The task schedule, as the card displays and edits it. */
 export interface WorkBuddyWebTaskSchedule {
+  /** Whether the daily sweep is armed. */
   enabled: boolean
+  /** Local hour (0-23) the daily sweep starts at. */
   hour: number
+  /** Local minute (0-59) the daily sweep starts at. */
   minute: number
+  /** Whether a sweep also runs shortly after DSH starts. */
   runOnStart: boolean
+  /** `HH:MM` form of `hour`/`minute`, for display only. */
   dailyAt: string
   nextRunAtMs?: number
   lastRunAtMs?: number

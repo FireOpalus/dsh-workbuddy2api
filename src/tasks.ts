@@ -868,6 +868,14 @@ export interface WorkBuddyTaskScheduleStatus {
   running: boolean
   /** Whether the plugin runs a startup sweep. */
   runOnStart: boolean
+  /** Whether the daily sweep is armed. */
+  enabled: boolean
+  /**
+   * The configured daily time, as numbers `hour`/`minute` — the card edits
+   * these, so it must receive them. `dailyAt` is only their display form.
+   */
+  hour: number
+  minute: number
   /** The configured daily time, as `HH:MM`. */
   dailyAt: string
 }
@@ -954,6 +962,11 @@ export class WorkBuddyTaskScheduler {
       lastSkipped: this.lastSkipped,
       running: this.running,
       runOnStart: schedule.runOnStart,
+      enabled: schedule.enabled,
+      // The card renders and edits these, so they travel as numbers; `dailyAt`
+      // is derived here for display only and must never be parsed back.
+      hour,
+      minute,
       dailyAt: String(hour).padStart(2, '0') + ':' + String(minute).padStart(2, '0'),
     }
   }

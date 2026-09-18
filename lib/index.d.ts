@@ -1178,6 +1178,14 @@ interface WorkBuddyTaskScheduleStatus {
   running: boolean;
   /** Whether the plugin runs a startup sweep. */
   runOnStart: boolean;
+  /** Whether the daily sweep is armed. */
+  enabled: boolean;
+  /**
+   * The configured daily time, as numbers `hour`/`minute` — the card edits
+   * these, so it must receive them. `dailyAt` is only their display form.
+   */
+  hour: number;
+  minute: number;
   /** The configured daily time, as `HH:MM`. */
   dailyAt: string;
 }

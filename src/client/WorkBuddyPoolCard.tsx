@@ -240,6 +240,27 @@ function CreditRing({ ratio, title, size = 14 }: {
   )
 }
 
+/**
+ * A finite integer inside `[min, max]`, or `fallback` when the input is not a
+ * usable number. Used before every settings write: the codec is strict, so a
+ * half-typed field must be normalized rather than forwarded.
+ */
+function clampInteger(value: unknown, min: number, max: number, fallback: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback
+  return Math.min(Math.max(Math.round(value), min), max)
+}
+
+/**
+ * The schedule document, but only when it carries the numeric fields the card
+ * edits. An older host answered `dailyAt` alone; rendering that would show
+ * empty time boxes and would also spread `undefined` into the settings write.
+ */
+function usableSchedule(schedule: WorkBuddyWebTaskSchedule | undefined): WorkBuddyWebTaskSchedule | undefined {
+  if (schedule === undefined) return undefined
+  if (typeof schedule.hour !== 'number' || typeof schedule.minute !== 'number') return undefined
+  return schedule
+}
+
 /** The empty placeholder each tab starts from. */
 function emptyUsage(region: WorkBuddyWebRegion): WorkBuddyWebUsage {
   return { status: 'empty', region, accounts: [], pool: [] }
@@ -864,7 +885,12 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
     }
     return { done, total, claimable, accounts: accounts.length }
   })()
-  const schedule = taskDraft[activeRegion] ?? taskState?.schedule
+  /**
+   * The schedule the card renders. A document from an older host carries only
+   * `dailyAt` (a formatted string) and no numbers, which rendered as empty time
+   * boxes; such a document is treated as absent rather than shown half-empty.
+   */
+  const schedule = taskDraft[activeRegion] ?? usableSchedule(taskState?.schedule)
   const reportsByAccount = new Map(
     (taskState?.reports ?? []).map(report => [report.accountId, report]),
   )
@@ -872,15 +898,24 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   /** Persist the schedule draft (and re-arm the host's timers). */
   const saveSchedule = async (next: WorkBuddyWebTaskSchedule): Promise<void> => {
     if (settingsScope === undefined) return
-    setTaskDraft(previous => ({ ...previous, [activeRegion]: next }))
+    // The settings write goes through a STRICT JSON codec: an explicit
+    // `undefined` anywhere in the payload fails the whole mutation with
+    // `settings/mutate rejected "ops"`, and nothing is saved. So every field is
+    // coerced to a real value here rather than trusted from a draft — a draft
+    // can legitimately hold a half-typed time box ("" parses to NaN).
+    const hour = clampInteger(next.hour, 0, 23, 0)
+    const minute = clampInteger(next.minute, 0, 59, 0)
+    const enabled = next.enabled === true
+    const runOnStart = next.runOnStart === true
+    setTaskDraft(previous => ({ ...previous, [activeRegion]: { ...next, enabled, hour, minute, runOnStart } }))
     try {
       const configured = settingsScope.getSnapshot().value as Record<string, unknown> | undefined
       await settingsScope.set('tasks', {
         ...typeof configured?.tasks === 'object' && configured.tasks !== null ? configured.tasks : {},
-        enabled: next.enabled,
-        hour: next.hour,
-        minute: next.minute,
-        runOnStart: next.runOnStart,
+        enabled,
+        hour,
+        minute,
+        runOnStart,
       })
     } catch (error: unknown) {
       if (mounted.current) setSaveError(error instanceof Error ? error.message : t('row.requestFailed'))
@@ -1556,7 +1591,12 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                             value={schedule.hour}
                             disabled={!writable}
                             onChange={event => {
-                              const hour = Number(event.currentTarget.value)
+                              // An emptied box reads as "" and Number("") is 0 —
+                              // committing that would silently mean midnight.
+                              // Ignore a blank edit; the last real value stands.
+                              const raw = event.currentTarget.value
+                              if (raw.trim() === '') return
+                              const hour = Number(raw)
                               if (Number.isFinite(hour)) void saveSchedule({ ...schedule, hour })
                             }}
                           />
@@ -1568,7 +1608,9 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                             value={schedule.minute}
                             disabled={!writable}
                             onChange={event => {
-                              const minute = Number(event.currentTarget.value)
+                              const raw = event.currentTarget.value
+                              if (raw.trim() === '') return
+                              const minute = Number(raw)
                               if (Number.isFinite(minute)) void saveSchedule({ ...schedule, minute })
                             }}
                           />
