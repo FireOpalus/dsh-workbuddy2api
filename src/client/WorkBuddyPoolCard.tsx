@@ -31,6 +31,8 @@ import {
   WORKBUDDY2API_POOL_ACTION_PATH,
   WORKBUDDY2API_REGIONS,
   WORKBUDDY2API_STATE_PARAM,
+  WORKBUDDY2API_TASKS_PATH,
+  WORKBUDDY2API_TASKS_RUN_PATH,
   WORKBUDDY2API_USAGE_PATH,
 } from '../status-paths.ts'
 import type {
@@ -40,6 +42,9 @@ import type {
   WorkBuddyWebPoolPolicy,
   WorkBuddyWebPoolState,
   WorkBuddyWebRegion,
+  WorkBuddyWebTaskReport,
+  WorkBuddyWebTaskSchedule,
+  WorkBuddyWebTasks,
   WorkBuddyWebUsage,
 } from '../status-paths.ts'
 import { WORKBUDDY2API_PLUGIN_ICON } from './icon.ts'
@@ -78,6 +83,13 @@ const LOGIN_STORAGE_KEY = 'dsh-workbuddy2api/login'
 interface WorkBuddyPoolDraft {
   accounts: Map<string, { enabled: boolean; weight: number }>
   policy: WorkBuddyWebPoolPolicy
+}
+
+/** One region's task document plus the sweep state that came with it. */
+interface WorkBuddyTaskState {
+  accounts: WorkBuddyWebTasks[]
+  schedule?: WorkBuddyWebTaskSchedule
+  reports: WorkBuddyWebTaskReport[]
 }
 
 /** One region's unsaved model edits. */
@@ -234,6 +246,10 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   const [login, setLogin] = useState<WorkBuddyLoginDraft | undefined>(() => readStoredLogin())
   /** A finished sign-in's confirmation line, cleared by the next action. */
   const [loginDone, setLoginDone] = useState<WorkBuddyLoginDone | undefined>(undefined)
+  /** Per-region growth tasks, loaded on demand (never on the 60s poll). */
+  const [tasksByRegion, setTasksByRegion] = useState<Partial<Record<WorkBuddyWebRegion, WorkBuddyTaskState>>>({})
+  const [tasksBusy, setTasksBusy] = useState(false)
+  const [taskDraft, setTaskDraft] = useState<Partial<Record<WorkBuddyWebRegion, WorkBuddyWebTaskSchedule>>>({})
   const mounted = useRef(true)
   /**
    * The authoritative "which sign-in is running" record. It is written
@@ -403,6 +419,71 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
     // object: every poll replaces the draft, and depending on the object would
     // restart the timer (and re-poll) on each of its own answers.
   }, [login?.state, login?.region, pollLogin])
+
+  /** Load one region's task document (list + schedule + last reports). */
+  const loadTasks = useCallback(async (region: WorkBuddyWebRegion): Promise<void> => {
+    try {
+      const response = await fetch(withWorkBuddyRegion(WORKBUDDY2API_TASKS_PATH, region), {
+        headers: { accept: 'application/json' },
+        credentials: 'same-origin',
+      })
+      const body = await response.json().catch(() => undefined) as
+        | { accounts?: WorkBuddyWebTasks[]; schedule?: WorkBuddyWebTaskSchedule | null; error?: string }
+        | undefined
+      if (!response.ok) throw new Error(body?.error ?? `HTTP ${response.status}`)
+      if (!mounted.current) return
+      setTasksByRegion(previous => ({
+        ...previous,
+        [region]: {
+          accounts: Array.isArray(body?.accounts) ? body.accounts : [],
+          ...body?.schedule === undefined || body.schedule === null ? {} : { schedule: body.schedule },
+          reports: body?.schedule?.lastReports ?? [],
+        },
+      }))
+    } catch (error: unknown) {
+      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
+    }
+  }, [t])
+
+  // Tasks are loaded when the tab is opened, not on the 60s pool poll: the list
+  // costs one upstream call per account, so polling it would be rude.
+  useEffect(() => {
+    if (!open) return
+    void loadTasks(activeRegion)
+  }, [open, activeRegion, loadTasks])
+
+  /** Run the tasks: this account's, or every account in the region. */
+  const runTasks = async (accountId?: string): Promise<void> => {
+    setTasksBusy(true)
+    setActionError(undefined)
+    try {
+      const response = await fetch(withWorkBuddyRegion(WORKBUDDY2API_TASKS_RUN_PATH, activeRegion), {
+        method: 'POST',
+        headers: { accept: 'application/json', 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify(accountId === undefined ? {} : { accountId }),
+      })
+      const body = await response.json().catch(() => undefined) as
+        | { reports?: WorkBuddyWebTaskReport[]; accounts?: WorkBuddyWebTasks[]; schedule?: WorkBuddyWebTaskSchedule; error?: string }
+        | undefined
+      if (!response.ok) throw new Error(body?.error ?? `HTTP ${response.status}`)
+      if (!mounted.current) return
+      setTasksByRegion(previous => ({
+        ...previous,
+        [activeRegion]: {
+          accounts: Array.isArray(body?.accounts) ? body.accounts : previous[activeRegion]?.accounts ?? [],
+          ...body?.schedule === undefined ? {} : { schedule: body.schedule },
+          reports: Array.isArray(body?.reports) ? body.reports : [],
+        },
+      }))
+      // A finished sweep changes credits, so the pool view is refreshed too.
+      await refreshUsage(activeRegion)
+    } catch (error: unknown) {
+      if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
+    } finally {
+      if (mounted.current) setTasksBusy(false)
+    }
+  }
 
   const startLogin = async (): Promise<void> => {
     setActionError(undefined)
@@ -704,6 +785,37 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
     } finally {
       if (mounted.current) setBusy(false)
     }
+  }
+
+  const taskState = tasksByRegion[activeRegion]
+  const schedule = taskDraft[activeRegion] ?? taskState?.schedule
+  const reportsByAccount = new Map(
+    (taskState?.reports ?? []).map(report => [report.accountId, report]),
+  )
+
+  /** Persist the schedule draft (and re-arm the host's timers). */
+  const saveSchedule = async (next: WorkBuddyWebTaskSchedule): Promise<void> => {
+    if (settingsScope === undefined) return
+    setTaskDraft(previous => ({ ...previous, [activeRegion]: next }))
+    try {
+      const configured = settingsScope.getSnapshot().value as Record<string, unknown> | undefined
+      await settingsScope.set('tasks', {
+        ...typeof configured?.tasks === 'object' && configured.tasks !== null ? configured.tasks : {},
+        enabled: next.enabled,
+        hour: next.hour,
+        minute: next.minute,
+        runOnStart: next.runOnStart,
+      })
+    } catch (error: unknown) {
+      if (mounted.current) setSaveError(error instanceof Error ? error.message : t('row.requestFailed'))
+      return
+    }
+    setTaskDraft(previous => {
+      const copy = { ...previous }
+      delete copy[activeRegion]
+      return copy
+    })
+    await loadTasks(activeRegion)
   }
 
   const title = t('row.title')
@@ -1079,6 +1191,204 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                     <p className="dsm-wb2api-model-capability-note">{t('row.modelCapabilityPending')}</p>
                   </section>
                 : null}
+
+              <section className="dsm-wb2api-tasks" aria-label={t('row.tasksTitle')}>
+                <div className="dsm-wb2api-section-head">
+                  <div>
+                    <h3 className="dsm-wb2api-section-title">{t('row.tasksTitle')}</h3>
+                    <p className="dsm-wb2api-section-sub">{t('row.tasksHint')}</p>
+                  </div>
+                  <div className="dsm-wb2api-actions-buttons">
+                    <button
+                      type="button"
+                      className="dsm-btn dsm-btn-outline"
+                      disabled={tasksBusy}
+                      onClick={() => { void loadTasks(activeRegion) }}
+                    >
+                      {tasksBusy ? t('row.tasksRefreshing') : t('row.tasksRefresh')}
+                    </button>
+                    <button
+                      type="button"
+                      className="dsm-btn dsm-btn-primary"
+                      disabled={tasksBusy}
+                      onClick={() => { void runTasks() }}
+                    >
+                      {tasksBusy ? t('row.tasksRunning') : t('row.tasksRun')}
+                    </button>
+                  </div>
+                </div>
+
+                {taskState === undefined
+                  ? <p className="dsm-wb2api-text">{t('row.tasksRefreshing')}</p>
+                  : taskState.accounts.length === 0
+                    ? <p className="dsm-wb2api-text">{t('row.tasksEmpty')}</p>
+                    : taskState.accounts.map(account => {
+                      if (!account.supported) {
+                        return <p className="dsm-wb2api-text" key={account.accountId}>{t('row.tasksIntl')}</p>
+                      }
+                      const report = reportsByAccount.get(account.accountId)
+                      const resultsByCode = new Map(
+                        (report?.results ?? []).map(result => [result.taskCode, result]),
+                      )
+                      const done = account.tasks.filter(task => task.claimed
+                        || (task.target > 0 && task.current >= task.target)).length
+                      return (
+                        <div key={account.accountId}>
+                          <div className="dsm-wb2api-section-head">
+                            <div>
+                              <h4 className="dsm-wb2api-section-title">{account.accountName}</h4>
+                              <p className="dsm-wb2api-section-sub">
+                                {t('row.tasksSummary', { done, total: account.tasks.length })}
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              className="dsm-btn dsm-btn-outline"
+                              disabled={tasksBusy}
+                              onClick={() => { void runTasks(account.accountId) }}
+                            >
+                              {tasksBusy ? t('row.tasksRunning') : t('row.tasksRun')}
+                            </button>
+                          </div>
+                          {account.error === undefined
+                            ? null
+                            : <p className="dsm-wb2api-error">{account.error}</p>}
+                          <div className="dsm-wb2api-task-list">
+                            {account.tasks.map(task => {
+                              const settled = task.claimed || (task.target > 0 && task.current >= task.target)
+                              const result = resultsByCode.get(task.taskCode)
+                              return (
+                                <div
+                                  className={`dsm-wb2api-task${settled ? ' dsm-wb2api-task-done' : ''}`}
+                                  key={task.taskCode}
+                                >
+                                  <div className="dsm-wb2api-task-head">
+                                    <span className="dsm-wb2api-task-title">{task.title}</span>
+                                    {task.claimed
+                                      ? <span className="dsm-wb2api-badge dsm-wb2api-badge-ready">
+                                          {t('row.tasksClaimed')}
+                                        </span>
+                                      : task.claimable
+                                        ? <span className="dsm-wb2api-badge dsm-wb2api-badge-cooldown">
+                                            {t('row.tasksClaimable')}
+                                          </span>
+                                        : null}
+                                    {task.automated
+                                      ? null
+                                      : <span
+                                          className="dsm-wb2api-badge dsm-wb2api-badge-disabled"
+                                          title={t('row.tasksUnsupportedWhy', {
+                                            reason: task.unsupportedReason ?? '',
+                                          })}
+                                        >
+                                          {t('row.tasksUnsupported')}
+                                        </span>}
+                                    <span className="dsm-wb2api-task-spacer" />
+                                    {task.target > 0
+                                      ? <span className="dsm-wb2api-task-progress">
+                                          {task.current}/{task.target}
+                                        </span>
+                                      : null}
+                                    {task.credit > 0 || task.energy > 0
+                                      ? <span className="dsm-wb2api-task-reward">
+                                          {task.energy > 0
+                                            ? t('row.tasksRewardEnergy', { credit: task.credit, energy: task.energy })
+                                            : t('row.tasksReward', { credit: task.credit })}
+                                        </span>
+                                      : null}
+                                  </div>
+                                  {task.detail === ''
+                                    ? null
+                                    : <p className="dsm-wb2api-task-detail">{task.detail}</p>}
+                                  {result === undefined
+                                    ? null
+                                    : <p className={`dsm-wb2api-task-report${result.outcome === 'error' ? ' dsm-wb2api-task-report-error' : ''}`}>
+                                        {result.progressAfter === undefined
+                                          ? result.message
+                                          : `${result.progressBefore ?? '?'} → ${result.progressAfter} · ${result.message}`}
+                                      </p>}
+                                </div>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      )
+                    })}
+
+                {schedule === undefined
+                  ? null
+                  : <div className="dsm-wb2api-task-schedule">
+                      <label>
+                        <span>{t('row.tasksAutoEnabled')}</span>
+                        <input
+                          type="checkbox"
+                          checked={schedule.enabled}
+                          disabled={!writable}
+                          onChange={event => { void saveSchedule({ ...schedule, enabled: event.currentTarget.checked }) }}
+                        />
+                      </label>
+                      <label>
+                        <span>{t('row.tasksAutoAt')}</span>
+                        <span>
+                          <input
+                            type="number"
+                            min={0}
+                            max={23}
+                            value={schedule.hour}
+                            disabled={!writable}
+                            onChange={event => {
+                              const hour = Number(event.currentTarget.value)
+                              if (Number.isFinite(hour)) void saveSchedule({ ...schedule, hour })
+                            }}
+                          />
+                          {' : '}
+                          <input
+                            type="number"
+                            min={0}
+                            max={59}
+                            value={schedule.minute}
+                            disabled={!writable}
+                            onChange={event => {
+                              const minute = Number(event.currentTarget.value)
+                              if (Number.isFinite(minute)) void saveSchedule({ ...schedule, minute })
+                            }}
+                          />
+                        </span>
+                      </label>
+                      <label>
+                        <span>{t('row.tasksAutoOnStart')}</span>
+                        <input
+                          type="checkbox"
+                          checked={schedule.runOnStart}
+                          disabled={!writable}
+                          onChange={event => { void saveSchedule({ ...schedule, runOnStart: event.currentTarget.checked }) }}
+                        />
+                      </label>
+                      <p className="dsm-wb2api-task-schedule-note">
+                        {schedule.running ? t('row.tasksAutoRunning') + ' · ' : ''}
+                        {schedule.nextRunAtMs === undefined
+                          ? ''
+                          : t('row.tasksAutoNext', { at: formatDateTime(schedule.nextRunAtMs) }) + ' · '}
+                        {schedule.lastRunAtMs === undefined
+                          ? t('row.tasksAutoLast', { at: t('row.tasksAutoNever') })
+                          : t('row.tasksAutoLast', { at: formatDateTime(schedule.lastRunAtMs) })}
+                      </p>
+                      <p className="dsm-wb2api-task-schedule-note">
+                        {schedule.lastSkipped.map(entry =>
+                          t('row.tasksSkipped', { name: entry.accountName, reason: entry.reason })).join(' · ')}
+                      </p>
+                      <div className="dsm-wb2api-actions-buttons" style={{ gridColumn: '1/-1' }}>
+                        <button
+                          type="button"
+                          className="dsm-btn dsm-btn-outline"
+                          disabled={tasksBusy}
+                          onClick={() => { void runTasks() }}
+                        >
+                          {t('row.tasksAutoRunNow')}
+                        </button>
+                      </div>
+                    </div>}
+              </section>
 
               {usage.status === 'error' ? <p className="dsm-wb2api-error">{usage.message}</p> : null}
               {actionError === undefined ? null : <p className="dsm-wb2api-error">{actionError}</p>}

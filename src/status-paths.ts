@@ -33,6 +33,11 @@ export const WORKBUDDY2API_LOGIN_POLL_PATH = '/plugins/dsh-workbuddy2api/login/p
 /** Query parameter carrying the sign-in state a poll addresses. */
 export const WORKBUDDY2API_STATE_PARAM = 'state'
 
+/** Plugin-owned growth-task list endpoint. */
+export const WORKBUDDY2API_TASKS_PATH = '/plugins/dsh-workbuddy2api/tasks'
+/** Plugin-owned growth-task run endpoint (one-click finish). */
+export const WORKBUDDY2API_TASKS_RUN_PATH = '/plugins/dsh-workbuddy2api/tasks/run'
+
 /** Query parameter naming the account a card request addresses. */
 export const WORKBUDDY2API_ACCOUNT_PARAM = 'accountId'
 
@@ -269,6 +274,67 @@ export interface WorkBuddyPoolPolicy {
 
 /** The card's view of one region's policy: the same document, under its web name. */
 export type WorkBuddyWebPoolPolicy = WorkBuddyPoolPolicy
+
+/** One growth task as the card renders it. */
+export interface WorkBuddyWebTask {
+  taskCode: string
+  title: string
+  /** What the task asks for. */
+  detail: string
+  current: number
+  target: number
+  credit: number
+  energy: number
+  locked: boolean
+  claimable: boolean
+  claimed: boolean
+  acceptStatus?: string
+  /** Whether this plugin can finish the task without the official client. */
+  automated: boolean
+  /** Why it cannot, when it cannot. */
+  unsupportedReason?: string
+}
+
+/** One task run's per-account report, as the card renders it. */
+export interface WorkBuddyWebTaskReport {
+  accountId: string
+  accountName: string
+  credit: number
+  energy: number
+  finishedAtMs: number
+  results: readonly {
+    taskCode: string
+    desc: string
+    outcome: 'done' | 'skipped' | 'error' | 'unsupported'
+    message: string
+    progressBefore?: string
+    progressAfter?: string
+  }[]
+}
+
+/** The task schedule, as the card displays and edits it. */
+export interface WorkBuddyWebTaskSchedule {
+  enabled: boolean
+  hour: number
+  minute: number
+  runOnStart: boolean
+  dailyAt: string
+  nextRunAtMs?: number
+  lastRunAtMs?: number
+  running: boolean
+  lastReports: readonly WorkBuddyWebTaskReport[]
+  lastSkipped: readonly { accountName: string; reason: string }[]
+}
+
+/** The whole task document for one account. */
+export interface WorkBuddyWebTasks {
+  accountId: string
+  accountName: string
+  /** False for the international gateway, which has no task system. */
+  supported: boolean
+  tasks: readonly WorkBuddyWebTask[]
+  error?: string
+}
 
 /**
  * One browser sign-in, as the card drives it. The host never returns the token

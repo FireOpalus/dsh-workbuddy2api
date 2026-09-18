@@ -93,6 +93,24 @@ export const WORKBUDDY2API_CARD_CSS = `
 .dsm-wb2api-spinner{flex:none;width:12px;height:12px;border-radius:50%;border:2px solid var(--dsw-alias-border-l2,#3a3d45);border-top-color:var(--dsw-alias-brand-primary,#5686fe);animation:dsm-wb2api-spin .8s linear infinite}
 @keyframes dsm-wb2api-spin{to{transform:rotate(360deg)}}
 .dsm-wb2api-signin-done{flex:1;min-width:180px;color:var(--dsw-alias-state-success-primary,#22a06b);font-size:12px;line-height:18px}
+.dsm-wb2api-tasks{display:flex;flex-direction:column;gap:10px;border-top:1px solid var(--dsw-alias-border-l2,#36373b);padding-top:14px}
+.dsm-wb2api-task-list{display:flex;flex-direction:column;border:1px solid var(--dsw-alias-border-l2,#36373b);border-radius:10px;overflow:hidden}
+.dsm-wb2api-task{display:flex;flex-direction:column;gap:5px;padding:9px 12px;background:var(--dsw-alias-bg-layer-2,#232529)}
+.dsm-wb2api-task+.dsm-wb2api-task{border-top:1px solid var(--dsw-alias-border-l2,#36373b)}
+.dsm-wb2api-task-done{opacity:.6}
+.dsm-wb2api-task-head{display:flex;align-items:center;gap:9px;min-width:0}
+.dsm-wb2api-task-title{color:var(--dsw-alias-label-primary,#e6e6e6);font-size:13px;font-weight:500;line-height:19px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsm-wb2api-task-spacer{flex:1;min-width:0}
+.dsm-wb2api-task-progress{flex:none;font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:12px;line-height:18px}
+.dsm-wb2api-task-reward{flex:none;color:var(--dsw-alias-label-tertiary,#999);font-size:11px;line-height:16px}
+.dsm-wb2api-task-detail{margin:0;color:var(--dsw-alias-label-tertiary,#999);font-size:11px;line-height:16px}
+.dsm-wb2api-task-report{margin:0;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:11px;line-height:16px}
+.dsm-wb2api-task-report-error{color:var(--dsw-alias-state-error-primary,#ef4444)}
+.dsm-wb2api-task-schedule{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px 14px;padding:11px 13px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:10px;background:var(--dsw-alias-bg-layer-2,#24262c)}
+.dsm-wb2api-task-schedule label{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:12px;line-height:18px}
+.dsm-wb2api-task-schedule input[type=number]{width:64px;font:inherit;font-size:12px;padding:3px 7px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);background:var(--dsw-alias-bg-layer-3,#2a2c33);color:var(--dsw-alias-label-primary,#e6e6e6)}
+.dsm-wb2api-task-schedule input[type=checkbox]{margin:0;accent-color:var(--dsw-alias-brand-primary,#5686fe)}
+.dsm-wb2api-task-schedule-note{grid-column:1/-1;margin:0;color:var(--dsw-alias-label-tertiary,#999);font-size:11px;line-height:16px}
 .dsm-wb2api-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid var(--dsw-alias-border-l2,#36373b);padding-top:12px}
 .dsm-wb2api-save-error{flex:1;min-width:0;color:var(--dsw-alias-state-error-primary,#ef4444);font-size:12px;line-height:16px;text-align:right}
 .dsm-wb2api-actions-buttons{display:flex;align-items:center;justify-content:flex-end;gap:8px}

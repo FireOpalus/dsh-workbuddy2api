@@ -37,6 +37,7 @@ import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-attachment'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import { workbuddyAccountId, WorkBuddyCredentialStore } from './auth.ts'
+import type { WorkBuddyCredential } from './auth.ts'
 import { deriveCatalog, fallbackModelsFor, WorkBuddyCatalog } from './catalog.ts'
 import type { WorkBuddyContextBudget, WorkBuddyModelInfo } from './catalog.ts'
 import {
@@ -53,10 +54,16 @@ import { createWorkBuddyShim } from './shim.ts'
 import type { WorkBuddyShim } from './shim.ts'
 import { DEFAULT_WORKBUDDY_POOL_POLICY, WorkBuddyAccountPool } from './pool.ts'
 import type { WorkBuddyPoolPolicy, WorkBuddyPoolStateRecord, WorkBuddyPoolTuning } from './pool.ts'
-import { WorkBuddyUpstreamClient } from './upstream.ts'
+import { regionOf, WorkBuddyUpstreamClient } from './upstream.ts'
 import type { WorkBuddyRegion } from './upstream.ts'
 import { registerWorkBuddy2ApiStatusRoute } from './web-status.ts'
 import { WorkBuddyLoginManager } from './login.ts'
+import {
+  DEFAULT_WORKBUDDY_TASK_SCHEDULE,
+  WorkBuddyTaskEngine,
+  WorkBuddyTaskScheduler,
+} from './tasks.ts'
+import type { WorkBuddyTaskSchedule, WorkBuddyTaskScheduleStatus } from './tasks.ts'
 import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
 
 export {
@@ -133,6 +140,29 @@ export {
   type WorkBuddyRefreshOutcome,
   type WorkBuddyRegion,
   type WorkBuddyUpstreamModel,
+} from './upstream.ts'
+export {
+  automatedTaskCodes,
+  DEFAULT_WORKBUDDY_TASK_SCHEDULE,
+  nextDailyRunAt,
+  progressText,
+  setWorkBuddyTaskDelay,
+  unsupportedReasonFor,
+  WorkBuddyTaskEngine,
+  WorkBuddyTaskScheduler,
+  type WorkBuddyTaskClient,
+  type WorkBuddyTaskOutcome,
+  type WorkBuddyTaskResult,
+  type WorkBuddyTaskRunReport,
+  type WorkBuddyTaskSchedule,
+  type WorkBuddyTaskScheduleStatus,
+  type WorkBuddyTaskView,
+} from './tasks.ts'
+export {
+  parseUpstreamTask,
+  type WorkBuddyDesktopEvent,
+  type WorkBuddyTask,
+  type WorkBuddyTaskReward,
 } from './upstream.ts'
 export {
   loginEndpointsFor,
@@ -240,6 +270,12 @@ export interface Config {
   /** Explicit WorkBuddy desktop auth-file path, overriding env and platform defaults. */
   authFile?: string
   /**
+   * The automatic growth-task sweep: finish every task this plugin can finish
+   * without the official client, once a day and (optionally) shortly after
+   * startup.
+   */
+  tasks?: WorkBuddyTaskSchedule
+  /**
    * Per-region state, keyed `cn` | `global`. Each region's provider, pool,
    * catalog, and card tab read and write ONLY their own slot, so changing
    * anything on one side never touches the other.
@@ -310,6 +346,13 @@ const poolPolicyConfig = z.object({
   minPickGapMs: z.number().step(1).min(0),
 })
 
+const taskScheduleConfig = z.object({
+  enabled: z.boolean().default(true).description('Run the daily growth-task sweep automatically'),
+  hour: z.number().step(1).min(0).max(23).default(0).description('Local hour the daily sweep starts at'),
+  minute: z.number().step(1).min(0).max(59).default(5).description('Local minute the daily sweep starts at'),
+  runOnStart: z.boolean().default(true).description('Also run one sweep shortly after DSH starts'),
+})
+
 const regionStateConfig = z.object({
   lastCatalog: z.array(modelConfig).default([]),
   enabledModelIds: z.array(z.string()).default([]),
@@ -330,6 +373,7 @@ const regionStateConfig = z.object({
  */
 export const Config: z<Config> = z.object({
   authFile: z.string().description(`WorkBuddy desktop auth file (defaults to the app's own location)`),
+  tasks: taskScheduleConfig.description('Automatic growth-task schedule (daily + on startup)'),
   regions: z.dict(regionStateConfig).default({})
     .description('Per-region model directory, selection, and pool state, keyed cn | global'),
   // 0.1.x wrote these at the TOP level, when both regions shared one pool and one
@@ -567,6 +611,48 @@ export function apply(ctx: Context, config: Config): void {
     },
   })
 
+  /**
+   * Growth tasks. The upstream pays for observed behavior, not for pressing a
+   * button, so "one-click finish" means reporting the behavior each task is
+   * scored on. The engine runs per account; the scheduler drives it once a day
+   * at a local wall-clock time and, optionally, once after startup.
+   */
+  const taskEngine = new WorkBuddyTaskEngine({
+    client,
+    // The credential handed in already came from the region's own store, so
+    // the list is that account's tasks and nothing else.
+    list: credential => client.listTasks(credential),
+    log: message => { ctx.logger.info('dsh-workbuddy2api: ' + message) },
+  })
+
+  /** The schedule in force right now, re-read from settings before each use. */
+  const currentTaskSchedule = (): WorkBuddyTaskSchedule => {
+    const configured = current().tasks
+    return {
+      ...DEFAULT_WORKBUDDY_TASK_SCHEDULE,
+      ...configured ?? {},
+      regions: ['cn'],
+    }
+  }
+
+  const taskScheduler = new WorkBuddyTaskScheduler({
+    engine: taskEngine,
+    accounts: async () => {
+      const found: { credential: WorkBuddyCredential; region: WorkBuddyRegion }[] = []
+      for (const region of REGION_KEYS) {
+        const stack = stacks[region]
+        await stack.pool.refresh()
+        const ids = stack.pool.snapshot()
+          .filter(entry => entry.present && entry.enabled)
+          .map(entry => entry.accountId)
+        for (const credential of await stack.store.byIds(ids)) found.push({ credential, region })
+      }
+      return found
+    },
+    schedule: currentTaskSchedule,
+    log: message => { ctx.logger.info('dsh-workbuddy2api: ' + message) },
+  })
+
   // Same-origin routes backing the Plugin-configuration card. `webServer` can
   // mount after this row, so wait reactively for it instead of sampling
   // ctx.get() once during apply (which silently loses all routes on Desktop).
@@ -590,19 +676,31 @@ export function apply(ctx: Context, config: Config): void {
       return credits
     },
     login,
+    tasks: taskEngine,
+    taskSchedule: () => taskScheduler.status(),
+    runTaskSweep: async () => { await taskScheduler.runNow() },
   }))
 
   ctx.settings.installSection(ctx, WORKBUDDY2API_SETTINGS_NS, Config, config, {
     setSource(source: () => Config) { current = source },
-    onChange() { applySelection(current()) },
+    onChange() {
+      applySelection(current())
+      // The schedule is read fresh before every sweep, so a change only has to
+      // re-arm the timers.
+      taskScheduler.start()
+    },
   })
 
   // Initial wiring: selections and each region's catalog from its saved state.
   applySelection(config)
+  // Arm the task schedule. The startup sweep is deliberately late (the pool
+  // scan and the catalog refresh come first) and never blocks startup.
+  taskScheduler.start()
 
   let stopped = false
   ctx.effect(() => () => {
     stopped = true
+    taskScheduler.dispose()
     login.dispose()
     for (const region of REGION_KEYS) {
       stacks[region].pool.dispose()

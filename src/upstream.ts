@@ -23,6 +23,7 @@
  * @module dsh-workbuddy2api/upstream
  */
 
+import { createHash } from 'node:crypto'
 import type { WorkBuddyCredential } from './auth.ts'
 
 /** WorkBuddy region selected by the credential's login domain. */
@@ -122,7 +123,18 @@ export type WorkBuddyChatResult =
 
 const CN_CHAT_BASE = 'https://copilot.tencent.com'
 const CN_BILLING_BASE = 'https://www.codebuddy.cn'
+/** Product origin (the growth centre and its reward endpoints live here). */
+const CN_WEB_BASE = 'https://www.workbuddy.cn'
 const GLOBAL_BASE = 'https://www.workbuddy.ai'
+
+/** Growth-domain paths: the task list, registration, and the report channel. */
+const TASKS_LIST_PATH = '/v2/activity/growth/tasks'
+const TASKS_ACCEPT_PATH = '/v2/activity/growth/tasks/accept'
+const REPORT_PATH = '/v2/report'
+
+/** Browser user agent used by the web-fingerprint report channel. */
+const WEB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
+  + ' Chrome/152.0.0.0 Safari/537.36'
 
 /** Model-catalog path used by the CN region. */
 const MODELS_CATALOG_PATH = '/v2/enterprises/personal/models'
@@ -483,6 +495,185 @@ export function selectCliModels(rawModels: unknown, agents: unknown): WorkBuddyU
   return models
 }
 
+
+/**
+ * Parse one growth task. The progress shape varies by task type: some entries
+ * carry a nested `progress: {current,target}` object and others flat
+ * `current`/`target` fields, so both are read and the nested one wins when it
+ * carries a real value.
+ */
+export function parseUpstreamTask(value: unknown): WorkBuddyTask | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const raw = value as Record<string, unknown>
+  const taskCode = typeof raw['task_code'] === 'string' ? raw['task_code'] : ''
+  if (taskCode === '') return undefined
+  const numberField = (source: Record<string, unknown>, key: string): number =>
+    typeof source[key] === 'number' ? source[key] as number : 0
+  let current = numberField(raw, 'current')
+  let target = numberField(raw, 'target')
+  const progress = raw['progress']
+  if (typeof progress === 'object' && progress !== null && !Array.isArray(progress)) {
+    const nested = progress as Record<string, unknown>
+    const nestedCurrent = numberField(nested, 'current')
+    const nestedTarget = numberField(nested, 'target')
+    if (nestedTarget > 0 || nestedCurrent > 0) {
+      current = nestedCurrent
+      target = nestedTarget
+    }
+  }
+  const acceptStatus = typeof raw['accept_status'] === 'string' ? raw['accept_status'] : undefined
+  const claimed = acceptStatus === 'claimed'
+  const text = (key: string): string | undefined =>
+    typeof raw[key] === 'string' && (raw[key] as string) !== '' ? raw[key] as string : undefined
+  const title = text('title')
+  const description = text('description')
+  const taskDesc = text('task_desc')
+  const taskType = text('task_type')
+  const tag = text('tag')
+  const jumpUrl = text('jump_url')
+  const status = text('status')
+  return {
+    taskCode,
+    ...title === undefined ? {} : { title },
+    ...description === undefined ? {} : { description },
+    ...taskDesc === undefined ? {} : { taskDesc },
+    credit: numberField(raw, 'reward_credit'),
+    energy: numberField(raw, 'reward_energy'),
+    hasReward: raw['has_reward'] === true,
+    ...taskType === undefined ? {} : { taskType },
+    ...tag === undefined ? {} : { tag },
+    ...jumpUrl === undefined ? {} : { jumpUrl },
+    locked: raw['locked'] === true,
+    target,
+    current,
+    ...acceptStatus === undefined ? {} : { acceptStatus },
+    ...status === undefined ? {} : { status },
+    claimable: !claimed && target > 0 && current >= target,
+    claimed,
+  }
+}
+
+/** One growth task as the upstream returns it, progress already normalized. */
+export interface WorkBuddyTask {
+  taskCode: string
+  title?: string
+  description?: string
+  taskDesc?: string
+  /** Reward in credits. */
+  credit: number
+  /** Reward in energy. */
+  energy: number
+  hasReward: boolean
+  taskType?: string
+  tag?: string
+  jumpUrl?: string
+  locked: boolean
+  target: number
+  current: number
+  acceptStatus?: string
+  status?: string
+  /** Progress reached and reward not taken (computed locally). */
+  claimable: boolean
+  /** Reward already taken (accept_status == "claimed"). */
+  claimed: boolean
+}
+
+/** A reward the gateway paid out. */
+export interface WorkBuddyTaskReward {
+  credit: number
+  energy: number
+  /** The gateway says this reward was taken before; no new credits. */
+  alreadyClaimed: boolean
+}
+
+/** A desktop-fingerprint event; the shared fingerprint is merged in on send. */
+export type WorkBuddyDesktopEvent = Record<string, unknown>
+
+/** The desktop fingerprint every report event carries. */
+function desktopFingerprint(credential: WorkBuddyCredential): Record<string, unknown> {
+  const now = Date.now()
+  const derive = (salt: string): string =>
+    createHash('sha256').update(salt + ':' + credential.uid).digest('hex').slice(0, 36)
+  return {
+    timezone: 'Asia/Shanghai',
+    reportDelay: 2000,
+    userId: credential.uid,
+    username: credential.nickname ?? '',
+    userNickname: credential.nickname ?? '',
+    product: 'SaaS',
+    releaseDate: 1789036585355,
+    commit: '5f9692923c93033111c51ad7b003eb80204a9b75',
+    ideName: 'WorkBuddy',
+    ideType: 'WorkBuddy',
+    ideVersion: '5.5.6',
+    machineId: derive('machine'),
+    sessionId: derive('session'),
+    extName: 'workbuddy-desktop',
+    extVersion: '5.5.6',
+    os: 'win32',
+    arch: 'x64',
+    osVersion: '10.0.26220',
+    cpuCores: 20,
+    memorySize: 24,
+    timestamp: now,
+    presentAt: now,
+  }
+}
+
+/**
+ * Build the full chat_request_send event the desktop client sends. The minimal
+ * three-field shape is NOT accepted: the gateway answers 200 and silently drops
+ * an event whose field set or userId does not match the client's, which would
+ * make a task look "reported but never scored".
+ */
+function chatRequestEvent(
+  credential: WorkBuddyCredential,
+  conversationId: string,
+  requestId: string,
+  modelId: string,
+  modelName: string,
+): Record<string, unknown> {
+  const now = Date.now()
+  return {
+    eventCode: 'chat_request_send',
+    timestamp: now,
+    reportDelay: 0,
+    mode: 'craft',
+    conversationId,
+    requestId,
+    inputLength: 12,
+    requestModelId: modelId,
+    requestModelName: modelName,
+    isPlan: false,
+    isAutoExecuteTerminal: false,
+    isAutoModify: false,
+    codebaseEnable: false,
+    maxToken: 0,
+    maxSteps: 0,
+    temperature: 0,
+    maxRetries: 0,
+    mentionContexts: [],
+    knowledgeId: [],
+    knowledgeName: [],
+    codebaseId: '',
+    mentionContextCount: 0,
+    command: '',
+    expertId: '',
+    recommendId: '',
+    skillId: '',
+    skillCount: 0,
+    totalCount: 0,
+    fileUri: '',
+    presentAt: now,
+    traceId: '',
+    rootRequestId: requestId,
+    parentConversationId: conversationId,
+    agentName: 'default',
+    agentType: 'conversation',
+    userId: credential.uid,
+  }
+}
+
 /**
  * Upstream HTTP client. One instance serves the whole plugin; requests take
  * the credential explicitly so token refreshes apply on the next call.
@@ -778,5 +969,168 @@ export class WorkBuddyUpstreamClient {
       expiringSoon,
       ...nearestExpiryMs === undefined ? {} : { nearestExpiryMs },
     }
+  }
+
+  /**
+   * Read the growth task list. This is the whole task surface: accept, claim,
+   * and every "did it score yet" read all key off it.
+   */
+  async listTasks(credential: WorkBuddyCredential, signal?: AbortSignal): Promise<WorkBuddyTask[]> {
+    const response = await fetch(chatBase(credential) + TASKS_LIST_PATH, {
+      headers: { ...billingHeaders(credential), 'Accept': 'application/json' },
+      signal: signal ?? AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const data = typeof envelope.data === 'object' && envelope.data !== null
+      ? envelope.data as Record<string, unknown>
+      : {}
+    const raw = Array.isArray(data['tasks']) ? data['tasks'] : []
+    const tasks: WorkBuddyTask[] = []
+    for (const entry of raw) {
+      const parsed = parseUpstreamTask(entry)
+      if (parsed !== undefined) tasks.push(parsed)
+    }
+    return tasks
+  }
+
+  /** Register for tasks (idempotent: an already-accepted task is not an error). */
+  async acceptTasks(credential: WorkBuddyCredential, taskCodes: readonly string[]): Promise<void> {
+    if (taskCodes.length === 0) return
+    const response = await fetch(chatBase(credential) + TASKS_ACCEPT_PATH, {
+      method: 'POST',
+      headers: { ...billingHeaders(credential), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ task_codes: [...taskCodes] }),
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+  }
+
+  /**
+   * Take one task's reward.
+   *
+   * The path matters and is NOT the CLI one: the reward endpoint lives on the
+   * WEB origin (`workbuddy.cn/activity/growth/tasks/<code>/claim`, task code in
+   * the path, `x-client-platform: web`). The CLI-shaped
+   * `copilot.tencent.com/v2/activity/growth/tasks/reward/claim` does not exist
+   * and answers "task not completed" for every task.
+   */
+  async claimTaskReward(credential: WorkBuddyCredential, taskCode: string): Promise<WorkBuddyTaskReward> {
+    const base = regionOf(credential.domain) === 'global' ? globalBase(credential.domain) : CN_WEB_BASE
+    const response = await fetch(base + '/activity/growth/tasks/' + encodeURIComponent(taskCode) + '/claim', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + credential.accessToken,
+        'Accept': 'application/json, text/plain, */*',
+        'Content-Type': 'application/json',
+        'Origin': base,
+        'Referer': base + '/profile/growth-center',
+        'x-client-platform': 'web',
+        ...credential.uid === '' ? {} : { 'X-User-Id': credential.uid },
+        ...credential.enterpriseId === undefined || credential.enterpriseId === ''
+          ? {}
+          : { 'X-Enterprise-Id': credential.enterpriseId, 'X-Tenant-Id': credential.enterpriseId },
+        ...credential.domain === '' ? {} : { 'X-Domain': credential.domain },
+      },
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
+    const data = typeof envelope.data === 'object' && envelope.data !== null
+      ? envelope.data as Record<string, unknown>
+      : {}
+    const numberField = (key: string): number => typeof data[key] === 'number' ? data[key] as number : 0
+    const alreadyClaimed = data['already_claimed'] === true
+    return alreadyClaimed
+      ? { credit: 0, energy: 0, alreadyClaimed: true }
+      : { credit: numberField('credit'), energy: numberField('energy'), alreadyClaimed: false }
+  }
+
+  /**
+   * Report one conversation-activity event (chat_request_send). This is what
+   * actually lights up most tasks — registering for a task produces no
+   * progress; the gateway scores behavior events.
+   */
+  async reportChatActivity(
+    credential: WorkBuddyCredential,
+    conversationId: string,
+    requestId: string,
+    model?: { id: string; name: string },
+  ): Promise<void> {
+    const event = chatRequestEvent(
+      credential,
+      conversationId,
+      requestId === '' ? conversationId : requestId,
+      model?.id ?? 'deepseek-v4-flash',
+      model?.name ?? 'DeepSeek V4 Flash',
+    )
+    await this.reportEvents(credential, CN_BILLING_BASE, [event], 'cli')
+  }
+
+  /** Report desktop-fingerprint events to the chat origin's /v2/report. */
+  async reportDesktopEvents(
+    credential: WorkBuddyCredential,
+    events: readonly WorkBuddyDesktopEvent[],
+  ): Promise<void> {
+    if (events.length === 0) return
+    const fingerprint = desktopFingerprint(credential)
+    const payload = events.map(event => ({ ...fingerprint, ...event }))
+    await this.reportEvents(credential, chatBase(credential), payload, 'desktop')
+  }
+
+  /** Report web-fingerprint events to the product's own origin. */
+  async reportWebEvents(
+    credential: WorkBuddyCredential,
+    events: readonly WorkBuddyDesktopEvent[],
+  ): Promise<void> {
+    if (events.length === 0) return
+    const base = regionOf(credential.domain) === 'global' ? globalBase(credential.domain) : CN_WEB_BASE
+    await this.reportEvents(credential, base, events, 'web')
+  }
+
+  /**
+   * POST one batch of events. The three channels differ only in origin and
+   * headers: the CLI/billing channel authenticates with the billing headers,
+   * the desktop one mimics the app, and the web one mimics the growth centre.
+   */
+  private async reportEvents(
+    credential: WorkBuddyCredential,
+    base: string,
+    events: readonly WorkBuddyDesktopEvent[],
+    channel: 'cli' | 'desktop' | 'web',
+  ): Promise<void> {
+    const headers: Record<string, string> = channel === 'cli'
+      ? { ...billingHeaders(credential), 'Content-Type': 'application/json' }
+      : channel === 'desktop'
+        ? {
+          'Authorization': 'Bearer ' + credential.accessToken,
+          'Accept': 'application/json, text/plain, */*',
+          'Content-Type': 'application/json;charset=UTF-8',
+          'User-Agent': DESKTOP_UA,
+          'X-Domain': base,
+          'X-Product': 'SaaS',
+          'X-Request-ID': createHash('sha256').update('req:' + credential.uid).digest('hex').slice(0, 36)
+            + String(Date.now() % 1_000_000),
+          ...credential.uid === '' ? {} : { 'X-User-Id': credential.uid },
+        }
+        : {
+          'Authorization': 'Bearer ' + credential.accessToken,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'x-client-platform': 'web',
+          'Origin': base,
+          'Referer': base + '/',
+          'User-Agent': WEB_UA,
+          ...credential.uid === '' ? {} : { 'X-User-Id': credential.uid },
+        }
+    const response = await fetch(base + REPORT_PATH, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(events),
+      signal: AbortSignal.timeout(JSON_TIMEOUT_MS),
+    })
+    const envelope = await readEnvelope(response)
+    if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope)
   }
 }

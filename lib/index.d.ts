@@ -624,6 +624,46 @@ declare function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | un
  */
 declare function selectCliModels(rawModels: unknown, agents: unknown): WorkBuddyUpstreamModel[];
 /**
+ * Parse one growth task. The progress shape varies by task type: some entries
+ * carry a nested `progress: {current,target}` object and others flat
+ * `current`/`target` fields, so both are read and the nested one wins when it
+ * carries a real value.
+ */
+declare function parseUpstreamTask(value: unknown): WorkBuddyTask | undefined;
+/** One growth task as the upstream returns it, progress already normalized. */
+interface WorkBuddyTask {
+  taskCode: string;
+  title?: string;
+  description?: string;
+  taskDesc?: string;
+  /** Reward in credits. */
+  credit: number;
+  /** Reward in energy. */
+  energy: number;
+  hasReward: boolean;
+  taskType?: string;
+  tag?: string;
+  jumpUrl?: string;
+  locked: boolean;
+  target: number;
+  current: number;
+  acceptStatus?: string;
+  status?: string;
+  /** Progress reached and reward not taken (computed locally). */
+  claimable: boolean;
+  /** Reward already taken (accept_status == "claimed"). */
+  claimed: boolean;
+}
+/** A reward the gateway paid out. */
+interface WorkBuddyTaskReward {
+  credit: number;
+  energy: number;
+  /** The gateway says this reward was taken before; no new credits. */
+  alreadyClaimed: boolean;
+}
+/** A desktop-fingerprint event; the shared fingerprint is merged in on send. */
+type WorkBuddyDesktopEvent = Record<string, unknown>;
+/**
  * Upstream HTTP client. One instance serves the whole plugin; requests take
  * the credential explicitly so token refreshes apply on the next call.
  */
@@ -668,6 +708,42 @@ declare class WorkBuddyUpstreamClient {
    * dates it needs.
    */
   fetchCredits(credential: WorkBuddyCredential): Promise<WorkBuddyCredits>;
+  /**
+   * Read the growth task list. This is the whole task surface: accept, claim,
+   * and every "did it score yet" read all key off it.
+   */
+  listTasks(credential: WorkBuddyCredential, signal?: AbortSignal): Promise<WorkBuddyTask[]>;
+  /** Register for tasks (idempotent: an already-accepted task is not an error). */
+  acceptTasks(credential: WorkBuddyCredential, taskCodes: readonly string[]): Promise<void>;
+  /**
+   * Take one task's reward.
+   *
+   * The path matters and is NOT the CLI one: the reward endpoint lives on the
+   * WEB origin (`workbuddy.cn/activity/growth/tasks/<code>/claim`, task code in
+   * the path, `x-client-platform: web`). The CLI-shaped
+   * `copilot.tencent.com/v2/activity/growth/tasks/reward/claim` does not exist
+   * and answers "task not completed" for every task.
+   */
+  claimTaskReward(credential: WorkBuddyCredential, taskCode: string): Promise<WorkBuddyTaskReward>;
+  /**
+   * Report one conversation-activity event (chat_request_send). This is what
+   * actually lights up most tasks — registering for a task produces no
+   * progress; the gateway scores behavior events.
+   */
+  reportChatActivity(credential: WorkBuddyCredential, conversationId: string, requestId: string, model?: {
+    id: string;
+    name: string;
+  }): Promise<void>;
+  /** Report desktop-fingerprint events to the chat origin's /v2/report. */
+  reportDesktopEvents(credential: WorkBuddyCredential, events: readonly WorkBuddyDesktopEvent[]): Promise<void>;
+  /** Report web-fingerprint events to the product's own origin. */
+  reportWebEvents(credential: WorkBuddyCredential, events: readonly WorkBuddyDesktopEvent[]): Promise<void>;
+  /**
+   * POST one batch of events. The three channels differ only in origin and
+   * headers: the CLI/billing channel authenticates with the billing headers,
+   * the desktop one mimics the app, and the web one mimics the growth centre.
+   */
+  private reportEvents;
 }
 //#endregion
 //#region src/pool.d.ts
@@ -916,6 +992,181 @@ declare class WorkBuddyAccountPool {
   dispose(): void;
   private startGc;
 }
+//#endregion
+//#region src/tasks.d.ts
+/** The subset of the upstream client the task engine uses. */
+type WorkBuddyTaskClient = Pick<WorkBuddyUpstreamClient, 'listTasks' | 'acceptTasks' | 'claimTaskReward' | 'reportChatActivity' | 'reportDesktopEvents' | 'reportWebEvents'>;
+/** How one action finished. */
+type WorkBuddyTaskOutcome = 'done' | 'skipped' | 'error' | 'unsupported';
+/** One action's result, as the card renders it. */
+interface WorkBuddyTaskResult {
+  taskCode: string;
+  /** What the action does, in the card's language. */
+  desc: string;
+  outcome: WorkBuddyTaskOutcome;
+  message: string;
+  /** Progress before and after, e.g. `0/5` → `5/5`. */
+  progressBefore?: string;
+  progressAfter?: string;
+  /** The reward this run collected, when it claimed one. */
+  credit?: number;
+  energy?: number;
+}
+/** What a run did, per account. */
+interface WorkBuddyTaskRunReport {
+  accountId: string;
+  accountName: string;
+  results: WorkBuddyTaskResult[];
+  /** Credits collected by this run. */
+  credit: number;
+  energy: number;
+  startedAtMs: number;
+  finishedAtMs: number;
+}
+/** One task plus what the engine can do about it. */
+interface WorkBuddyTaskView {
+  task: WorkBuddyTask;
+  /** Whether an automated action exists for this task code. */
+  automated: boolean;
+  /** Why it is not automated, when it is not. */
+  unsupportedReason?: string;
+}
+/** Replace the sleep implementation (tests only). */
+declare function setWorkBuddyTaskDelay(delay: (ms: number) => Promise<void>): void;
+/** Every task code this plugin can finish on its own. */
+declare function automatedTaskCodes(): readonly string[];
+/** Why a task cannot be automated, or undefined when it can. */
+declare function unsupportedReasonFor(taskCode: string): string | undefined;
+/** The engine's dependencies. */
+interface WorkBuddyTaskEngineOptions {
+  client: WorkBuddyTaskClient;
+  /** Live tasks for one account, annotated with what can be automated. */
+  list(credential: WorkBuddyCredential): Promise<WorkBuddyTask[]>;
+  /** Log one line; the host passes its own logger. */
+  log?(message: string): void;
+}
+/**
+ * The task engine: one run per account, actions in a fixed order, every action
+ * idempotent (an already-claimed or already-complete task is skipped before its
+ * behavior is reported, so a second run never burns a second request).
+ */
+declare class WorkBuddyTaskEngine {
+  private readonly options;
+  constructor(options: WorkBuddyTaskEngineOptions);
+  /** The task list, each entry annotated with whether it can be automated. */
+  view(credential: WorkBuddyCredential): Promise<WorkBuddyTaskView[]>;
+  /**
+   * Finish every automatable task for one account.
+   *
+   * Registration happens first and in one batch (the gateway has no documented
+   * limit on the array, so it is sent whole); it is not what produces progress,
+   * but it keeps the state machine regular. Then each action runs in order,
+   * re-reading the task list before and after so the report says what actually
+   * changed rather than what was merely requested.
+   */
+  run(credential: WorkBuddyCredential, options?: {
+    taskCodes?: readonly string[];
+    signal?: AbortSignal;
+  }): Promise<WorkBuddyTaskRunReport>;
+  /**
+   * Re-read one task until it is settled (claimable or claimed) or the bounded
+   * budget runs out. The gateway's scoring is asynchronous — a re-read right
+   * after a report still shows the old progress for several seconds.
+   */
+  private settled;
+}
+/** A task's progress as text, for the report and the card. */
+declare function progressText(task: WorkBuddyTask): string;
+/** The persisted daily-task configuration. */
+interface WorkBuddyTaskSchedule {
+  /** Run the daily sweep automatically. */
+  enabled: boolean;
+  /** Local hour (0–23) the daily sweep starts at. */
+  hour: number;
+  /** Local minute (0–59) the daily sweep starts at. */
+  minute: number;
+  /** Run one sweep shortly after the plugin starts. */
+  runOnStart: boolean;
+  /** Run only for accounts whose region matches. */
+  regions?: readonly WorkBuddyRegion[];
+}
+/** What the scheduler did last, for the card. */
+interface WorkBuddyTaskScheduleStatus {
+  /** Epoch ms of the next planned sweep. */
+  nextRunAtMs?: number;
+  /** Epoch ms of the last sweep that actually ran. */
+  lastRunAtMs?: number;
+  /** Reports of the last sweep, one per account. */
+  lastReports: readonly WorkBuddyTaskRunReport[];
+  /** Accounts the last sweep skipped, with why. */
+  lastSkipped: readonly {
+    accountName: string;
+    reason: string;
+  }[];
+  /** Whether a sweep is running right now. */
+  running: boolean;
+  /** Whether the plugin runs a startup sweep. */
+  runOnStart: boolean;
+  /** The configured daily time, as `HH:MM`. */
+  dailyAt: string;
+}
+/** The next occurrence of a local wall-clock time, strictly after `from`. */
+declare function nextDailyRunAt(hour: number, minute: number, from?: number): number;
+/** Constructor dependencies of the scheduler. */
+interface WorkBuddyTaskSchedulerOptions {
+  engine: WorkBuddyTaskEngine;
+  /** The accounts to sweep, with the region each belongs to. */
+  accounts(): Promise<readonly {
+    credential: WorkBuddyCredential;
+    region: WorkBuddyRegion;
+  }[]>;
+  /** Current configuration (re-read before every sweep). */
+  schedule(): WorkBuddyTaskSchedule;
+  /** Delay between two accounts' sweeps. */
+  accountGapMs?: number;
+  log?(message: string): void;
+  now?(): number;
+}
+/**
+ * Runs the task sweep on a daily wall-clock time and, optionally, once shortly
+ * after startup. Both triggers call the same serialized sweep, so a startup run
+ * that happens to land next to the daily one cannot run twice at once.
+ */
+declare class WorkBuddyTaskScheduler {
+  private readonly options;
+  private readonly now;
+  private timer;
+  private nextRunAtMs;
+  private lastRunAtMs;
+  private lastReports;
+  private lastSkipped;
+  /** Whether a sweep is running right now (reported to the card). */
+  private running;
+  /** The sweep in flight, so a second caller joins it instead of racing it. */
+  private inflight;
+  private disposed;
+  private startupTimer;
+  constructor(options: WorkBuddyTaskSchedulerOptions);
+  /** Arm the timers; safe to call again after a configuration change. */
+  start(): void;
+  /** Stop every timer; the scheduler cannot be restarted afterwards. */
+  dispose(): void;
+  /** What the card shows about the schedule. */
+  status(): WorkBuddyTaskScheduleStatus;
+  /** Run one sweep now (the card's button and the timers share this path). */
+  runNow(): Promise<WorkBuddyTaskRunReport[]>;
+  private armDaily;
+  /**
+   * One sweep over every eligible account. Accounts run one at a time: the
+   * upstream throttles behavior reports, and the sweep's own pacing (a gap
+   * between accounts) is what keeps a multi-account install from tripping it.
+   */
+  private sweep;
+  private runSweep;
+  private clearTimers;
+}
+/** The schedule in force when the user configured nothing. */
+declare const DEFAULT_WORKBUDDY_TASK_SCHEDULE: WorkBuddyTaskSchedule;
 //#endregion
 //#region src/catalog.d.ts
 /** One model entry the adapter exposes. */
@@ -1266,6 +1517,15 @@ interface WorkBuddyStatusRouteOptions {
    * case the two sign-in routes answer 503 instead of failing obscurely.
    */
   login?: WorkBuddyLoginManager;
+  /**
+   * The growth-task engine. Absent when the host did not wire it, in which case
+   * the two task routes answer 503.
+   */
+  tasks?: WorkBuddyTaskEngine;
+  /** The task schedule in force and what it last did. */
+  taskSchedule?(): WorkBuddyTaskScheduleStatus;
+  /** Run one task sweep right now, over every eligible account. */
+  runTaskSweep?(): Promise<void>;
 }
 /**
  * Assemble one region's card document: that region's locally discovered
@@ -1325,6 +1585,12 @@ interface Config {
   /** Explicit WorkBuddy desktop auth-file path, overriding env and platform defaults. */
   authFile?: string;
   /**
+   * The automatic growth-task sweep: finish every task this plugin can finish
+   * without the official client, once a day and (optionally) shortly after
+   * startup.
+   */
+  tasks?: WorkBuddyTaskSchedule;
+  /**
    * Per-region state, keyed `cn` | `global`. Each region's provider, pool,
    * catalog, and card tab read and write ONLY their own slot, so changing
    * anything on one side never touches the other.
@@ -1368,4 +1634,4 @@ declare function resolvePolicy(configured: Partial<WorkBuddyPoolTuning> | undefi
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { Config, DEFAULT_WORKBUDDY_POOL_POLICY, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, REGION_KEYS, type UpstreamErrorKind, WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, WORKBUDDY2API_ACCOUNT_PARAM, WORKBUDDY2API_CHECKIN_PATH, WORKBUDDY2API_CREDITS_REFRESH_PATH, WORKBUDDY2API_GLOBAL_PROVIDER, WORKBUDDY2API_HOST_HEARTBEAT_FILENAME, WORKBUDDY2API_LOGIN_POLL_PATH, WORKBUDDY2API_LOGIN_START_PATH, WORKBUDDY2API_MODELS_REFRESH_PATH, WORKBUDDY2API_POOL_ACTION_PATH, WORKBUDDY2API_PROVIDER, WORKBUDDY2API_PROVIDERS, WORKBUDDY2API_PROVIDER_DISPLAY_NAME, WORKBUDDY2API_PROVIDER_DISPLAY_NAMES, WORKBUDDY2API_REGIONS, WORKBUDDY2API_REGION_PARAM, WORKBUDDY2API_SETTINGS_NS, WORKBUDDY2API_STATE_PARAM, WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY2API_USAGE_PATH, WORKBUDDY2API_VERSION, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_LOGIN_TTL_MS, type WorkBuddyAccountChoice, WorkBuddyAccountPool, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCheckinClaim, type WorkBuddyCheckinStatus, type WorkBuddyContextBudget, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredentialStoreOptions, type WorkBuddyCreditPackage, type WorkBuddyCredits, type WorkBuddyDispatchOutcome, type WorkBuddyHostHeartbeat, type WorkBuddyLoginAccount, type WorkBuddyLoginEndpoints, WorkBuddyLoginManager, type WorkBuddyLoginManagerOptions, type WorkBuddyLoginPoll, type WorkBuddyLoginStart, WorkBuddyLoginUnknownStateError, type WorkBuddyModelInfo, WorkBuddyPersistedModel, type WorkBuddyPickResult, type WorkBuddyPoolAccount, type WorkBuddyPoolEntry, type WorkBuddyPoolMissReason, type WorkBuddyPoolPolicy, type WorkBuddyPoolState, type WorkBuddyPoolStateRecord, type WorkBuddyPoolTuning, type WorkBuddyReasoning, type WorkBuddyRefreshOutcome, type WorkBuddyRegion, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyWebAccount, type WorkBuddyWebAccountCredits, type WorkBuddyWebCheckin, type WorkBuddyWebCredits, type WorkBuddyWebLogin, type WorkBuddyWebModel, type WorkBuddyWebPackage, type WorkBuddyWebPoolEntry, type WorkBuddyWebPoolPolicy, type WorkBuddyWebPoolState, type WorkBuddyWebRegion, type WorkBuddyWebUsage, apply, applyContextBudgets, authFileName, classifyUpstreamError, clearHostHeartbeat, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, deriveCatalog, expiryToMs, fallbackModelsFor, inject, isFresher, isHeartbeatProcessAlive, loginEndpointsFor, name, nextDay4Am, parseCreditMultiplier, parseReasoning, parseUpstreamModel, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, readHostHeartbeat, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, registerWorkBuddy2ApiStatusRoute, resolvePolicy, selectCliModels, stickyKeyOf, toPersistedWorkBuddyModel, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, writeHostHeartbeat };
+export { Config, DEFAULT_WORKBUDDY_POOL_POLICY, DEFAULT_WORKBUDDY_TASK_SCHEDULE, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, REGION_KEYS, type UpstreamErrorKind, WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, WORKBUDDY2API_ACCOUNT_PARAM, WORKBUDDY2API_CHECKIN_PATH, WORKBUDDY2API_CREDITS_REFRESH_PATH, WORKBUDDY2API_GLOBAL_PROVIDER, WORKBUDDY2API_HOST_HEARTBEAT_FILENAME, WORKBUDDY2API_LOGIN_POLL_PATH, WORKBUDDY2API_LOGIN_START_PATH, WORKBUDDY2API_MODELS_REFRESH_PATH, WORKBUDDY2API_POOL_ACTION_PATH, WORKBUDDY2API_PROVIDER, WORKBUDDY2API_PROVIDERS, WORKBUDDY2API_PROVIDER_DISPLAY_NAME, WORKBUDDY2API_PROVIDER_DISPLAY_NAMES, WORKBUDDY2API_REGIONS, WORKBUDDY2API_REGION_PARAM, WORKBUDDY2API_SETTINGS_NS, WORKBUDDY2API_STATE_PARAM, WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY2API_USAGE_PATH, WORKBUDDY2API_VERSION, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_LOGIN_TTL_MS, type WorkBuddyAccountChoice, WorkBuddyAccountPool, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCheckinClaim, type WorkBuddyCheckinStatus, type WorkBuddyContextBudget, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredentialStoreOptions, type WorkBuddyCreditPackage, type WorkBuddyCredits, type WorkBuddyDesktopEvent, type WorkBuddyDispatchOutcome, type WorkBuddyHostHeartbeat, type WorkBuddyLoginAccount, type WorkBuddyLoginEndpoints, WorkBuddyLoginManager, type WorkBuddyLoginManagerOptions, type WorkBuddyLoginPoll, type WorkBuddyLoginStart, WorkBuddyLoginUnknownStateError, type WorkBuddyModelInfo, WorkBuddyPersistedModel, type WorkBuddyPickResult, type WorkBuddyPoolAccount, type WorkBuddyPoolEntry, type WorkBuddyPoolMissReason, type WorkBuddyPoolPolicy, type WorkBuddyPoolState, type WorkBuddyPoolStateRecord, type WorkBuddyPoolTuning, type WorkBuddyReasoning, type WorkBuddyRefreshOutcome, type WorkBuddyRegion, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, type WorkBuddyTask, type WorkBuddyTaskClient, WorkBuddyTaskEngine, type WorkBuddyTaskOutcome, type WorkBuddyTaskResult, type WorkBuddyTaskReward, type WorkBuddyTaskRunReport, type WorkBuddyTaskSchedule, type WorkBuddyTaskScheduleStatus, WorkBuddyTaskScheduler, type WorkBuddyTaskView, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyWebAccount, type WorkBuddyWebAccountCredits, type WorkBuddyWebCheckin, type WorkBuddyWebCredits, type WorkBuddyWebLogin, type WorkBuddyWebModel, type WorkBuddyWebPackage, type WorkBuddyWebPoolEntry, type WorkBuddyWebPoolPolicy, type WorkBuddyWebPoolState, type WorkBuddyWebRegion, type WorkBuddyWebUsage, apply, applyContextBudgets, authFileName, automatedTaskCodes, classifyUpstreamError, clearHostHeartbeat, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, deriveCatalog, expiryToMs, fallbackModelsFor, inject, isFresher, isHeartbeatProcessAlive, loginEndpointsFor, name, nextDailyRunAt, nextDay4Am, parseCreditMultiplier, parseReasoning, parseUpstreamModel, parseUpstreamTask, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, progressText, readHostHeartbeat, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, registerWorkBuddy2ApiStatusRoute, resolvePolicy, selectCliModels, setWorkBuddyTaskDelay, stickyKeyOf, toPersistedWorkBuddyModel, unsupportedReasonFor, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, writeHostHeartbeat };

@@ -27,6 +27,7 @@ import type { WorkBuddyCredentialStore } from './auth.ts'
 import type { WorkBuddyModelInfo } from './catalog.ts'
 import type { WorkBuddyAccountPool, WorkBuddyPoolTuning } from './pool.ts'
 import type { WorkBuddyCredits, WorkBuddyRegion, WorkBuddyUpstreamClient } from './upstream.ts'
+import { regionOf as regionOfDomain } from './upstream.ts'
 import {
   regionOfStatusUrl,
   WORKBUDDY2API_ACCOUNTS_REFRESH_PATH,
@@ -38,6 +39,8 @@ import {
   WORKBUDDY2API_MODELS_REFRESH_PATH,
   WORKBUDDY2API_POOL_ACTION_PATH,
   WORKBUDDY2API_STATE_PARAM,
+  WORKBUDDY2API_TASKS_PATH,
+  WORKBUDDY2API_TASKS_RUN_PATH,
   WORKBUDDY2API_USAGE_PATH,
 } from './status-paths.ts'
 import type {
@@ -48,10 +51,15 @@ import type {
   WorkBuddyWebLogin,
   WorkBuddyWebModel,
   WorkBuddyWebPoolState,
+  WorkBuddyWebTask,
+  WorkBuddyWebTaskSchedule,
+  WorkBuddyWebTasks,
   WorkBuddyWebUsage,
 } from './status-paths.ts'
 import { WorkBuddyLoginUnknownStateError } from './login.ts'
 import type { WorkBuddyLoginManager } from './login.ts'
+import type { WorkBuddyTaskEngine, WorkBuddyTaskScheduleStatus, WorkBuddyTaskView } from './tasks.ts'
+import { progressText } from './tasks.ts'
 
 export {
   WORKBUDDY2API_ACCOUNTS_REFRESH_PATH,
@@ -63,6 +71,8 @@ export {
   WORKBUDDY2API_MODELS_REFRESH_PATH,
   WORKBUDDY2API_POOL_ACTION_PATH,
   WORKBUDDY2API_STATE_PARAM,
+  WORKBUDDY2API_TASKS_PATH,
+  WORKBUDDY2API_TASKS_RUN_PATH,
   WORKBUDDY2API_USAGE_PATH,
 }
 export type { WorkBuddyWebUsage }
@@ -100,6 +110,15 @@ export interface WorkBuddyStatusRouteOptions {
    * case the two sign-in routes answer 503 instead of failing obscurely.
    */
   login?: WorkBuddyLoginManager
+  /**
+   * The growth-task engine. Absent when the host did not wire it, in which case
+   * the two task routes answer 503.
+   */
+  tasks?: WorkBuddyTaskEngine
+  /** The task schedule in force and what it last did. */
+  taskSchedule?(): WorkBuddyTaskScheduleStatus
+  /** Run one task sweep right now, over every eligible account. */
+  runTaskSweep?(): Promise<void>
 }
 
 /** Redact token-like content before it crosses to the browser. */
@@ -142,6 +161,29 @@ function toCredits(answer: WorkBuddyCredits): WorkBuddyWebCredits {
     })),
     expiringSoon: answer.expiringSoon,
     ...answer.nearestExpiryMs === undefined ? {} : { nearestExpiryMs: answer.nearestExpiryMs },
+  }
+}
+
+/**
+ * One task, projected for the card. The title falls back through the upstream's
+ * three text fields because which one is populated varies by task type.
+ */
+function toWebTask(view: WorkBuddyTaskView): WorkBuddyWebTask {
+  const { task } = view
+  return {
+    taskCode: task.taskCode,
+    title: task.title ?? task.taskDesc ?? task.taskCode,
+    detail: task.taskDesc ?? task.description ?? '',
+    current: task.current,
+    target: task.target,
+    credit: task.credit,
+    energy: task.energy,
+    locked: task.locked,
+    claimable: task.claimable,
+    claimed: task.claimed,
+    ...task.acceptStatus === undefined ? {} : { acceptStatus: task.acceptStatus },
+    automated: view.automated,
+    ...view.unsupportedReason === undefined ? {} : { unsupportedReason: view.unsupportedReason },
   }
 }
 
@@ -428,6 +470,122 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
       },
     })
 
+    /** One account's growth tasks, annotated with what this plugin can finish. */
+    const taskDocument = async (
+      region: WorkBuddyRegion,
+      accountId: string,
+      engine: WorkBuddyTaskEngine,
+    ): Promise<WorkBuddyWebTasks> => {
+      const credential = await deps.store(region).resolve(accountId)
+      const accountName = credential.nickname ?? credential.uin ?? credential.uid
+      // The international gateway has no growth-task system: the call would
+      // only 404, so the card is told up front instead of showing an error.
+      if (credential.domain !== '' && regionOfDomain(credential.domain) !== 'cn') {
+        return { accountId, accountName, supported: false, tasks: [] }
+      }
+      try {
+        const views = await engine.view(credential)
+        return { accountId, accountName, supported: true, tasks: views.map(toWebTask) }
+      } catch (error: unknown) {
+        return { accountId, accountName, supported: true, tasks: [], error: safeMessage(error) }
+      }
+    }
+
+    const disposeTasks = ctx.webServer.register({
+      kind: 'exact',
+      path: WORKBUDDY2API_TASKS_PATH,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (!guard(req, res, 'GET')) return
+        const region = requestRegion(req, res)
+        if (region === undefined) return
+        const engine = deps.tasks
+        if (engine === undefined) {
+          json(res, 503, { error: 'task engine unavailable' })
+          return
+        }
+        try {
+          const accountId = requestAccountId(req)
+          if (accountId !== undefined) {
+            json(res, 200, await taskDocument(region, accountId, engine))
+            return
+          }
+          const accounts = await accountsOf(deps, region)
+          json(res, 200, {
+            region,
+            schedule: deps.taskSchedule?.() ?? null,
+            accounts: await Promise.all(accounts.map(entry => taskDocument(region, entry.id, engine))),
+          })
+        } catch (error: unknown) {
+          json(res, 500, { error: safeMessage(error) })
+        }
+      },
+    })
+
+    /**
+     * Run the tasks. Without an `accountId` this is the one-click "finish
+     * everything" for the requested region; with one it is that account only.
+     * Either way the work is serialized per region by the engine's own pacing.
+     */
+    const disposeTasksRun = ctx.webServer.register({
+      kind: 'exact',
+      path: WORKBUDDY2API_TASKS_RUN_PATH,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        if (!guard(req, res, 'POST')) return
+        const region = requestRegion(req, res)
+        if (region === undefined) return
+        const engine = deps.tasks
+        if (engine === undefined) {
+          json(res, 503, { error: 'task engine unavailable' })
+          return
+        }
+        try {
+          const body = await readJsonBody(req)
+          const named = typeof body['accountId'] === 'string' && body['accountId'] !== ''
+            ? body['accountId']
+            : undefined
+          const codes = Array.isArray(body['taskCodes'])
+            ? body['taskCodes'].filter((code): code is string => typeof code === 'string')
+            : undefined
+          const accounts = await accountsOf(deps, region)
+          const wanted = named === undefined ? accounts : accounts.filter(entry => entry.id === named)
+          if (named !== undefined && wanted.length === 0) {
+            json(res, 404, { error: 'account not found' })
+            return
+          }
+          const reports = []
+          for (const entry of wanted) {
+            const credential = await deps.store(region).resolve(entry.id)
+            if (credential.domain !== '' && regionOfDomain(credential.domain) !== 'cn') {
+              reports.push({
+                accountId: entry.id,
+                accountName: entry.accountName,
+                credit: 0,
+                energy: 0,
+                finishedAtMs: Date.now(),
+                results: [{
+                  taskCode: '(任务体系)',
+                  desc: '国际版没有任务体系',
+                  outcome: 'unsupported' as const,
+                  message: '该账号属于国际版，上游没有 growth 任务接口',
+                }],
+              })
+              continue
+            }
+            reports.push(await engine.run(credential, codes === undefined ? {} : { taskCodes: codes }))
+          }
+          json(res, 200, {
+            region,
+            reports,
+            schedule: deps.taskSchedule?.() ?? null,
+            accounts: await Promise.all((await accountsOf(deps, region))
+              .map(entry => taskDocument(region, entry.id, engine))),
+          })
+        } catch (error: unknown) {
+          json(res, 500, { error: safeMessage(error) })
+        }
+      },
+    })
+
     /**
      * Start a browser sign-in. The authorization URL is returned to the page,
      * which opens it; the token bundle never crosses this route in either
@@ -556,6 +714,8 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
     })
 
     return () => {
+      disposeTasksRun()
+      disposeTasks()
       disposeLoginPoll()
       disposeLoginStart()
       disposePool()
