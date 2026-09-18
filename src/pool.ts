@@ -81,6 +81,11 @@ export interface WorkBuddyPoolEntry {
   creditsAtMs?: number
   /** Credits expiring inside the configured window (default 7 days). */
   creditsExpiringSoon?: number
+  /**
+   * The allowance `credits` is measured against, for the card's
+   * remaining-share ring. 0 means the upstream reported no sizes.
+   */
+  creditsCapacity?: number
   /** Whether the account still has a local credential file. */
   present: boolean
   tokenExpiresAtMs: number
@@ -160,6 +165,7 @@ interface EntryState {
   lastError: string
   credits: number | undefined
   creditsExpiring: number
+  creditsCapacity: number
   creditsAtMs: number
 }
 
@@ -334,6 +340,7 @@ export class WorkBuddyAccountPool {
       lastError: '',
       credits: undefined,
       creditsExpiring: 0,
+      creditsCapacity: 0,
       creditsAtMs: 0,
     }
   }
@@ -417,6 +424,7 @@ export class WorkBuddyAccountPool {
       ...entry.credits === undefined ? {} : { credits: entry.credits },
       ...entry.creditsAtMs === 0 ? {} : { creditsAtMs: entry.creditsAtMs },
       ...entry.creditsExpiring === 0 ? {} : { creditsExpiringSoon: entry.creditsExpiring },
+      ...entry.creditsCapacity === 0 ? {} : { creditsCapacity: entry.creditsCapacity },
       present: entry.present,
       tokenExpiresAtMs: entry.tokenExpiresAtMs,
     }
@@ -729,11 +737,14 @@ export class WorkBuddyAccountPool {
   }
 
   /** Cache the credits the card or the CLI read for one account. */
-  setCredits(accountId: string, credits: { total: number; expiringSoon: number }): void {
+  setCredits(accountId: string, credits: { total: number; expiringSoon: number; capacity?: number }): void {
     const entry = this.entries.get(accountId)
     if (entry === undefined) return
     entry.credits = credits.total
     entry.creditsExpiring = credits.expiringSoon
+    // A cache entry that does not know the allowance keeps the one it had: the
+    // card's ring would otherwise collapse to "unknown" on every refresh.
+    if (credits.capacity !== undefined) entry.creditsCapacity = credits.capacity
     entry.creditsAtMs = this.now()
   }
 

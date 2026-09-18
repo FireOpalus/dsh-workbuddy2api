@@ -151,6 +151,7 @@ function loopbackOrigin(req: IncomingMessage): boolean {
 function toCredits(answer: WorkBuddyCredits): WorkBuddyWebCredits {
   return {
     total: answer.total,
+    capacity: answer.capacity,
     packages: answer.packages.map(pack => ({
       packageName: pack.packageName,
       remain: pack.remain,
@@ -292,7 +293,15 @@ export async function workBuddyWebStatus(
   const credits: WorkBuddyWebAccountCredits[] = entries.map(entry => ({
     accountId: entry.accountId,
     ...entry.credits === undefined ? {} : {
-      credits: { total: entry.credits, packages: [], expiringSoon: entry.creditsExpiringSoon ?? 0 },
+      credits: {
+        total: entry.credits,
+        // The pool caches the total, the soon-expiring slice, and (since the
+        // card's ring landed) the allowance; the package breakdown only arrives
+        // with an explicit credit refresh.
+        capacity: entry.creditsCapacity ?? 0,
+        packages: [],
+        expiringSoon: entry.creditsExpiringSoon ?? 0,
+      },
     },
   }))
   return {

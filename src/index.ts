@@ -592,7 +592,11 @@ export function apply(ctx: Context, config: Config): void {
       try {
         const credits = await client.fetchCredits(credential)
         const accountId = workbuddyAccountId(credential)
-        stacks[region].pool.setCredits(accountId, { total: credits.total, expiringSoon: credits.expiringSoon })
+        stacks[region].pool.setCredits(accountId, {
+          total: credits.total,
+          expiringSoon: credits.expiringSoon,
+          capacity: credits.capacity,
+        })
         // Today's check-in is a separate endpoint and never fatal: the account
         // is already signed in and usable either way.
         try {
@@ -672,7 +676,11 @@ export function apply(ctx: Context, config: Config): void {
     refreshCredits: async (region, accountId) => {
       const credential = await stacks[region].store.resolve(accountId)
       const credits = await client.fetchCredits(credential)
-      stacks[region].pool.setCredits(accountId, { total: credits.total, expiringSoon: credits.expiringSoon })
+      stacks[region].pool.setCredits(accountId, {
+        total: credits.total,
+        expiringSoon: credits.expiringSoon,
+        capacity: credits.capacity,
+      })
       return credits
     },
     login,

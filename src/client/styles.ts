@@ -58,6 +58,8 @@ export const WORKBUDDY2API_CARD_CSS = `
 .dsm-wb2api-badge-disabled,.dsm-wb2api-badge-missing{color:var(--dsw-alias-label-tertiary,#999);background:rgba(174,179,187,.1);border-color:rgba(174,179,187,.28)}
 .dsm-wb2api-account-spacer{flex:1;min-width:0}
 .dsm-wb2api-account-meta{display:flex;align-items:center;gap:7px 12px;flex-wrap:wrap;color:var(--dsw-alias-label-tertiary,#999);font-size:11px;line-height:16px}
+.dsm-wb2api-credits{display:inline-flex;align-items:center;gap:5px}
+.dsm-wb2api-ring{flex:none;display:block}
 .dsm-wb2api-account-controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .dsm-wb2api-switch{display:inline-flex;align-items:center;gap:5px;cursor:pointer;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:11px;line-height:16px}
 .dsm-wb2api-switch input{margin:0;accent-color:var(--dsw-alias-brand-primary,#5686fe)}

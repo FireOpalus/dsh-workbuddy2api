@@ -198,6 +198,43 @@ function stateKeyOf(state: WorkBuddyWebPoolEntry['state']): WorkBuddySettingsKey
   }
 }
 
+/**
+ * A small ring showing how much of an account's granted credit allowance is
+ * left. One stroked circle with a dash offset; the geometry is in viewBox units
+ * so the icon scales with the surrounding text.
+ */
+function CreditRing({ ratio, title }: { ratio: number | undefined; title: string }): ReturnType<typeof h> {
+  const radius = 6
+  const circumference = 2 * Math.PI * radius
+  const share = ratio === undefined ? 0 : Math.min(Math.max(ratio, 0), 1)
+  return (
+    <svg
+      className="dsm-wb2api-ring"
+      viewBox="0 0 16 16"
+      width="14"
+      height="14"
+      role="img"
+      aria-label={title}
+    >
+      <title>{title}</title>
+      <circle cx="8" cy="8" r={radius} fill="none" stroke="var(--dsw-alias-border-l2,#3a3d45)" strokeWidth="3" />
+      {ratio === undefined
+        ? null
+        : <circle
+            cx="8"
+            cy="8"
+            r={radius}
+            fill="none"
+            stroke={share >= 0.5 ? '#22a06b' : share >= 0.2 ? '#c98a2b' : '#d92d20'}
+            strokeWidth="3"
+            strokeLinecap="round"
+            strokeDasharray={String(circumference * share) + ' ' + String(circumference)}
+            transform="rotate(-90 8 8)"
+          />}
+    </svg>
+  )
+}
+
 /** The empty placeholder each tab starts from. */
 function emptyUsage(region: WorkBuddyWebRegion): WorkBuddyWebUsage {
   return { status: 'empty', region, accounts: [], pool: [] }
@@ -249,6 +286,8 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   /** Per-region growth tasks, loaded on demand (never on the 60s poll). */
   const [tasksByRegion, setTasksByRegion] = useState<Partial<Record<WorkBuddyWebRegion, WorkBuddyTaskState>>>({})
   const [tasksBusy, setTasksBusy] = useState(false)
+  /** The account a task run is currently sweeping, when it is one account. */
+  const [tasksBusyAccount, setTasksBusyAccount] = useState<string | undefined>(undefined)
   const [taskDraft, setTaskDraft] = useState<Partial<Record<WorkBuddyWebRegion, WorkBuddyWebTaskSchedule>>>({})
   const mounted = useRef(true)
   /**
@@ -455,6 +494,7 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
   /** Run the tasks: this account's, or every account in the region. */
   const runTasks = async (accountId?: string): Promise<void> => {
     setTasksBusy(true)
+    setTasksBusyAccount(accountId)
     setActionError(undefined)
     try {
       const response = await fetch(withWorkBuddyRegion(WORKBUDDY2API_TASKS_RUN_PATH, activeRegion), {
@@ -481,7 +521,10 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
     } catch (error: unknown) {
       if (mounted.current) setActionError(error instanceof Error ? error.message : t('row.requestFailed'))
     } finally {
-      if (mounted.current) setTasksBusy(false)
+      if (mounted.current) {
+        setTasksBusy(false)
+        setTasksBusyAccount(undefined)
+      }
     }
   }
 
@@ -975,6 +1018,20 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                         const enabled = edited?.enabled ?? entry.enabled
                         const weight = edited?.weight ?? entry.weight
                         const credit = creditsByAccount.get(entry.accountId)
+                        // Remaining share of everything the account was granted.
+                        // Unknown when the upstream reported no package sizes, or
+                        // when the allowance itself cannot cover the total
+                        // (a top-up the catalogue did not describe) — the ring
+                        // must not claim a share it cannot compute.
+                        const capacity = credit?.credits?.capacity ?? 0
+                        const total = credit?.credits?.total
+                        const ratio = total === undefined || capacity <= 0 || total > capacity
+                          ? undefined
+                          : total / capacity
+                        const percent = ratio === undefined ? 0 : Math.round(ratio * 100)
+                        const ringTitle = ratio === undefined
+                          ? t('row.creditsRatioUnknown')
+                          : t('row.creditsRatio', { percent })
                         return (
                           <div className="dsm-wb2api-account" key={entry.accountId}>
                             <div className="dsm-wb2api-account-head">
@@ -1028,15 +1085,18 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                               {entry.degradedUntil === undefined
                                 ? null
                                 : <span>{t('row.accountDegradedUntil', { at: formatDateTime(entry.degradedUntil) })}</span>}
-                              <span>
+                              <span className="dsm-wb2api-credits">
                                 {credit?.credits === undefined
                                   ? t('row.accountCreditsUnknown')
-                                  : credit.credits.expiringSoon > 0
-                                    ? t('row.accountCreditsExpiring', {
-                                      credits: formatNumber(credit.credits.total),
-                                      soon: formatNumber(credit.credits.expiringSoon),
-                                    })
-                                    : t('row.accountCredits', { credits: formatNumber(credit.credits.total) })}
+                                  : <>
+                                      <CreditRing ratio={ratio} title={ringTitle} />
+                                      {credit.credits.expiringSoon > 0
+                                        ? t('row.accountCreditsExpiring', {
+                                          credits: formatNumber(credit.credits.total),
+                                          soon: formatNumber(credit.credits.expiringSoon),
+                                        })
+                                        : t('row.accountCredits', { credits: formatNumber(credit.credits.total) })}
+                                    </>}
                               </span>
                               <button
                                 type="button"
@@ -1045,6 +1105,16 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                                 onClick={() => { void claimCheckin(entry.accountId) }}
                               >
                                 {checkingIn === entry.accountId ? t('row.checkinClaiming') : t('row.checkinClaim')}
+                              </button>
+                              <button
+                                type="button"
+                                className="dsm-btn dsm-btn-outline"
+                                disabled={tasksBusy}
+                                onClick={() => { void runTasks(entry.accountId) }}
+                              >
+                                {tasksBusyAccount === entry.accountId
+                                  ? t('row.taskRunAccountBusy')
+                                  : t('row.taskRunAccount')}
                               </button>
                             </div>
                             {credit?.creditsError === undefined

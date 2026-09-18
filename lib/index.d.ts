@@ -85,6 +85,11 @@ interface WorkBuddyWebCreditPackage {
 /** Aggregated credit answer rendered by the plugin card. */
 interface WorkBuddyWebCredits {
   total: number;
+  /**
+   * The allowance `total` is measured against, for the card's remaining-share
+   * ring. 0 means "unknown", never "empty".
+   */
+  capacity: number;
   packages: readonly WorkBuddyWebCreditPackage[];
   /** Credits expiring within 3 days across every package. */
   expiringSoon: number;
@@ -169,6 +174,8 @@ interface WorkBuddyWebPoolEntry {
   credits?: number;
   creditsAtMs?: number;
   creditsExpiringSoon?: number;
+  /** The allowance `credits` is measured against; 0 means "unknown". */
+  creditsCapacity?: number;
   present: boolean;
   tokenExpiresAtMs: number;
 }
@@ -551,6 +558,15 @@ interface WorkBuddyCreditPackage {
 /** Aggregated credit answer for one credential. */
 interface WorkBuddyCredits {
   total: number;
+  /**
+   * The allowance every counted package adds up to — the denominator of
+   * "how much is left". A monthly package contributes its per-cycle capacity
+   * and a one-off gift its original size, so the ratio means "remaining share
+   * of everything this account was granted". 0 means the upstream did not
+   * report any sizes, and callers must treat the ratio as unknown rather than
+   * as "nothing left".
+   */
+  capacity: number;
   packages: readonly WorkBuddyCreditPackage[];
   /** Credits expiring within 3 days across every package. */
   expiringSoon: number;
@@ -794,6 +810,11 @@ interface WorkBuddyPoolEntry {
   creditsAtMs?: number;
   /** Credits expiring inside the configured window (default 7 days). */
   creditsExpiringSoon?: number;
+  /**
+   * The allowance `credits` is measured against, for the card's
+   * remaining-share ring. 0 means the upstream reported no sizes.
+   */
+  creditsCapacity?: number;
   /** Whether the account still has a local credential file. */
   present: boolean;
   tokenExpiresAtMs: number;
@@ -974,6 +995,7 @@ declare class WorkBuddyAccountPool {
   setCredits(accountId: string, credits: {
     total: number;
     expiringSoon: number;
+    capacity?: number;
   }): void;
   /** Apply the card's per-account switches and weights. */
   configure(updates: readonly {

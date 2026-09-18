@@ -101,6 +101,11 @@ export interface WorkBuddyWebCreditPackage {
 /** Aggregated credit answer rendered by the plugin card. */
 export interface WorkBuddyWebCredits {
   total: number
+  /**
+   * The allowance `total` is measured against, for the card's remaining-share
+   * ring. 0 means "unknown", never "empty".
+   */
+  capacity: number
   packages: readonly WorkBuddyWebCreditPackage[]
   /** Credits expiring within 3 days across every package. */
   expiringSoon: number
@@ -195,6 +200,8 @@ export interface WorkBuddyWebPoolEntry {
   credits?: number
   creditsAtMs?: number
   creditsExpiringSoon?: number
+  /** The allowance `credits` is measured against; 0 means "unknown". */
+  creditsCapacity?: number
   present: boolean
   tokenExpiresAtMs: number
 }

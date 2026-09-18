@@ -80,6 +80,15 @@ export interface WorkBuddyCreditPackage {
 /** Aggregated credit answer for one credential. */
 export interface WorkBuddyCredits {
   total: number
+  /**
+   * The allowance every counted package adds up to — the denominator of
+   * "how much is left". A monthly package contributes its per-cycle capacity
+   * and a one-off gift its original size, so the ratio means "remaining share
+   * of everything this account was granted". 0 means the upstream did not
+   * report any sizes, and callers must treat the ratio as unknown rather than
+   * as "nothing left".
+   */
+  capacity: number
   packages: readonly WorkBuddyCreditPackage[]
   /** Credits expiring within 3 days across every package. */
   expiringSoon: number
@@ -930,6 +939,7 @@ export class WorkBuddyUpstreamClient {
       return undefined
     }
     const packages: WorkBuddyCreditPackage[] = []
+    let capacity = 0
     for (const raw of rawAccounts) {
       if (typeof raw !== 'object' || raw === null) continue
       const account = raw as Record<string, unknown>
@@ -949,6 +959,8 @@ export class WorkBuddyUpstreamClient {
         continue
       }
       total += cappedRemain
+      // Only packages that count toward the total contribute to the allowance.
+      capacity += size
       const expiryMs = expiresAtMs
       if (expiryMs !== undefined) {
         if (nearestExpiryMs === undefined || expiryMs < nearestExpiryMs) nearestExpiryMs = expiryMs
@@ -965,6 +977,7 @@ export class WorkBuddyUpstreamClient {
     }
     return {
       total,
+      capacity,
       packages,
       expiringSoon,
       ...nearestExpiryMs === undefined ? {} : { nearestExpiryMs },
