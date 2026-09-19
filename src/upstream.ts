@@ -33,6 +33,12 @@ export type WorkBuddyRegion = 'cn' | 'global'
 export type UpstreamErrorKind =
   | 'hard_credit'
   | 'soft_rate'
+  /** 429 + code 6004: the MODEL is rate-limited, not the account. */
+  | 'model_rate'
+  /** 11102 "service info not found": this backend has no such model at all. */
+  | 'model_blocked'
+  /** 403 with no business envelope: the gateway's WAF answered, not the API. */
+  | 'waf_block'
   | 'session_dead'
   | 'not_found'
   | 'server'
@@ -128,7 +134,16 @@ export interface WorkBuddyRefreshOutcome {
 /** Chat answer: either a live SSE response or a classified failure. */
 export type WorkBuddyChatResult =
   | { ok: true; response: Response }
-  | { ok: false; status: number; kind: UpstreamErrorKind; message: string }
+  | {
+    ok: false
+    status: number
+    kind: UpstreamErrorKind
+    message: string
+    /** The upstream's own reset moment, when the body named one. */
+    resetAtMs?: number
+    /** A wait the upstream stated in a response header, when it sent one. */
+    retryAfterMs?: number
+  }
 
 const CN_CHAT_BASE = 'https://copilot.tencent.com'
 const CN_BILLING_BASE = 'https://www.codebuddy.cn'
@@ -172,19 +187,198 @@ const HARD_CREDIT_MARKERS: readonly string[] = [
 /** Session-invalidation markers that mean "sign in again in the WorkBuddy app". */
 const SESSION_DEAD_MARKERS: readonly string[] = ['Offline user session not found', '12153']
 
-/** Classify an upstream failure from its HTTP status and body excerpt. */
+/**
+ * Rate-limit wording that can arrive on a status OTHER than 429.
+ *
+ * Without these, a gateway that answers 200 or 400 with "usage limit reached"
+ * would fall through to the generic client case: the account would keep being
+ * picked and keep failing, instead of cooling down for a bounded while.
+ */
+const SOFT_RATE_MARKERS: readonly string[] = [
+  'rate limit', 'rate-limiting', 'rate-limited', 'too many requests', 'too many',
+  // Usage throttling, not billing exhaustion: reaching this before the credit
+  // markers is what keeps a rate-limited body from parking an account until 04:00.
+  'usage limit',
+  '请求过于频繁', '限流',
+]
+
+/** The business code meaning "this MODEL's usage is over its limit". */
+const MODEL_RATE_LIMIT_CODE = '6004'
+
+/** The business code meaning "this backend has no such model at all". */
+const MODEL_BLOCKED_CODE = '11102'
+
+/** The narrow phrase 11102 answers with; never a broad "model ... not found". */
+const MODEL_BLOCKED_PHRASE = 'service info not found'
+
+/**
+ * Whether a 429 body names the MODEL as the limited resource (code 6004).
+ *
+ * The distinction decides who gets punished: an account-level limit parks the
+ * whole account, while a model-level one means the account is FINE and only that
+ * model is unavailable — switching models is enough, and parking the account
+ * would take a healthy credential out of service for hours.
+ */
+export function isModelRateLimit(body: string): boolean {
+  // Tolerant of `"code":6004`, `"code": 6004` and `"code":"6004"`.
+  return /"code"\s*:\s*"?6004"?/u.test(body)
+}
+
+/**
+ * Whether the backend answered "this model does not exist here" (11102).
+ *
+ * Read the code/message as FIELDS, never as a substring of the whole document:
+ * an error body also carries requestId and other values, so matching the raw
+ * text could hit "11102" inside an id and avoid a model that works.
+ */
+export function isModelBlocked(status: number, body: string): boolean {
+  if ((status !== 400 && status !== 404) || body === '') return false
+  // Cheap pre-filter: most 4xx carry neither token, so they return without a parse.
+  if (!body.includes(MODEL_BLOCKED_CODE) && !body.toLowerCase().includes(MODEL_BLOCKED_PHRASE)) return false
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return false
+  }
+  if (typeof parsed !== 'object' || parsed === null) return false
+  const nodes: Record<string, unknown>[] = [parsed as Record<string, unknown>]
+  const inner = (parsed as Record<string, unknown>)['error']
+  if (typeof inner === 'object' && inner !== null) nodes.push(inner as Record<string, unknown>)
+  let code = ''
+  let message = ''
+  for (const node of nodes) {
+    for (const key of ['code', 'errCode', 'error_code']) {
+      const value = node[key]
+      if (value !== undefined && value !== null && code === '') code = String(value).trim()
+    }
+    for (const key of ['msg', 'message']) {
+      const value = node[key]
+      if (typeof value === 'string' && value !== '' && message === '') message = value.trim()
+    }
+  }
+  if (code === MODEL_BLOCKED_CODE) return true
+  return message.toLowerCase().includes(MODEL_BLOCKED_PHRASE)
+}
+
+/**
+ * Whether a 403 is the gateway's WAF answering rather than the API.
+ *
+ * A business 403 carries the usual `code`/`msg` envelope and has its own
+ * classification; an edge block answers an HTML page, an empty body, or plain
+ * text. Treating the edge block as a generic client error would rotate accounts
+ * without ever penalizing one, so every request keeps hitting the same wall.
+ */
+export function isWafBlocked(status: number, body: string): boolean {
+  if (status !== 403) return false
+  return !body.includes('"code":') && !body.includes('"msg":')
+}
+
+/** The timezone the upstream's reset text is written in, regardless of host TZ. */
+const RESET_ZONE_OFFSET_MINUTES = 8 * 60
+
+/** The upstream's reset phrasing: 「将在 <timestamp> 重置」. */
+const RESET_PATTERN = /将在 (.+?) 重置/u
+
+/**
+ * Parse the wall-clock moment a 429 body promises the limit resets.
+ *
+ * The upstream writes the time in UTC+8 with no offset, so it is parsed in that
+ * fixed zone rather than the host's: reading it as local time would silently
+ * shift the cooldown by the machine's offset.
+ */
+export function parseRateReset(body: string): number | undefined {
+  const match = RESET_PATTERN.exec(body)
+  const captured = match?.[1]
+  if (captured === undefined) return undefined
+  const text = captured.trim().replace(/\s*UTC\+8$/u, '')
+  const parsed = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/u.exec(text)
+  if (parsed === null) return undefined
+  const [, year, month, day, hour, minute, second] = parsed
+  if (year === undefined || month === undefined || day === undefined
+    || hour === undefined || minute === undefined || second === undefined) {
+    return undefined
+  }
+  const utc = Date.UTC(
+    Number(year), Number(month) - 1, Number(day),
+    Number(hour), Number(minute), Number(second),
+  ) - RESET_ZONE_OFFSET_MINUTES * 60_000
+  return Number.isFinite(utc) ? utc : undefined
+}
+
+/** Header names carrying an upstream-declared wait, in priority order. */
+const RETRY_AFTER_HEADERS = ['retry-after', 'retry-after-ms', 'x-ratelimit-reset']
+
+/** Anything longer than this is treated as a nonsense value and ignored. */
+const RETRY_AFTER_CEILING_MS = 2 * 60 * 60 * 1000
+
+/**
+ * Read an upstream-declared wait from the response headers.
+ *
+ * `Retry-After` and `retry-after-ms` are durations; `x-ratelimit-reset` is an
+ * epoch instant, so it is converted to the remaining time. A missing, non-numeric,
+ * non-positive, or absurd value is ignored rather than guessed at — the caller
+ * falls back to its own bounded backoff.
+ */
+export function parseRetryAfter(headers: Headers): number | undefined {
+  for (const name of RETRY_AFTER_HEADERS) {
+    const raw = headers.get(name)
+    if (raw === null) continue
+    const value = raw.trim()
+    // Non-numeric forms (an HTTP date, say) are not parsed: better no answer
+    // than a wrong one.
+    if (!/^\d+$/u.test(value) || value.length > 16) continue
+    const number = Number(value)
+    if (!Number.isSafeInteger(number) || number <= 0) continue
+    const milliseconds = name === 'retry-after-ms'
+      ? number
+      : name === 'retry-after'
+        ? number * 1000
+        // An epoch instant: 12+ digits is milliseconds, otherwise seconds.
+        : (value.length >= 12 ? number : number * 1000) - Date.now()
+    if (milliseconds <= 0 || milliseconds > RETRY_AFTER_CEILING_MS) continue
+    return milliseconds
+  }
+  return undefined
+}
+
+/**
+ * Classify an upstream failure from its HTTP status and body excerpt.
+ *
+ * The order is specific-before-broad, and every step has a reason:
+ *
+ * 1. `model_blocked` (11102) first — it is the most specific verdict the upstream
+ *    gives ("this model does not exist on this backend"), and letting the broad
+ *    4xx fallback take it would leave a broken model in rotation;
+ * 2. 402 — the only real "out of credit" status, and the least self-healing;
+ * 3. `session_dead` — a terminal state needing a human, so it outranks the
+ *    rate-limit wording that a mixed-up gateway error page can contain;
+ * 4. 429 — the STATUS is more authoritative than keywords, because rate-limit
+ *    bodies often carry "quota exceeded", which would otherwise be read as
+ *    "out of credit" and park the account until 04:00;
+ * 5. remaining credit wording on other statuses;
+ * 6. rate-limit wording on other statuses;
+ * 7. 404 / 5xx;
+ * 8. WAF — 403 without an envelope, before the generic 4xx fallback;
+ * 9. everything else.
+ */
 export function classifyUpstreamError(status: number, body: string): UpstreamErrorKind {
+  if (isModelBlocked(status, body)) return 'model_blocked'
   if (status === 402) return 'hard_credit'
   const lower = body.toLowerCase()
-  for (const marker of HARD_CREDIT_MARKERS) {
-    if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'hard_credit'
-  }
   for (const marker of SESSION_DEAD_MARKERS) {
     if (body.includes(marker)) return 'session_dead'
   }
-  if (status === 429) return 'soft_rate'
+  if (status === 429) return isModelRateLimit(body) ? 'model_rate' : 'soft_rate'
+  for (const marker of HARD_CREDIT_MARKERS) {
+    if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'hard_credit'
+  }
+  for (const marker of SOFT_RATE_MARKERS) {
+    if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'soft_rate'
+  }
   if (status === 404) return 'not_found'
   if (status >= 500) return 'server'
+  if (isWafBlocked(status, body)) return 'waf_block'
   if (status >= 400) return 'client'
   return 'client'
 }
@@ -760,11 +954,17 @@ export class WorkBuddyUpstreamClient {
     }
     if (response.ok) return { ok: true, response }
     const text = (await response.text()).slice(0, ERROR_BODY_LIMIT)
+    // Both wait signals travel with the failure so the pool can honour whichever
+    // the upstream actually sent, instead of guessing a backoff.
+    const resetAtMs = parseRateReset(text)
+    const retryAfterMs = parseRetryAfter(response.headers)
     return {
       ok: false,
       status: response.status,
       kind: classifyUpstreamError(response.status, text),
       message: text,
+      ...resetAtMs === undefined ? {} : { resetAtMs },
+      ...retryAfterMs === undefined ? {} : { retryAfterMs },
     }
   }
 
@@ -941,8 +1141,14 @@ export class WorkBuddyUpstreamClient {
    * separate: the card groups monthly-cycle packages itself and lists the
    * nearest-expiring one-off packages, so aggregation here would lose the
    * dates it needs.
+   *
+   * `expiringSoonMs` is the window that decides which credits count as "about to
+   * expire" — the number the picker uses to prefer spending credits before they
+   * lapse. It is a policy value rather than a constant because the right window
+   * depends on how the account's packages are actually granted, and a hardcoded
+   * one silently disagrees with the setting the operator can see and edit.
    */
-  async fetchCredits(credential: WorkBuddyCredential): Promise<WorkBuddyCredits> {
+  async fetchCredits(credential: WorkBuddyCredential, expiringSoonMs?: number): Promise<WorkBuddyCredits> {
     const now = new Date()
     const format = (date: Date): string => [
       date.getFullYear().toString().padStart(4, '0'),
@@ -982,7 +1188,10 @@ export class WorkBuddyUpstreamClient {
     let total = 0
     let nearestExpiryMs: number | undefined
     let expiringSoon = 0
-    const SOON_MS = 3 * 24 * 60 * 60 * 1000
+    // The caller's window, or the long-standing three days when it passes none.
+    const SOON_MS = expiringSoonMs !== undefined && expiringSoonMs > 0
+      ? expiringSoonMs
+      : 3 * 24 * 60 * 60 * 1000
     const parseDate = (raw: unknown): number | undefined => {
       if (typeof raw === 'number' && raw > 1_000_000_000_000) return raw
       if (typeof raw === 'string' && raw !== '') {

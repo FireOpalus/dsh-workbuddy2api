@@ -1259,6 +1259,21 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
                               : <span className="dsm-wb2api-account-hint">
                                   {t('row.accountLastError', { message: entry.lastError })}
                                 </span>}
+                            {entry.modelCooldowns === undefined || entry.modelCooldowns.length === 0
+                              ? null
+                              : <span
+                                  className="dsm-wb2api-account-hint dsm-wb2api-account-hint-model"
+                                  title={t('row.accountModelCooldownHint')}
+                                >
+                                  {t('row.accountModelCooldowns')}
+                                  {': '}
+                                  {entry.modelCooldowns
+                                    .map(cooldown => t('row.accountModelCooldown', {
+                                      model: cooldown.model,
+                                      at: formatDateTime(cooldown.untilMs),
+                                    }))
+                                    .join(' · ')}
+                                </span>}
                           </div>
                         )
                       })}

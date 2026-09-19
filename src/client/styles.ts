@@ -70,6 +70,8 @@ export const WORKBUDDY2API_CARD_CSS = `
 .dsm-wb2api-weight{display:inline-flex;align-items:center;gap:5px;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:11px;line-height:16px}
 .dsm-wb2api-weight input{width:56px;font:inherit;font-size:11px;padding:2px 6px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);background:var(--dsw-alias-bg-layer-3,#2a2c33);color:var(--dsw-alias-label-primary,#e6e6e6)}
 .dsm-wb2api-account-hint{color:var(--dsw-alias-state-error-primary,#ef4444);font-size:11px;line-height:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* A model-level refusal is not an account fault, so it reads as a warning. */
+.dsm-wb2api-account-hint-model{color:#c98a2b}
 .dsm-wb2api-policy{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px 14px;padding:12px 14px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#24262c)}
 .dsm-wb2api-policy-field{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:12px;line-height:18px}
 .dsm-wb2api-policy-field input[type=number]{width:74px;font:inherit;font-size:12px;padding:3px 7px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);background:var(--dsw-alias-bg-layer-3,#2a2c33);color:var(--dsw-alias-label-primary,#e6e6e6)}

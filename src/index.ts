@@ -662,7 +662,7 @@ export function apply(ctx: Context, config: Config): void {
       // Read the new account's balance straight away, so the card shows credits
       // instead of "unknown" the moment the sign-in completes.
       try {
-        const credits = await client.fetchCredits(credential)
+        const credits = await client.fetchCredits(credential, stacks[region].pool.currentPolicy().expiringSoonMs)
         const accountId = workbuddyAccountId(credential)
         stacks[region].pool.setCredits(accountId, {
           total: credits.total,
@@ -748,7 +748,9 @@ export function apply(ctx: Context, config: Config): void {
     discoverModels,
     refreshCredits: async (region, accountId) => {
       const credential = await stacks[region].store.resolve(accountId)
-      const credits = await client.fetchCredits(credential)
+      // The pool's own window decides which credits count as expiring soon, so
+      // the number the card shows and the one the picker weighs are the same.
+      const credits = await client.fetchCredits(credential, stacks[region].pool.currentPolicy().expiringSoonMs)
       stacks[region].pool.setCredits(accountId, {
         total: credits.total,
         expiringSoon: credits.expiringSoon,

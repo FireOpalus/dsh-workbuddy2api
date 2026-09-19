@@ -88,6 +88,12 @@ export interface WorkBuddyPoolEntry {
    * remaining-share ring. 0 means the upstream reported no sizes.
    */
   creditsCapacity?: number
+  /**
+   * Per-model refusals currently in force for this account: a 6004 rate limit or
+   * an 11102 "no such model here". Separate from the account's own health,
+   * because the account is fine — only these models are unavailable on it.
+   */
+  modelCooldowns?: readonly { model: string; untilMs: number; reason: string; hits: number }[]
   /** Whether the account still has a local credential file. */
   present: boolean
   tokenExpiresAtMs: number
@@ -134,6 +140,25 @@ export const DEFAULT_WORKBUDDY_POOL_POLICY: WorkBuddyPoolTuning = {
   minPickGapMs: 100,
 }
 
+/**
+ * Consecutive session-dead answers before the account is condemned.
+ *
+ * A single 12153 is routinely jitter — a dropped connection, a lost race with a
+ * token refresh — and disabling on the first one is how perfectly healthy
+ * accounts get taken out of service for good, needing a human to bring them back.
+ */
+const SESSION_DEAD_THRESHOLD = 3
+
+/** First TTL for the "this backend has no such model" negative cache. */
+const MODEL_BLOCK_BASE_MS = 6 * 3_600_000
+/** How far the model-block TTL doubles per repeat; capped at one day. */
+const MODEL_BLOCK_MAX_MS = 24 * 3_600_000
+const MODEL_BLOCK_SHIFT = 4
+/** Base soft cooldown for a gateway (WAF) refusal, jittered below. */
+const WAF_COOLDOWN_BASE_MS = 60_000
+/** How long a cost observation stays usable: covers a "free at night" window. */
+const MODEL_COST_TTL_MS = 6 * 3_600_000
+
 /** Mutable per-account bookkeeping the picker reads and the report writes. */
 interface EntryState {
   accountId: string
@@ -156,6 +181,8 @@ interface EntryState {
   degradedUntil: number
   /** Consecutive unclassified failures; the degrade trigger. */
   consecutiveFails: number
+  /** Consecutive "session is dead" answers; only the threshold condemns. */
+  sessionDeadFails: number
   inFlight: number
   successes: number
   failures: number
@@ -169,6 +196,22 @@ interface EntryState {
   creditsExpiring: number
   creditsCapacity: number
   creditsAtMs: number
+  /**
+   * Per-MODEL cooldowns, separate from the account-level ones.
+   *
+   * A 6004 answer says "this model's usage is over its limit" — the account is
+   * healthy and other models still work. Parking the account instead would take a
+   * working credential out of service for hours and hide the real cause, so the
+   * deadline is recorded per model and only that model avoids the account.
+   */
+  modelCooldowns: Map<string, { untilMs: number; reason: string; hits: number }>
+  /**
+   * Observed cost per 1k tokens, per model, from the upstream's own
+   * `usage.credit`. This is what makes the cost-tier layer possible: a free
+   * promotional model stays free only while it is actually free, and the only
+   * way to know is to watch what was charged.
+   */
+  modelCost: Map<string, { costPer1k: number; lastSeenMs: number }>
 }
 
 /** Outcome of one dispatch, reported back by the shim. */
@@ -178,6 +221,24 @@ export interface WorkBuddyDispatchOutcome {
   kind?: UpstreamErrorKind
   /** Redacted, human-readable reason stored on the entry. */
   message?: string
+  /**
+   * The model this dispatch used, when the caller knows it. A model-level
+   * cooldown is recorded against this name, so a 6004 for one model does not
+   * park the account for the others.
+   */
+  model?: string
+  /**
+   * The wall-clock moment the upstream promised the limit lifts, from the 429
+   * body's own wording. Preferred over any computed backoff: it is what actually
+   * happens, and guessing longer only idles a healthy account.
+   */
+  resetAtMs?: number
+  /**
+   * A wait the upstream stated in its response headers. Honoured when there is
+   * no body wording; ignored when there is, since the body is the narrower
+   * statement.
+   */
+  retryAfterMs?: number
 }
 
 /** Why the pool could not pick any account at all. */
@@ -344,6 +405,9 @@ export class WorkBuddyAccountPool {
       creditsExpiring: 0,
       creditsCapacity: 0,
       creditsAtMs: 0,
+      sessionDeadFails: 0,
+      modelCooldowns: new Map(),
+      modelCost: new Map(),
     }
   }
 
@@ -427,6 +491,13 @@ export class WorkBuddyAccountPool {
       ...entry.creditsAtMs === 0 ? {} : { creditsAtMs: entry.creditsAtMs },
       ...entry.creditsExpiring === 0 ? {} : { creditsExpiringSoon: entry.creditsExpiring },
       ...entry.creditsCapacity === 0 ? {} : { creditsCapacity: entry.creditsCapacity },
+      ...(() => {
+        const active = [...entry.modelCooldowns]
+          .filter(([, cooldown]) => cooldown.untilMs > now)
+          .map(([model, cooldown]) => ({ model, untilMs: cooldown.untilMs, reason: cooldown.reason, hits: cooldown.hits }))
+          .sort((left, right) => left.model.localeCompare(right.model))
+        return active.length === 0 ? {} : { modelCooldowns: active }
+      })(),
       present: entry.present,
       tokenExpiresAtMs: entry.tokenExpiresAtMs,
     }
@@ -467,11 +538,52 @@ export class WorkBuddyAccountPool {
     return !this.inFlightFull(entry)
   }
 
+  /**
+   * Health as seen by ONE model: the account-level gate, plus the per-model
+   * cooldowns.
+   *
+   * This is what makes a model-level limit non-punitive. A 6004 on model A says
+   * nothing about model B, so an account cooling down for A is still a perfectly
+   * good candidate for B — the account's credentials, credits and health are all
+   * intact. Judging it with the account-level gate alone would idle a working
+   * credential; judging it with no gate at all would keep sending A into a wall.
+   */
+  private healthyForModel(entry: EntryState, now: number, model: string | undefined): boolean {
+    if (!this.healthy(entry, now)) return false
+    if (model === undefined || model === '') return true
+    const blocked = entry.modelCooldowns.get(model)
+    return blocked === undefined || blocked.untilMs <= now
+  }
+
+  /** Drop per-model cooldowns that have expired, so the map cannot grow forever. */
+  private pruneModelCooldowns(entry: EntryState, now: number): void {
+    if (entry.modelCooldowns.size === 0) return
+    for (const [model, cooldown] of entry.modelCooldowns) {
+      if (cooldown.untilMs <= now) entry.modelCooldowns.delete(model)
+    }
+  }
+
   /** The earliest still-running deadline of an entry, or 0 when it is clear. */
   private expiryOf(entry: EntryState, now: number): number {
     const deadlines = [entry.cooldownUntil, entry.breakerUntil, entry.degradedUntil]
       .filter(deadline => deadline > now)
     return deadlines.length === 0 ? 0 : Math.min(...deadlines)
+  }
+
+  /**
+   * Accounts currently bound by some live session.
+   *
+   * The initial assignment prefers accounts NOT in this set. Without that step,
+   * a new conversation's first request is decided purely by weight — and since
+   * the weight favours the richest account, many conversations opening at once
+   * tend to land on the same one. Preferring an unbound account spreads new
+   * sessions across the pool while still letting weight order the choice within
+   * whichever group is used.
+   */
+  private boundAccountIds(): Set<string> {
+    const bound = new Set<string>()
+    for (const binding of this.sticky.values()) bound.add(binding.accountId)
+    return bound
   }
 
   /** The sticky binding for a session key, when it is alive. */
@@ -534,7 +646,12 @@ export class WorkBuddyAccountPool {
    *    set — never only the shortlist, which would starve tied accounts;
    * 6. draw one weighted-random from what remains.
    */
-  pick(options: { exclude?: ReadonlySet<string>; stickyKey?: string } = {}): WorkBuddyPickResult {
+  pick(options: {
+    exclude?: ReadonlySet<string>
+    stickyKey?: string
+    /** The model this request asks for; enables model-level gates and tiers. */
+    model?: string
+  } = {}): WorkBuddyPickResult {
     const now = this.now()
     const excluded = options.exclude ?? new Set<string>()
     const all = [...this.entries.values()]
@@ -544,8 +661,12 @@ export class WorkBuddyAccountPool {
     const pickable = all.filter(entry => entry.enabled && entry.present)
     if (pickable.length === 0) return { ok: false, reason: 'pool-saturated' }
 
+    const model = options.model
     const bound = this.stickyBinding(options.stickyKey, now)
-    if (bound !== undefined && this.healthy(bound, now) && !excluded.has(bound.accountId)
+    // The stickiness fast path is judged by the SAME model-aware gate as the
+    // general path: a binding must not pin a conversation to an account that is
+    // currently limited for the very model being asked for.
+    if (bound !== undefined && this.healthyForModel(bound, now, model) && !excluded.has(bound.accountId)
       && this.totalInFlight < this.policy.maxInFlightTotal) {
       return { ok: true, entry: this.view(this.dispatch(bound, now), now), fallback: false }
     }
@@ -556,27 +677,63 @@ export class WorkBuddyAccountPool {
       return { ok: false, reason: 'pool-saturated' }
     }
 
-    const candidates = all.filter(entry => !excluded.has(entry.accountId) && this.healthy(entry, now))
+    for (const entry of all) this.pruneModelCooldowns(entry, now)
+    let candidates = all.filter(entry =>
+      !excluded.has(entry.accountId) && this.healthyForModel(entry, now, model))
+    // A conversation being (re)assigned prefers an account no other session is
+    // using yet, so simultaneous new sessions spread across the pool instead of
+    // all landing on the heaviest account. Sessions that still hold a live
+    // binding never reach here — they returned from the fast path above — so this
+    // can only move a conversation that was going to be reassigned anyway.
+    if (options.stickyKey !== undefined && candidates.length > 1) {
+      const inUse = this.boundAccountIds()
+      const idle = candidates.filter(entry => !inUse.has(entry.accountId))
+      if (idle.length > 0) candidates = idle
+    }
     if (candidates.length === 0) {
       const fallback = this.pickEarliestExpiry(pickable, excluded, now)
       if (fallback === undefined) return { ok: false, reason: this.missReason(all) }
       return { ok: true, entry: this.view(this.dispatch(fallback, now), now), fallback: true }
     }
 
-    let maxCredits = 0
-    for (const entry of candidates) {
-      if (entry.credits !== undefined && entry.credits > maxCredits) maxCredits = entry.credits
+    // Cost tiering (the "layered pick"), only when the request names a model.
+    //   0 = observed FREE for this model — the strongest preference
+    //   1 = no observation
+    //   2 = observed to cost credits
+    // "No observation" deliberately outranks "observed to cost": a promotional
+    // model's free status can only be discovered by trying it, so if the
+    // known-paid accounts always won, the free one would never be reached and
+    // its status never learned. Ties inside a tier still compare observed price.
+    const tierOf = (entry: EntryState): { tier: number; cost: number } => {
+      if (model === undefined || model === '') return { tier: 1, cost: 0 }
+      const observed = entry.modelCost.get(model)
+      if (observed === undefined || now - observed.lastSeenMs > MODEL_COST_TTL_MS) return { tier: 1, cost: 0 }
+      return { tier: observed.costPer1k <= 0 ? 0 : 2, cost: observed.costPer1k }
     }
-    const ranked = candidates
-      .map(entry => ({ entry, weight: this.weightOf(entry, maxCredits, now) }))
-      .sort((left, right) => right.weight - left.weight || left.entry.usedSeq - right.entry.usedSeq)
+    const tiered = candidates.map(entry => ({ entry, ...tierOf(entry) }))
+    const bestTier = tiered.reduce((best, candidate) => Math.min(best, candidate.tier), 2)
+    const inTier = tiered.filter(candidate => candidate.tier === bestTier)
+    let maxCredits = 0
+    for (const candidate of inTier) {
+      const credits = candidate.entry.credits
+      if (credits !== undefined && credits > maxCredits) maxCredits = credits
+    }
+    const ranked = inTier
+      .map(candidate => ({ entry: candidate.entry, weight: this.weightOf(candidate.entry, maxCredits, now), cost: candidate.cost }))
+      .sort((left, right) =>
+        left.cost - right.cost
+        || right.weight - left.weight
+        || left.entry.usedSeq - right.entry.usedSeq)
+    // The full ranked list is kept for the LRU fallback, so a shortlist cutoff
+    // can never starve a tied account.
+    const fullRanked = ranked
     const shortlist = ranked.slice(0, 5)
     const eligible = shortlist.filter(candidate => now - candidate.entry.lastUsedAt >= this.policy.minPickGapMs)
     const chosen = eligible.length > 0
       ? this.pickWeighted(eligible.map(candidate => candidate.entry), eligible.map(candidate => candidate.weight))
       // Everything on the shortlist was used inside the gap: take the globally
       // least-recently-used candidate so no account is starved by the cutoff.
-      : ranked.reduce((best, candidate) =>
+      : fullRanked.reduce((best, candidate) =>
         candidate.entry.usedSeq < best.entry.usedSeq ? candidate : best).entry
     return { ok: true, entry: this.view(this.dispatch(chosen, now), now), fallback: false }
   }
@@ -677,8 +834,21 @@ export class WorkBuddyAccountPool {
       entry.breakerTrips = 0
       entry.softStreak = 0
       entry.degradedUntil = 0
+      // A working request proves the session is alive, so the death count resets.
+      entry.sessionDeadFails = 0
       entry.lastSuccessAt = now
       entry.lastError = ''
+      // A model-blocked entry is a guess that this backend lacks the model; an
+      // answer from that very model disproves it, so the negative cache clears.
+      // Model-level RATE limits are deliberately NOT cleared here: their deadline
+      // came from the upstream's own reset moment, and one success on a different
+      // request says nothing about that. They expire on their own.
+      if (outcome.model !== undefined && outcome.model !== '') {
+        const cached = entry.modelCooldowns.get(outcome.model)
+        if (cached !== undefined && cached.reason.startsWith('11102')) {
+          entry.modelCooldowns.delete(outcome.model)
+        }
+      }
       if (stickyKey !== undefined && this.policy.stickyTtlMs > 0) {
         this.sticky.set(stickyKey, { accountId, at: now })
       }
@@ -693,23 +863,72 @@ export class WorkBuddyAccountPool {
         entry.cooldownKind = 'hard'
         entry.cooldownUntil = nextDay4Am(now)
         return
-      case 'session_dead':
-        entry.cooldownKind = 'hard'
-        entry.cooldownUntil = nextDay4Am(now)
-        entry.lastError = '会话已失效，请在 WorkBuddy 桌面端重新登录该账号'
-        return
-      case 'soft_rate': {
-        // The "already cooling" rule: a user hammering retry must not push the
-        // account further into the future than the first refusal did.
-        if (entry.cooldownKind === 'soft' && entry.cooldownUntil > now) return
-        const shift = Math.min(entry.softStreak, 16)
-        const grown = this.policy.softRateCooldownMs * 2 ** shift
-        const capped = Math.min(grown, this.policy.softRateCooldownMaxMs)
-        entry.cooldownKind = 'soft'
-        entry.cooldownUntil = now + capped
-        entry.softStreak += 1
+      case 'model_rate': {
+        // The MODEL is over its limit, so only that model avoids this account.
+        // The deadline follows the upstream's own reset moment when it gave one
+        // (never the exponential backoff: the reset is a fact, the backoff a
+        // guess, and guessing longer only idles a healthy account).
+        const model = outcome.model !== undefined && outcome.model !== '' ? outcome.model : ''
+        if (model === '') {
+          // No model name means the caller could not tell; fall back to the
+          // account-level path rather than recording a cooldown nobody can match.
+          this.applySoftRate(entry, now, outcome)
+          return
+        }
+        const ceiling = this.policy.softRateCooldownMaxMs
+        const until = outcome.resetAtMs !== undefined
+          ? Math.min(outcome.resetAtMs, now + ceiling)
+          : now + Math.min(this.policy.softRateCooldownMs, ceiling)
+        const previous = entry.modelCooldowns.get(model)
+        entry.modelCooldowns.set(model, {
+          untilMs: until,
+          reason: outcome.resetAtMs !== undefined ? '6004 model rate limit' : 'model rate limited',
+          hits: (previous?.hits ?? 0) + 1,
+        })
         return
       }
+      case 'model_blocked': {
+        // "This backend has no such model": retrying it is pointless, so the
+        // (account, model) pair is negatively cached with exponential TTL. The
+        // account keeps serving every other model.
+        const model = outcome.model !== undefined && outcome.model !== '' ? outcome.model : ''
+        if (model === '') return
+        const previous = entry.modelCooldowns.get(model)
+        const hits = (previous?.hits ?? 0) + 1
+        const ttl = Math.min(MODEL_BLOCK_BASE_MS * 2 ** Math.min(hits - 1, MODEL_BLOCK_SHIFT), MODEL_BLOCK_MAX_MS)
+        entry.modelCooldowns.set(model, { untilMs: now + ttl, reason: '11102 model not available', hits })
+        return
+      }
+      case 'waf_block':
+        // The gateway's firewall answered, not the API. It is a per-IP/per-
+        // fingerprint signal that clears on its own, so the account is cooled
+        // down and never disabled — disabling would need a human for a fault the
+        // account did not commit. A stated wait wins over the local backoff.
+        if (outcome.retryAfterMs !== undefined) {
+          entry.cooldownKind = 'soft'
+          entry.cooldownUntil = now + Math.min(outcome.retryAfterMs, this.policy.softRateCooldownMaxMs)
+          return
+        }
+        this.applySoftRate(entry, now, outcome, WAF_COOLDOWN_BASE_MS)
+        return
+      case 'session_dead':
+        // A single 12153 is often jitter (a dropped connection, a refresh race),
+        // so it takes consecutive failures to condemn the account. Disabling on
+        // the first one is how healthy accounts get killed off for good.
+        entry.sessionDeadFails += 1
+        if (entry.sessionDeadFails < SESSION_DEAD_THRESHOLD) {
+          entry.cooldownKind = 'soft'
+          entry.cooldownUntil = now + this.policy.softRateCooldownMs
+          return
+        }
+        entry.sessionDeadFails = 0
+        entry.cooldownKind = 'hard'
+        entry.cooldownUntil = nextDay4Am(now)
+        entry.lastError = '会话已失效（连续 ' + String(SESSION_DEAD_THRESHOLD) + ' 次），请在 WorkBuddy 桌面端重新登录该账号'
+        return
+      case 'soft_rate':
+        this.applySoftRate(entry, now, outcome)
+        return
       case 'not_found':
         entry.cooldownKind = 'soft'
         entry.cooldownUntil = now + this.policy.notFoundCooldownMs
@@ -735,6 +954,70 @@ export class WorkBuddyAccountPool {
         if (entry.degradedUntil > now) return
         entry.degradedUntil = now + Math.min(this.policy.degradeCooldownMs, this.policy.degradeCooldownMaxMs)
       }
+    }
+  }
+
+  /**
+   * Apply an account-level soft cooldown.
+   *
+   * Order of authority: the upstream's own reset moment, then its stated wait,
+   * then the local bounded backoff. This is the "reset wall clock" rule — when
+   * the upstream says when it lifts, waiting longer than that only idles a
+   * healthy account, and no amount of local doubling makes the answer truer.
+   *
+   * The already-cooling rule is deliberately preserved on the backoff path: a
+   * user hammering retry must not push the deadline further out than the first
+   * refusal did.
+   */
+  private applySoftRate(
+    entry: EntryState,
+    now: number,
+    outcome: WorkBuddyDispatchOutcome,
+    baseOverrideMs?: number,
+  ): void {
+    const base = baseOverrideMs ?? this.policy.softRateCooldownMs
+    if (outcome.resetAtMs !== undefined) {
+      entry.cooldownKind = 'soft'
+      entry.cooldownUntil = Math.min(outcome.resetAtMs, now + this.policy.softRateCooldownMaxMs)
+      entry.modelCooldowns.clear()
+      return
+    }
+    if (outcome.retryAfterMs !== undefined) {
+      entry.cooldownKind = 'soft'
+      entry.cooldownUntil = now + Math.min(outcome.retryAfterMs, this.policy.softRateCooldownMaxMs)
+      entry.modelCooldowns.clear()
+      return
+    }
+    if (entry.cooldownKind === 'soft' && entry.cooldownUntil > now) return
+    const shift = Math.min(entry.softStreak, 16)
+    const grown = base * 2 ** shift
+    entry.cooldownKind = 'soft'
+    entry.cooldownUntil = now + Math.min(grown, this.policy.softRateCooldownMaxMs)
+    entry.softStreak += 1
+    entry.modelCooldowns.clear()
+  }
+
+  /**
+   * Record what one request actually cost on one model.
+   *
+   * The upstream reports the real charge in the stream's final `usage.credit`,
+   * so this is measurement rather than configuration: a model advertised at
+   * x0.00 that starts billing shows up here, and the cost tier follows the
+   * observation instead of the catalogue. Tokens are needed to normalise the
+   * charge; without them the observation is skipped rather than invented.
+   */
+  noteModelCost(accountId: string, model: string, credit: number, totalTokens: number): void {
+    if (model === '' || !Number.isFinite(credit) || credit < 0 || !Number.isFinite(totalTokens) || totalTokens <= 0) {
+      return
+    }
+    const entry = this.entries.get(accountId)
+    if (entry === undefined) return
+    entry.modelCost.set(model, { costPer1k: (credit / totalTokens) * 1000, lastSeenMs: this.now() })
+    // Bound the ledger: only recently-seen models are meaningful, and an
+    // unbounded map would grow with every model ever used.
+    const now = this.now()
+    for (const [name, observation] of entry.modelCost) {
+      if (now - observation.lastSeenMs > MODEL_COST_TTL_MS * 4) entry.modelCost.delete(name)
     }
   }
 
@@ -778,6 +1061,21 @@ export class WorkBuddyAccountPool {
     entry.breakerTrips = 0
     entry.degradedUntil = 0
     entry.consecutiveFails = 0
+    entry.sessionDeadFails = 0
+    // An explicit human "recover" clears the model-level refusals too: the user
+    // is telling us the account is fine, so every local guess about it goes.
+    entry.modelCooldowns.clear()
+  }
+
+  /** Live per-model cooldowns for one account, for the card and the CLI. */
+  modelCooldownsOf(accountId: string): { model: string; untilMs: number; reason: string; hits: number }[] {
+    const entry = this.entries.get(accountId)
+    if (entry === undefined) return []
+    const now = this.now()
+    return [...entry.modelCooldowns]
+      .filter(([, cooldown]) => cooldown.untilMs > now)
+      .map(([model, cooldown]) => ({ model, untilMs: cooldown.untilMs, reason: cooldown.reason, hits: cooldown.hits }))
+      .sort((left, right) => left.model.localeCompare(right.model))
   }
 
   /**

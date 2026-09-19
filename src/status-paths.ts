@@ -202,6 +202,12 @@ export interface WorkBuddyWebPoolEntry {
   creditsExpiringSoon?: number
   /** The allowance `credits` is measured against; 0 means "unknown". */
   creditsCapacity?: number
+  /**
+   * Per-model refusals currently in force: a 6004 rate limit or an 11102
+   * "this backend has no such model". Listed so a model that keeps failing is
+   * visible as the MODEL's problem rather than the account looking broken.
+   */
+  modelCooldowns?: readonly { model: string; untilMs: number; reason: string; hits: number }[]
   present: boolean
   tokenExpiresAtMs: number
 }

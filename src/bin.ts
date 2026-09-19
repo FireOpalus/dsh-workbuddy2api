@@ -230,6 +230,16 @@ async function status(jsonOutput: boolean): Promise<number> {
           ...entry.cooldownUntil === undefined ? [] : [`    cooldown(${entry.cooldownKind ?? 'soft'}) until ${new Date(entry.cooldownUntil).toISOString()}`],
           ...entry.breakerUntil === undefined ? [] : [`    breaker until ${new Date(entry.breakerUntil).toISOString()}`],
           ...entry.degradedUntil === undefined ? [] : [`    degraded until ${new Date(entry.degradedUntil).toISOString()}`],
+          // A model-level refusal is about ONE model, not the account, so it is
+          // printed separately: reading it as an account problem would send the
+          // operator looking in the wrong place.
+          ...entry.modelCooldowns === undefined || entry.modelCooldowns.length === 0
+            ? []
+            : [
+              `    model limits: ${entry.modelCooldowns
+                .map(cooldown => `${cooldown.model} until ${new Date(cooldown.untilMs).toISOString()} (${cooldown.reason})`)
+                .join(', ')}`,
+            ],
           `    ok ${entry.successes} / failed ${entry.failures} / in-flight ${entry.inFlight}`,
         ]),
         ...fragment.credits.flatMap(probe => probe.error === undefined

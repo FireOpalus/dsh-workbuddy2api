@@ -176,6 +176,17 @@ interface WorkBuddyWebPoolEntry {
   creditsExpiringSoon?: number;
   /** The allowance `credits` is measured against; 0 means "unknown". */
   creditsCapacity?: number;
+  /**
+   * Per-model refusals currently in force: a 6004 rate limit or an 11102
+   * "this backend has no such model". Listed so a model that keeps failing is
+   * visible as the MODEL's problem rather than the account looking broken.
+   */
+  modelCooldowns?: readonly {
+    model: string;
+    untilMs: number;
+    reason: string;
+    hits: number;
+  }[];
   present: boolean;
   tokenExpiresAtMs: number;
 }
@@ -518,7 +529,13 @@ declare class WorkBuddyCredentialStore {
 /** WorkBuddy region selected by the credential's login domain. */
 type WorkBuddyRegion = 'cn' | 'global';
 /** Upstream failure classes the shim maps onto distinct HTTP answers. */
-type UpstreamErrorKind = 'hard_credit' | 'soft_rate' | 'session_dead' | 'not_found' | 'server' | 'client';
+type UpstreamErrorKind = 'hard_credit' | 'soft_rate' |
+/** 429 + code 6004: the MODEL is rate-limited, not the account. */
+'model_rate' |
+/** 11102 "service info not found": this backend has no such model at all. */
+'model_blocked' |
+/** 403 with no business envelope: the gateway's WAF answered, not the API. */
+'waf_block' | 'session_dead' | 'not_found' | 'server' | 'client';
 /** Reasoning capability as the upstream catalog declares it. */
 interface WorkBuddyReasoning {
   supportedEfforts?: readonly string[];
@@ -608,8 +625,31 @@ type WorkBuddyChatResult = {
   status: number;
   kind: UpstreamErrorKind;
   message: string;
+  /** The upstream's own reset moment, when the body named one. */
+  resetAtMs?: number;
+  /** A wait the upstream stated in a response header, when it sent one. */
+  retryAfterMs?: number;
 };
-/** Classify an upstream failure from its HTTP status and body excerpt. */
+/**
+ * Classify an upstream failure from its HTTP status and body excerpt.
+ *
+ * The order is specific-before-broad, and every step has a reason:
+ *
+ * 1. `model_blocked` (11102) first — it is the most specific verdict the upstream
+ *    gives ("this model does not exist on this backend"), and letting the broad
+ *    4xx fallback take it would leave a broken model in rotation;
+ * 2. 402 — the only real "out of credit" status, and the least self-healing;
+ * 3. `session_dead` — a terminal state needing a human, so it outranks the
+ *    rate-limit wording that a mixed-up gateway error page can contain;
+ * 4. 429 — the STATUS is more authoritative than keywords, because rate-limit
+ *    bodies often carry "quota exceeded", which would otherwise be read as
+ *    "out of credit" and park the account until 04:00;
+ * 5. remaining credit wording on other statuses;
+ * 6. rate-limit wording on other statuses;
+ * 7. 404 / 5xx;
+ * 8. WAF — 403 without an envelope, before the generic 4xx fallback;
+ * 9. everything else.
+ */
 declare function classifyUpstreamError(status: number, body: string): UpstreamErrorKind;
 /**
  * Region for a login domain; an empty domain means CN. The international
@@ -731,8 +771,14 @@ declare class WorkBuddyUpstreamClient {
    * separate: the card groups monthly-cycle packages itself and lists the
    * nearest-expiring one-off packages, so aggregation here would lose the
    * dates it needs.
+   *
+   * `expiringSoonMs` is the window that decides which credits count as "about to
+   * expire" — the number the picker uses to prefer spending credits before they
+   * lapse. It is a policy value rather than a constant because the right window
+   * depends on how the account's packages are actually granted, and a hardcoded
+   * one silently disagrees with the setting the operator can see and edit.
    */
-  fetchCredits(credential: WorkBuddyCredential): Promise<WorkBuddyCredits>;
+  fetchCredits(credential: WorkBuddyCredential, expiringSoonMs?: number): Promise<WorkBuddyCredits>;
   /**
    * Read the growth task list. This is the whole task surface: accept, claim,
    * and every "did it score yet" read all key off it.
@@ -913,6 +959,17 @@ interface WorkBuddyPoolEntry {
    * remaining-share ring. 0 means the upstream reported no sizes.
    */
   creditsCapacity?: number;
+  /**
+   * Per-model refusals currently in force for this account: a 6004 rate limit or
+   * an 11102 "no such model here". Separate from the account's own health,
+   * because the account is fine — only these models are unavailable on it.
+   */
+  modelCooldowns?: readonly {
+    model: string;
+    untilMs: number;
+    reason: string;
+    hits: number;
+  }[];
   /** Whether the account still has a local credential file. */
   present: boolean;
   tokenExpiresAtMs: number;
@@ -942,6 +999,24 @@ interface WorkBuddyDispatchOutcome {
   kind?: UpstreamErrorKind;
   /** Redacted, human-readable reason stored on the entry. */
   message?: string;
+  /**
+   * The model this dispatch used, when the caller knows it. A model-level
+   * cooldown is recorded against this name, so a 6004 for one model does not
+   * park the account for the others.
+   */
+  model?: string;
+  /**
+   * The wall-clock moment the upstream promised the limit lifts, from the 429
+   * body's own wording. Preferred over any computed backoff: it is what actually
+   * happens, and guessing longer only idles a healthy account.
+   */
+  resetAtMs?: number;
+  /**
+   * A wait the upstream stated in its response headers. Honoured when there is
+   * no body wording; ignored when there is, since the body is the narrower
+   * statement.
+   */
+  retryAfterMs?: number;
 }
 /** Why the pool could not pick any account at all. */
 type WorkBuddyPoolMissReason = 'no-accounts' | 'all-disabled' | 'pool-saturated';
@@ -1030,8 +1105,32 @@ declare class WorkBuddyAccountPool {
    * and below the concurrency ceiling.
    */
   private healthy;
+  /**
+   * Health as seen by ONE model: the account-level gate, plus the per-model
+   * cooldowns.
+   *
+   * This is what makes a model-level limit non-punitive. A 6004 on model A says
+   * nothing about model B, so an account cooling down for A is still a perfectly
+   * good candidate for B — the account's credentials, credits and health are all
+   * intact. Judging it with the account-level gate alone would idle a working
+   * credential; judging it with no gate at all would keep sending A into a wall.
+   */
+  private healthyForModel;
+  /** Drop per-model cooldowns that have expired, so the map cannot grow forever. */
+  private pruneModelCooldowns;
   /** The earliest still-running deadline of an entry, or 0 when it is clear. */
   private expiryOf;
+  /**
+   * Accounts currently bound by some live session.
+   *
+   * The initial assignment prefers accounts NOT in this set. Without that step,
+   * a new conversation's first request is decided purely by weight — and since
+   * the weight favours the richest account, many conversations opening at once
+   * tend to land on the same one. Preferring an unbound account spreads new
+   * sessions across the pool while still letting weight order the choice within
+   * whichever group is used.
+   */
+  private boundAccountIds;
   /** The sticky binding for a session key, when it is alive. */
   private stickyBinding;
   /** Weight of one candidate, per the reference's three-factor formula. */
@@ -1057,6 +1156,8 @@ declare class WorkBuddyAccountPool {
   pick(options?: {
     exclude?: ReadonlySet<string>;
     stickyKey?: string;
+    /** The model this request asks for; enables model-level gates and tiers. */
+    model?: string;
   }): WorkBuddyPickResult;
   /** Why nothing could be picked, in the most specific available terms. */
   private missReason;
@@ -1089,6 +1190,29 @@ declare class WorkBuddyAccountPool {
    * | `transport` / `client` | degrade after 5 consecutive failures (10m) — an unknown failure is not the account's fault |
    */
   report(accountId: string, outcome: WorkBuddyDispatchOutcome, stickyKey?: string): void;
+  /**
+   * Apply an account-level soft cooldown.
+   *
+   * Order of authority: the upstream's own reset moment, then its stated wait,
+   * then the local bounded backoff. This is the "reset wall clock" rule — when
+   * the upstream says when it lifts, waiting longer than that only idles a
+   * healthy account, and no amount of local doubling makes the answer truer.
+   *
+   * The already-cooling rule is deliberately preserved on the backoff path: a
+   * user hammering retry must not push the deadline further out than the first
+   * refusal did.
+   */
+  private applySoftRate;
+  /**
+   * Record what one request actually cost on one model.
+   *
+   * The upstream reports the real charge in the stream's final `usage.credit`,
+   * so this is measurement rather than configuration: a model advertised at
+   * x0.00 that starts billing shows up here, and the cost tier follows the
+   * observation instead of the catalogue. Tokens are needed to normalise the
+   * charge; without them the observation is skipped rather than invented.
+   */
+  noteModelCost(accountId: string, model: string, credit: number, totalTokens: number): void;
   /** Cache the credits the card or the CLI read for one account. */
   setCredits(accountId: string, credits: {
     total: number;
@@ -1104,6 +1228,13 @@ declare class WorkBuddyAccountPool {
   }[]): void;
   /** Forget one account's cooldown, breaker, and degrade marks. */
   reset(accountId: string): void;
+  /** Live per-model cooldowns for one account, for the card and the CLI. */
+  modelCooldownsOf(accountId: string): {
+    model: string;
+    untilMs: number;
+    reason: string;
+    hits: number;
+  }[];
   /**
    * The durable counters for every entry, keyed by account id.
    *

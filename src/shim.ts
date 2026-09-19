@@ -111,6 +111,40 @@ function originIsLoopback(origin: string | undefined): boolean {
   }
 }
 
+/**
+ * The model a chat body asks for, or undefined when it names none.
+ *
+ * Only the request's own field is read — never inferred from the catalog — so a
+ * model-aware decision is always about what the caller actually requested.
+ */
+function modelOf(bodyJson: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(bodyJson)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    const model = (parsed as Record<string, unknown>)['model']
+    return typeof model === 'string' && model.trim() !== '' ? model.trim() : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The charge and token count the upstream reports in the last SSE frame.
+ *
+ * This is measurement, not configuration: the model catalogue advertises a
+ * multiplier, but the gateway reports what a request actually cost. Watching the
+ * real number means a promotional model that quietly starts billing is noticed.
+ */
+function usageOf(frame: string): { credit: number; totalTokens: number } | undefined {
+  const at = frame.indexOf('"usage"')
+  if (at === -1) return undefined
+  const tail = frame.slice(at)
+  const credit = /"credit"s*:s*(-?d+(?:.d+)?)/u.exec(tail)
+  const tokens = /"total_tokens"s*:s*(d+)/u.exec(tail)
+  if (credit === null || tokens === null) return undefined
+  return { credit: Number(credit[1]), totalTokens: Number(tokens[1]) }
+}
+
 /** Chat-completion POSTs must carry a JSON body type (simple-request CSRF drops here). */
 function isJsonContentType(req: IncomingMessage): boolean {
   const type = req.headers['content-type']
@@ -121,6 +155,12 @@ function isJsonContentType(req: IncomingMessage): boolean {
 const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   hard_credit: 402,
   soft_rate: 429,
+  // A model-level limit is not the client's fault and not an auth failure; 429
+  // is still the honest status, since the client should simply wait or switch.
+  model_rate: 429,
+  model_blocked: 404,
+  // The gateway refused before the API ever saw the request.
+  waf_block: 403,
   session_dead: 401,
   not_found: 502,
   server: 502,
@@ -272,6 +312,9 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     // keys its own conversation state on the account, so bouncing between
     // accounts mid-conversation would degrade answers and waste credits.
     const stickyKey = stickyKeyOf(raw)
+    // The model this request asks for. It gates the per-model cooldowns (a 6004
+    // must not park the account for other models) and drives the cost tiers.
+    const model = modelOf(raw)
 
     const controller = new AbortController()
     req.on('close', () => controller.abort())
@@ -279,7 +322,11 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     const attempted = new Set<string>()
     let lastFailure: { status: number; kind: UpstreamErrorKind; message: string } | undefined
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const picked = pool.pick({ exclude: attempted, ...stickyKey === undefined ? {} : { stickyKey } })
+      const picked = pool.pick({
+        exclude: attempted,
+        ...stickyKey === undefined ? {} : { stickyKey },
+        ...model === undefined ? {} : { model },
+      })
       if (!picked.ok) {
         if (lastFailure !== undefined) {
           writeOpenAIError(
@@ -318,7 +365,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         pool.release(accountId)
       }
       if (result.ok) {
-        pool.report(accountId, { ok: true }, stickyKey)
+        pool.report(accountId, { ok: true, ...model === undefined ? {} : { model } }, stickyKey)
         // Counters moved (a success, and possibly a sticky renewal).
         onDispatch?.()
         if (controller.signal.aborted) {
@@ -332,9 +379,19 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
           'X-Accel-Buffering': 'no',
         })
         let sawDone = false
+        // Usage arrives in the final frame, so the tail of the stream is kept
+        // rather than the whole answer: enough to read the report, bounded.
+        let usageTail = ''
         const body = Readable.fromWeb(result.response.body as Parameters<typeof Readable.fromWeb>[0])
         body.on('data', (chunk: Buffer) => {
-          if (chunk.includes('[DONE]')) sawDone = true
+          if (chunk.includes('[DONE]')) {
+            sawDone = true
+            const usage = usageOf(usageTail)
+            if (usage !== undefined && model !== undefined) {
+              pool.noteModelCost(accountId, model, usage.credit, usage.totalTokens)
+            }
+          }
+          usageTail = (usageTail + chunk.toString('utf8')).slice(-4096)
         })
         body.on('error', (error: unknown) => {
           logger?.warn('dsh-workbuddy2api: upstream stream failed mid-flight', error)
@@ -351,6 +408,11 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         ok: false,
         ...result.status === 0 ? {} : { kind: result.kind },
         message: result.message,
+        ...model === undefined ? {} : { model },
+        // The upstream's own statements about when the limit lifts travel with
+        // the failure, so the pool can honour them rather than guess.
+        ...result.resetAtMs === undefined ? {} : { resetAtMs: result.resetAtMs },
+        ...result.retryAfterMs === undefined ? {} : { retryAfterMs: result.retryAfterMs },
       })
       // Counters moved (a failure, and possibly a cooldown/breaker transition).
       onDispatch?.()

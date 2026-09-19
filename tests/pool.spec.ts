@@ -128,13 +128,36 @@ describe('pool health transitions', () => {
     expect(pool.entryView('a')?.state).toBe('ready')
   })
 
-  it('gives a dead session the same long cooldown and a readable reason', async () => {
+  it('does NOT condemn an account on one dead-session answer', async () => {
+    // A single 12153 is routinely jitter — a dropped connection, a lost race
+    // with a token refresh. Disabling on the first one is how healthy accounts
+    // get taken out of service for good, so the first two only cool softly.
     const pool = await makePool(['a'])
     pool.report('a', { ok: false, kind: 'session_dead', message: '12153' })
+    expect(pool.entryView('a')?.cooldownKind).toBe('soft')
+    pool.report('a', { ok: false, kind: 'session_dead', message: '12153' })
+    expect(pool.entryView('a')?.cooldownKind).toBe('soft')
+  })
+
+  it('hard-cools a session that keeps dying, with a readable reason', async () => {
+    const pool = await makePool(['a'])
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      pool.report('a', { ok: false, kind: 'session_dead', message: '12153' })
+    }
     const entry = pool.entryView('a')
-    expect(entry?.state).toBe('cooldown')
     expect(entry?.cooldownKind).toBe('hard')
     expect(entry?.lastError).toContain('重新登录')
+  })
+
+  it('clears the death count when a request finally succeeds', async () => {
+    // The counter measures CONSECUTIVE deaths, so one good answer proves the
+    // session is alive and the account starts from zero again.
+    const pool = await makePool(['a'])
+    pool.report('a', { ok: false, kind: 'session_dead', message: '12153' })
+    pool.report('a', { ok: false, kind: 'session_dead', message: '12153' })
+    pool.report('a', { ok: true })
+    pool.report('a', { ok: false, kind: 'session_dead', message: '12153' })
+    expect(pool.entryView('a')?.cooldownKind).toBe('soft')
   })
 
   it('backs a rate limit off exponentially and never extends a running cooldown', async () => {
@@ -439,5 +462,300 @@ describe('nextDay4Am', () => {
     expect(new Date(nextDay4Am(before)).getDate()).toBe(5)
     const after = new Date(2026, 0, 5, 4, 30, 0).getTime()
     expect(new Date(nextDay4Am(after)).getDate()).toBe(6)
+  })
+})
+describe('model-level cooldowns (6004)', () => {
+  it('cools the MODEL, not the account, when the reset moment is known', async () => {
+    // The account is healthy; only this model is over its limit. Parking the
+    // account would idle a working credential for hours.
+    const time = clock()
+    const pool = await makePool(['a'], { now: time.now })
+    const resetAtMs = time.now() + 30 * 60_000
+    pool.report('a', { ok: false, kind: 'model_rate', model: 'glm-5.3', resetAtMs, message: '6004' })
+    // The account itself is NOT in an account-level cooldown.
+    expect(pool.entryView('a')?.state).toBe('ready')
+    // The limited model avoids that account: with only 'a' in the pool it can no
+    // longer serve the request at all, which is the whole point.
+    expect(pool.pick({ model: 'glm-5.3' }).ok).toBe(false)
+    expect(pool.modelCooldownsOf('a').map(entry => entry.model)).toEqual(['glm-5.3'])
+  })
+
+  it('honours the upstream reset instant rather than an exponential guess', async () => {
+    const time = clock()
+    const pool = await makePool(['a'], { now: time.now })
+    const resetAtMs = time.now() + 5 * 60_000
+    pool.report('a', { ok: false, kind: 'model_rate', model: 'm', resetAtMs, message: '6004' })
+    // Exactly the upstream's moment, not 600s of local backoff.
+    expect(pool.modelCooldownsOf('a')[0]?.untilMs).toBe(resetAtMs)
+  })
+
+  it('falls back to account-level soft cooling when no model is named', async () => {
+    // Without a model name the cooldown could never be matched again, so the
+    // caller's inability to name it degrades to the safe account-level path.
+    const pool = await makePool(['a'])
+    pool.report('a', { ok: false, kind: 'model_rate', message: '6004' })
+    expect(pool.entryView('a')?.cooldownKind).toBe('soft')
+  })
+
+  it('expires a model cooldown without releasing the account-level state', async () => {
+    const time = clock()
+    const pool = await makePool(['a'], { now: time.now })
+    pool.report('a', { ok: false, kind: 'model_rate', model: 'm', resetAtMs: time.now() + 60_000, message: '6004' })
+    expect(pool.modelCooldownsOf('a')).toHaveLength(1)
+    time.advance(60_001)
+    expect(pool.modelCooldownsOf('a')).toHaveLength(0)
+  })
+
+  it('negatively caches a model the backend does not have, with growing TTL', async () => {
+    const time = clock()
+    const pool = await makePool(['a'], { now: time.now })
+    pool.report('a', { ok: false, kind: 'model_blocked', model: 'ghost', message: '11102' })
+    const first = pool.modelCooldownsOf('a')[0]
+    expect(first?.reason).toContain('11102')
+    const firstTtl = (first?.untilMs ?? 0) - time.now()
+    time.advance(1_000)
+    pool.report('a', { ok: false, kind: 'model_blocked', model: 'ghost', message: '11102' })
+    const secondTtl = (pool.modelCooldownsOf('a')[0]?.untilMs ?? 0) - time.now()
+    expect(secondTtl).toBeGreaterThan(firstTtl)
+  })
+
+  it('clears a model-blocked entry once that model answers', async () => {
+    // The negative cache is a guess; a real answer from that model disproves it.
+    const pool = await makePool(['a'])
+    pool.report('a', { ok: false, kind: 'model_blocked', model: 'ghost', message: '11102' })
+    expect(pool.modelCooldownsOf('a')).toHaveLength(1)
+    pool.report('a', { ok: true, model: 'ghost' })
+    expect(pool.modelCooldownsOf('a')).toHaveLength(0)
+  })
+
+  it('keeps a 6004 entry through an unrelated success', async () => {
+    // A success on another request says nothing about the upstream's own reset
+    // moment, so the model limit must survive it and expire on its own.
+    const pool = await makePool(['a'])
+    pool.report('a', { ok: false, kind: 'model_rate', model: 'm', message: '6004' })
+    pool.report('a', { ok: true, model: 'm' })
+    expect(pool.modelCooldownsOf('a')).toHaveLength(1)
+  })
+
+  it('lets an explicit recover clear the model refusals too', async () => {
+    const pool = await makePool(['a'])
+    pool.report('a', { ok: false, kind: 'model_blocked', model: 'ghost', message: '11102' })
+    pool.reset('a')
+    expect(pool.modelCooldownsOf('a')).toHaveLength(0)
+  })
+})
+
+describe('a gateway (WAF) refusal', () => {
+  it('cools the account down without ever disabling it', async () => {
+    // The firewall answered, not the API. It is a per-IP signal that clears on
+    // its own, so needing a human for it would be wrong.
+    const time = clock()
+    const pool = await makePool(['a'], { now: time.now })
+    pool.report('a', { ok: false, kind: 'waf_block', message: '403 html' })
+    const entry = pool.entryView('a')
+    expect(entry?.state).toBe('cooldown')
+    expect(entry?.cooldownKind).toBe('soft')
+    expect(entry?.enabled).toBe(true)
+  })
+
+  it('honours a Retry-After the gateway stated', async () => {
+    const time = clock()
+    const pool = await makePool(['a'], { now: time.now })
+    pool.report('a', { ok: false, kind: 'waf_block', retryAfterMs: 42_000, message: '403' })
+    // The stated wait, not the 60s base and no exponential growth from it.
+    expect((pool.entryView('a')?.cooldownUntil ?? 0) - time.now()).toBe(42_000)
+  })
+})
+
+describe('the reset wall clock on account-level limits', () => {
+  it('uses the upstream instant and does not grow it', async () => {
+    const time = clock()
+    const pool = await makePool(['a'], { now: time.now })
+    const resetAtMs = time.now() + 90_000
+    pool.report('a', { ok: false, kind: 'soft_rate', resetAtMs, message: '429 将在 … 重置' })
+    expect(pool.entryView('a')?.cooldownUntil).toBe(resetAtMs)
+    // A second refusal must not push the deadline past what the upstream said.
+    time.advance(1_000)
+    pool.report('a', { ok: false, kind: 'soft_rate', resetAtMs: resetAtMs + 60_000, message: '429' })
+    expect(pool.entryView('a')?.cooldownUntil).toBe(resetAtMs + 60_000)
+  })
+
+  it('prefers a body reset moment over a Retry-After header', async () => {
+    // The body wording is the narrower statement about this very limit.
+    const time = clock()
+    const pool = await makePool(['a'], { now: time.now })
+    pool.report('a', { ok: false, kind: 'soft_rate', resetAtMs: time.now() + 10_000, retryAfterMs: 600_000, message: '429' })
+    expect((pool.entryView('a')?.cooldownUntil ?? 0) - time.now()).toBe(10_000)
+  })
+
+  it('uses Retry-After when the body said nothing', async () => {
+    const time = clock()
+    const pool = await makePool(['a'], { now: time.now })
+    pool.report('a', { ok: false, kind: 'soft_rate', retryAfterMs: 30_000, message: '429' })
+    expect((pool.entryView('a')?.cooldownUntil ?? 0) - time.now()).toBe(30_000)
+  })
+})
+
+describe('cost-tiered picking (layered picks)', () => {
+  it('prefers an account observed FREE for this model', async () => {
+    const pool = await makePool(['a', 'b'])
+    // 'a' was measured free for this model; 'b' has no observation at all.
+    pool.noteModelCost('a', 'promo', 0, 1000)
+    const picked = new Set<string>()
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const result = pool.pick({ model: 'promo' })
+      if (result.ok) {
+        picked.add(result.entry.accountId)
+        pool.release(result.entry.accountId)
+      }
+    }
+    // Tier 0 is a hard filter, so 'b' is never chosen while 'a' qualifies.
+    expect(picked).toEqual(new Set(['a']))
+    // And the tier really is why: with no model named, both are eligible.
+    const unnamed = new Set<string>()
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const result = pool.pick()
+      if (result.ok) {
+        unnamed.add(result.entry.accountId)
+        pool.release(result.entry.accountId)
+      }
+    }
+    expect(unnamed.size).toBe(2)
+  })
+
+  it('prefers an unobserved account over one known to charge', async () => {
+    // The free status of a new account can only be learned by trying it, so a
+    // known-paid account must not win every time.
+    const pool = await makePool(['a', 'b'])
+    pool.noteModelCost('a', 'promo', 5, 1000)
+    const picked = new Set<string>()
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const result = pool.pick({ model: 'promo' })
+      if (result.ok) {
+        picked.add(result.entry.accountId)
+        pool.release(result.entry.accountId)
+      }
+    }
+    // 'b' is unobserved (tier 1) and 'a' is known to charge (tier 2), so the
+    // unobserved account wins every draw.
+    expect(picked).toEqual(new Set(['b']))
+  })
+
+  it('falls back to plain weighting when no model is named', async () => {
+    const pool = await makePool(['a', 'b'])
+    pool.noteModelCost('a', 'promo', 0, 1000)
+    const picked = new Set<string>()
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const result = pool.pick()
+      if (result.ok) {
+        picked.add(result.entry.accountId)
+        pool.release(result.entry.accountId)
+      }
+    }
+    // With no model there is no tier, so both accounts stay eligible.
+    expect(picked.has('b')).toBe(true)
+  })
+
+  it('keeps both paid accounts eligible and never shuts the cheaper one out', async () => {
+    // Cost ranks WITHIN a tier; it does not exclude. Two paid accounts both stay
+    // eligible (so a price spike on one cannot starve the other), while the
+    // cheaper one heads the shortlist the weighted draw comes from.
+    // Absolute exclusion is exactly what the FREE tier is for — see the next test.
+    const pool = await makePool(['cheap', 'dear'])
+    pool.noteModelCost('cheap', 'm', 1, 1000)
+    pool.noteModelCost('dear', 'm', 9, 1000)
+    const picked = new Set<string>()
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const result = pool.pick({ model: 'm' })
+      if (result.ok) {
+        picked.add(result.entry.accountId)
+        pool.release(result.entry.accountId)
+      }
+    }
+    expect(picked).toEqual(new Set(['cheap', 'dear']))
+    expect(picked.has('cheap')).toBe(true)
+  })
+
+  it('EXCLUDES a paid account in favour of a free one', async () => {
+    // Tier 0 is a hard filter: with a measured-free account available, a known
+    // paid one is never chosen, which is the whole point of watching real cost.
+    const pool = await makePool(['free', 'paid'])
+    pool.noteModelCost('free', 'm', 0, 1000)
+    pool.noteModelCost('paid', 'm', 5, 1000)
+    const picked = new Set<string>()
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const result = pool.pick({ model: 'm' })
+      if (result.ok) {
+        picked.add(result.entry.accountId)
+        pool.release(result.entry.accountId)
+      }
+    }
+    expect(picked).toEqual(new Set(['free']))
+  })
+
+  it('ignores a cost observation that has gone stale', async () => {
+    // A "free at night" observation must not persist into the paid hours.
+    const time = clock()
+    const pool = await makePool(['a', 'b'], { now: time.now })
+    pool.noteModelCost('a', 'm', 0, 1000)
+    pool.noteModelCost('b', 'm', 5, 1000)
+    time.advance(7 * 3_600_000)
+    const picked = new Set<string>()
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const result = pool.pick({ model: 'm' })
+      if (result.ok) {
+        picked.add(result.entry.accountId)
+        pool.release(result.entry.accountId)
+      }
+    }
+    // Both observations expired, so both sit in the unobserved tier.
+    expect(picked.size).toBe(2)
+  })
+})
+describe('sticky allocation (idle-first)', () => {
+  it('spreads simultaneous new conversations across idle accounts', async () => {
+    // Without this, every new conversation's first request is decided by weight
+    // alone, and the heaviest account collects them all.
+    const pool = await makePool(['a', 'b', 'c'])
+    // Give 'a' the strongest weight so pure weighting would always choose it.
+    pool.setCredits('a', { total: 10_000, expiringSoon: 0 })
+    pool.setCredits('b', { total: 1, expiringSoon: 0 })
+    pool.setCredits('c', { total: 1, expiringSoon: 0 })
+    const assigned: string[] = []
+    for (const session of ['s1', 's2', 's3']) {
+      const result = pool.pick({ stickyKey: session })
+      if (!result.ok) continue
+      assigned.push(result.entry.accountId)
+      // Bind the session by reporting a success, exactly as the shim does.
+      pool.report(result.entry.accountId, { ok: true }, session)
+      pool.release(result.entry.accountId)
+    }
+    // Three different sessions take three different accounts, despite 'a'
+    // carrying all the weight.
+    expect(new Set(assigned).size).toBe(3)
+  })
+
+  it('still uses every account when all of them are already bound', async () => {
+    // The idle preference is a preference: with no idle account left, the
+    // weighted choice over the full candidate set decides.
+    const pool = await makePool(['a', 'b'])
+    pool.report('a', { ok: true }, 's1')
+    pool.report('b', { ok: true }, 's2')
+    const result = pool.pick({ stickyKey: 's3' })
+    expect(result.ok).toBe(true)
+  })
+
+  it('keeps an existing conversation on its own account', async () => {
+    // Idle-first must never move a bound session: that is the whole point of
+    // stickiness, and the fast path returns before the idle filter is reached.
+    const pool = await makePool(['a', 'b'])
+    pool.setCredits('b', { total: 10_000, expiringSoon: 0 })
+    pool.report('a', { ok: true }, 's1')
+    const first = pool.pick({ stickyKey: 's1' })
+    expect(first.ok && first.entry.accountId).toBe('a')
+    pool.release('a')
+    const again = pool.pick({ stickyKey: 's1' })
+    // Still 'a' even though 'b' is far richer and idle.
+    expect(again.ok && again.entry.accountId).toBe('a')
   })
 })
