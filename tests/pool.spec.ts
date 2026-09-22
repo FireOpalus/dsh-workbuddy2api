@@ -759,3 +759,72 @@ describe('sticky allocation (idle-first)', () => {
     expect(again.ok && again.entry.accountId).toBe('a')
   })
 })
+describe('reenableIfCredits (unfreezing after a check-in)', () => {
+  it('clears a hard credit cooldown when the balance came back', async () => {
+    // This is what the startup check-in is FOR: an account parked for running out
+    // of credits is restored by its own check-in, and without this it would sit
+    // idle until 04:00 despite being usable again.
+    const pool = await makePool(['a'])
+    pool.report('a', { ok: false, kind: 'hard_credit', message: '积分不足' })
+    expect(pool.entryView('a')?.cooldownKind).toBe('hard')
+    expect(pool.reenableIfCredits('a', { total: 500 })).toBe(true)
+    const entry = pool.entryView('a')
+    expect(entry?.cooldownUntil).toBeUndefined()
+    expect(entry?.state).toBe('ready')
+    expect(entry?.credits).toBe(500)
+  })
+
+  it('reports false when there was nothing to unfreeze', async () => {
+    // The bug this pins down: inferring "unfrozen" from the balance alone reports
+    // a recovery for every healthy account, which is a claim it cannot back.
+    const pool = await makePool(['a'])
+    expect(pool.reenableIfCredits('a', { total: 500 })).toBe(false)
+    // The balance is still recorded, because it is a fact either way.
+    expect(pool.entryView('a')?.credits).toBe(500)
+  })
+
+  it('does not unfreeze an account that still has no credits', async () => {
+    const pool = await makePool(['a'])
+    pool.report('a', { ok: false, kind: 'hard_credit', message: '积分不足' })
+    expect(pool.reenableIfCredits('a', { total: 0 })).toBe(false)
+    expect(pool.entryView('a')?.cooldownKind).toBe('hard')
+    expect(pool.entryView('a')?.credits).toBe(0)
+  })
+
+  it('never clears the breaker', async () => {
+    // A check-in proves the BILLING channel works and the balance is back; it
+    // says nothing about the chat channel that tripped the breaker.
+    const pool = await makePool(['a'], { policy: { breakerThreshold: 1, breakerCooldownMs: 60_000 } })
+    pool.report('a', { ok: false, kind: 'server', message: '500' })
+    expect(pool.entryView('a')?.breakerUntil).toBeDefined()
+    pool.reenableIfCredits('a', { total: 900 })
+    expect(pool.entryView('a')?.breakerUntil).toBeDefined()
+  })
+
+  it('leaves a disabled account disabled but records its balance', async () => {
+    // Disabled is the user's own switch; a startup step must not silently
+    // re-enable an account they turned off.
+    const pool = await makePool(['a'])
+    pool.configure([{ accountId: 'a', enabled: false }])
+    pool.report('a', { ok: false, kind: 'hard_credit', message: '积分不足' })
+    expect(pool.reenableIfCredits('a', { total: 700 })).toBe(false)
+    const entry = pool.entryView('a')
+    expect(entry?.enabled).toBe(false)
+    expect(entry?.credits).toBe(700)
+  })
+
+  it('is a no-op for an account the pool does not have', async () => {
+    const pool = await makePool(['a'])
+    expect(pool.reenableIfCredits('ghost', { total: 100 })).toBe(false)
+    expect(pool.entryView('ghost')).toBeUndefined()
+  })
+
+  it('makes the account pickable again after unfreezing', async () => {
+    const pool = await makePool(['a'])
+    pool.report('a', { ok: false, kind: 'hard_credit', message: '积分不足' })
+    // A hard cooldown is excluded even from the all-cooling fallback.
+    expect(pool.pick().ok).toBe(false)
+    pool.reenableIfCredits('a', { total: 500 })
+    expect(pool.pick().ok).toBe(true)
+  })
+})

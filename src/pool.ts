@@ -1067,6 +1067,51 @@ export class WorkBuddyAccountPool {
     entry.modelCooldowns.clear()
   }
 
+  /**
+   * Record an account's refreshed balance, and unfreeze it when the balance came
+   * back.
+   *
+   * This is what the startup check-in is FOR: an account parked in a hard
+   * cooldown because it ran out of credits has its balance restored by the daily
+   * check-in, and until something clears that cooldown the pool keeps ignoring a
+   * perfectly usable account.
+   *
+   * Two deliberate limits:
+   *   - the COOLING domain is cleared, the BREAKER is not: a successful check-in
+   *     proves the billing channel works and the balance is back, which says
+   *     nothing about the chat channel that tripped the breaker;
+   *   - a disabled account stays disabled (that is the user's own switch), and an
+   *     account with nothing left is not unfrozen — it would only fail again.
+   *
+   * @returns whether anything was actually cleared. Only the pool knows this; a
+   *   caller that only sees a balance would report a recovery every time.
+   */
+  reenableIfCredits(
+    accountId: string,
+    credits: { total: number; expiringSoon?: number; capacity?: number },
+  ): boolean {
+    const entry = this.entries.get(accountId)
+    if (entry === undefined) return false
+    entry.credits = credits.total
+    if (credits.expiringSoon !== undefined) entry.creditsExpiring = credits.expiringSoon
+    if (credits.capacity !== undefined) entry.creditsCapacity = credits.capacity
+    entry.creditsAtMs = this.now()
+    if (credits.total <= 0 || !entry.enabled) return false
+    const unfrozen = entry.cooldownUntil > 0
+      || entry.cooldownKind !== 'none'
+      || entry.softStreak > 0
+      || entry.degradedUntil > 0
+      || entry.modelCooldowns.size > 0
+    entry.cooldownUntil = 0
+    entry.cooldownKind = 'none'
+    entry.softStreak = 0
+    entry.degradedUntil = 0
+    entry.consecutiveFails = 0
+    entry.modelCooldowns.clear()
+    entry.lastError = ''
+    return unfrozen
+  }
+
   /** Live per-model cooldowns for one account, for the card and the CLI. */
   modelCooldownsOf(accountId: string): { model: string; untilMs: number; reason: string; hits: number }[] {
     const entry = this.entries.get(accountId)

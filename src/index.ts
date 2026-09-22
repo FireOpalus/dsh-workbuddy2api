@@ -64,6 +64,7 @@ import {
   WorkBuddyTaskScheduler,
 } from './tasks.ts'
 import { clearPoolState, readPoolState, writePoolState } from './pool-state.ts'
+import { checkinAllAccounts } from './startup-checkin.ts'
 import type { WorkBuddyPoolCounterRecord, WorkBuddyPoolStateDocument } from './pool-state.ts'
 import type { WorkBuddyTaskSchedule, WorkBuddyTaskScheduleStatus } from './tasks.ts'
 import { clearHostHeartbeat, writeHostHeartbeat } from './host-heartbeat.ts'
@@ -143,6 +144,11 @@ export {
   type WorkBuddyRegion,
   type WorkBuddyUpstreamModel,
 } from './upstream.ts'
+export {
+  checkinAllAccounts,
+  isAlreadyCheckedIn,
+  type WorkBuddyCheckinResult,
+} from './startup-checkin.ts'
 export {
   clearPoolState,
   parsePoolCounterRecord,
@@ -622,6 +628,34 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
+  /**
+   * Check every account in, once per startup. Called after the counters are
+   * restored so an unfreeze is not immediately overwritten by the restore.
+   */
+  const runStartupCheckin = async (): Promise<void> => {
+    await checkinAllAccounts({
+      client,
+      pool: region => stacks[region].pool,
+      accounts: async () => {
+        const found: { credential: WorkBuddyCredential; accountId: string; region: WorkBuddyRegion }[] = []
+        for (const region of REGION_KEYS) {
+          const stack = stacks[region]
+          // `present && enabled` only: a COOLING account is exactly the one worth
+          // checking in, because unfreezing it is half the point of doing this.
+          const ids = stack.pool.snapshot()
+            .filter(entry => entry.present && entry.enabled)
+            .map(entry => entry.accountId)
+          for (const credential of await stack.store.byIds(ids)) {
+            // The pool's own id, so the unfreeze can find the entry it belongs to.
+            found.push({ credential, accountId: workbuddyAccountId(credential), region })
+          }
+        }
+        return found
+      },
+      log: message => { ctx.logger.info('dsh-workbuddy2api: ' + message) },
+    })
+  }
+
   /** Persist soon, coalescing a burst of dispatches into one write. */
   const schedulePersist = (): void => {
     if (!countersLoaded) return
@@ -906,6 +940,24 @@ export function apply(ctx: Context, config: Config): void {
           // starts from zero, exactly as it did before persistence existed.
           countersLoaded = true
           ctx.logger.warn('dsh-workbuddy2api: pool counters could not be restored', error)
+        }
+
+        // Check every account in, once per startup.
+        //
+        // Deliberately NOT scheduled: it runs when DSH starts and that is all.
+        // The reward is small, but the side effect is not — a check-in restores
+        // the balance of an account that ran out of credits, and the pool can then
+        // unfreeze it instead of ignoring a usable account all day.
+        //
+        // Last in this block on purpose: the counters above must be restored
+        // first, or the unfreeze would be recorded and then overwritten.
+        try {
+          await runStartupCheckin()
+          schedulePersist()
+        } catch (error: unknown) {
+          // A failed check-in never blocks startup: the providers are already
+          // registered and the pool works exactly as it did before.
+          ctx.logger.warn('dsh-workbuddy2api: startup check-in failed', error)
         }
       })()
 

@@ -1228,6 +1228,30 @@ declare class WorkBuddyAccountPool {
   }[]): void;
   /** Forget one account's cooldown, breaker, and degrade marks. */
   reset(accountId: string): void;
+  /**
+   * Record an account's refreshed balance, and unfreeze it when the balance came
+   * back.
+   *
+   * This is what the startup check-in is FOR: an account parked in a hard
+   * cooldown because it ran out of credits has its balance restored by the daily
+   * check-in, and until something clears that cooldown the pool keeps ignoring a
+   * perfectly usable account.
+   *
+   * Two deliberate limits:
+   *   - the COOLING domain is cleared, the BREAKER is not: a successful check-in
+   *     proves the billing channel works and the balance is back, which says
+   *     nothing about the chat channel that tripped the breaker;
+   *   - a disabled account stays disabled (that is the user's own switch), and an
+   *     account with nothing left is not unfrozen — it would only fail again.
+   *
+   * @returns whether anything was actually cleared. Only the pool knows this; a
+   *   caller that only sees a balance would report a recovery every time.
+   */
+  reenableIfCredits(accountId: string, credits: {
+    total: number;
+    expiringSoon?: number;
+    capacity?: number;
+  }): boolean;
   /** Live per-model cooldowns for one account, for the card and the CLI. */
   modelCooldownsOf(accountId: string): {
     model: string;
@@ -1595,6 +1619,52 @@ declare function workBuddyThinkingLevelMap(info: WorkBuddyModelInfo): WorkBuddyT
  */
 declare function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkBuddyAdapter;
 //#endregion
+//#region src/startup-checkin.d.ts
+/**
+ * Whether a failure means today's check-in was already done.
+ *
+ * Two conditions, both required:
+ *   - the gateway ANSWERED with a business envelope, so a dropped connection —
+ *     which also throws — can never be mistaken for a completed check-in;
+ *   - the message names the redundant check-in.
+ */
+declare function isAlreadyCheckedIn(error: unknown): boolean;
+/** One account's outcome. */
+interface WorkBuddyCheckinResult {
+  accountId: string;
+  accountName: string;
+  outcome: 'claimed' | 'already' | 'inactive' | 'error';
+  message: string;
+  /** Credits granted by this run, when it claimed the reward. */
+  credit?: number;
+  /** Whether the balance refresh actually unfroze the account. */
+  unfrozen?: boolean;
+}
+/**
+ * Check in every configured account once.
+ *
+ * Never throws: a startup step that can take the whole plugin down would turn a
+ * nice-to-have into a liability, so every failure is reported in the results.
+ */
+declare function checkinAllAccounts(options: {
+  client: Pick<WorkBuddyUpstreamClient, 'fetchCheckinStatus' | 'claimDailyCheckin' | 'fetchCredits'>;
+  /** Region-scoped pools, so an account is unfrozen in the pool that owns it. */
+  pool(region: WorkBuddyRegion): WorkBuddyAccountPool;
+  /**
+   * The accounts to visit, each with the region that owns it.
+   *
+   * `accountId` is the POOL's key (derived from `uin`), which is deliberately
+   * not the same string as `credential.uid` (the upstream's own id). Passing the
+   * wrong one silently misses the entry, so the caller supplies it explicitly.
+   */
+  accounts(): Promise<readonly {
+    credential: WorkBuddyCredential;
+    accountId: string;
+    region: WorkBuddyRegion;
+  }[]>;
+  log(message: string): void;
+}): Promise<readonly WorkBuddyCheckinResult[]>;
+//#endregion
 //#region src/login.d.ts
 /** How long an unfinished authorization URL stays pollable. */
 declare const WORKBUDDY_LOGIN_TTL_MS: number;
@@ -1921,4 +1991,4 @@ declare function resolvePolicy(configured: Partial<WorkBuddyPoolTuning> | undefi
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { Config, DEFAULT_WORKBUDDY_POOL_POLICY, DEFAULT_WORKBUDDY_TASK_SCHEDULE, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, REGION_KEYS, type UpstreamErrorKind, WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, WORKBUDDY2API_ACCOUNT_PARAM, WORKBUDDY2API_CHECKIN_PATH, WORKBUDDY2API_CREDITS_REFRESH_PATH, WORKBUDDY2API_GLOBAL_PROVIDER, WORKBUDDY2API_HOST_HEARTBEAT_FILENAME, WORKBUDDY2API_LOGIN_POLL_PATH, WORKBUDDY2API_LOGIN_START_PATH, WORKBUDDY2API_MODELS_REFRESH_PATH, WORKBUDDY2API_POOL_ACTION_PATH, WORKBUDDY2API_POOL_STATE_FILENAME, WORKBUDDY2API_POOL_STATE_VERSION, WORKBUDDY2API_PROVIDER, WORKBUDDY2API_PROVIDERS, WORKBUDDY2API_PROVIDER_DISPLAY_NAME, WORKBUDDY2API_PROVIDER_DISPLAY_NAMES, WORKBUDDY2API_REGIONS, WORKBUDDY2API_REGION_PARAM, WORKBUDDY2API_SETTINGS_NS, WORKBUDDY2API_STATE_PARAM, WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY2API_USAGE_PATH, WORKBUDDY2API_VERSION, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_LOGIN_TTL_MS, type WorkBuddyAccountChoice, WorkBuddyAccountPool, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCheckinClaim, type WorkBuddyCheckinStatus, type WorkBuddyContextBudget, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredentialStoreOptions, type WorkBuddyCreditPackage, type WorkBuddyCredits, type WorkBuddyDesktopEvent, type WorkBuddyDispatchOutcome, type WorkBuddyHostHeartbeat, type WorkBuddyLoginAccount, type WorkBuddyLoginEndpoints, WorkBuddyLoginManager, type WorkBuddyLoginManagerOptions, type WorkBuddyLoginPoll, type WorkBuddyLoginStart, WorkBuddyLoginUnknownStateError, type WorkBuddyModelInfo, WorkBuddyPersistedModel, type WorkBuddyPickResult, type WorkBuddyPoolAccount, type WorkBuddyPoolCounterRecord, type WorkBuddyPoolEntry, type WorkBuddyPoolMissReason, type WorkBuddyPoolPolicy, type WorkBuddyPoolState, type WorkBuddyPoolStateDocument, type WorkBuddyPoolStateRecord, type WorkBuddyPoolTuning, type WorkBuddyReasoning, type WorkBuddyRefreshOutcome, type WorkBuddyRegion, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, type WorkBuddyTask, type WorkBuddyTaskClient, WorkBuddyTaskEngine, type WorkBuddyTaskOutcome, type WorkBuddyTaskResult, type WorkBuddyTaskReward, type WorkBuddyTaskRunReport, type WorkBuddyTaskSchedule, type WorkBuddyTaskScheduleStatus, WorkBuddyTaskScheduler, type WorkBuddyTaskView, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyWebAccount, type WorkBuddyWebAccountCredits, type WorkBuddyWebCheckin, type WorkBuddyWebCredits, type WorkBuddyWebLogin, type WorkBuddyWebModel, type WorkBuddyWebPackage, type WorkBuddyWebPoolEntry, type WorkBuddyWebPoolPolicy, type WorkBuddyWebPoolState, type WorkBuddyWebRegion, type WorkBuddyWebUsage, apply, applyContextBudgets, authFileName, automatedTaskCodes, classifyUpstreamError, clearHostHeartbeat, clearPoolState, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, deriveCatalog, expiryToMs, fallbackModelsFor, inject, isFresher, isHeartbeatProcessAlive, loginEndpointsFor, name, nextDailyRunAt, nextDay4Am, parseCreditMultiplier, parsePoolCounterRecord, parseReasoning, parseUpstreamModel, parseUpstreamTask, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, progressText, readHostHeartbeat, readPoolState, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, registerWorkBuddy2ApiStatusRoute, resolvePolicy, selectCliModels, setWorkBuddyTaskDelay, stickyKeyOf, toPersistedWorkBuddyModel, unsupportedReasonFor, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, workbuddyPoolStatePath, writeHostHeartbeat, writePoolState };
+export { Config, DEFAULT_WORKBUDDY_POOL_POLICY, DEFAULT_WORKBUDDY_TASK_SCHEDULE, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, REGION_KEYS, type UpstreamErrorKind, WORKBUDDY2API_ACCOUNTS_REFRESH_PATH, WORKBUDDY2API_ACCOUNT_PARAM, WORKBUDDY2API_CHECKIN_PATH, WORKBUDDY2API_CREDITS_REFRESH_PATH, WORKBUDDY2API_GLOBAL_PROVIDER, WORKBUDDY2API_HOST_HEARTBEAT_FILENAME, WORKBUDDY2API_LOGIN_POLL_PATH, WORKBUDDY2API_LOGIN_START_PATH, WORKBUDDY2API_MODELS_REFRESH_PATH, WORKBUDDY2API_POOL_ACTION_PATH, WORKBUDDY2API_POOL_STATE_FILENAME, WORKBUDDY2API_POOL_STATE_VERSION, WORKBUDDY2API_PROVIDER, WORKBUDDY2API_PROVIDERS, WORKBUDDY2API_PROVIDER_DISPLAY_NAME, WORKBUDDY2API_PROVIDER_DISPLAY_NAMES, WORKBUDDY2API_REGIONS, WORKBUDDY2API_REGION_PARAM, WORKBUDDY2API_SETTINGS_NS, WORKBUDDY2API_STATE_PARAM, WORKBUDDY2API_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY2API_USAGE_PATH, WORKBUDDY2API_VERSION, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_LOGIN_TTL_MS, type WorkBuddyAccountChoice, WorkBuddyAccountPool, type WorkBuddyAdapter, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCheckinClaim, type WorkBuddyCheckinResult, type WorkBuddyCheckinStatus, type WorkBuddyContextBudget, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredentialStoreOptions, type WorkBuddyCreditPackage, type WorkBuddyCredits, type WorkBuddyDesktopEvent, type WorkBuddyDispatchOutcome, type WorkBuddyHostHeartbeat, type WorkBuddyLoginAccount, type WorkBuddyLoginEndpoints, WorkBuddyLoginManager, type WorkBuddyLoginManagerOptions, type WorkBuddyLoginPoll, type WorkBuddyLoginStart, WorkBuddyLoginUnknownStateError, type WorkBuddyModelInfo, WorkBuddyPersistedModel, type WorkBuddyPickResult, type WorkBuddyPoolAccount, type WorkBuddyPoolCounterRecord, type WorkBuddyPoolEntry, type WorkBuddyPoolMissReason, type WorkBuddyPoolPolicy, type WorkBuddyPoolState, type WorkBuddyPoolStateDocument, type WorkBuddyPoolStateRecord, type WorkBuddyPoolTuning, type WorkBuddyReasoning, type WorkBuddyRefreshOutcome, type WorkBuddyRegion, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, type WorkBuddyTask, type WorkBuddyTaskClient, WorkBuddyTaskEngine, type WorkBuddyTaskOutcome, type WorkBuddyTaskResult, type WorkBuddyTaskReward, type WorkBuddyTaskRunReport, type WorkBuddyTaskSchedule, type WorkBuddyTaskScheduleStatus, WorkBuddyTaskScheduler, type WorkBuddyTaskView, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyWebAccount, type WorkBuddyWebAccountCredits, type WorkBuddyWebCheckin, type WorkBuddyWebCredits, type WorkBuddyWebLogin, type WorkBuddyWebModel, type WorkBuddyWebPackage, type WorkBuddyWebPoolEntry, type WorkBuddyWebPoolPolicy, type WorkBuddyWebPoolState, type WorkBuddyWebRegion, type WorkBuddyWebUsage, apply, applyContextBudgets, authFileName, automatedTaskCodes, checkinAllAccounts, classifyUpstreamError, clearHostHeartbeat, clearPoolState, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, deriveCatalog, expiryToMs, fallbackModelsFor, inject, isAlreadyCheckedIn, isFresher, isHeartbeatProcessAlive, loginEndpointsFor, name, nextDailyRunAt, nextDay4Am, parseCreditMultiplier, parsePoolCounterRecord, parseReasoning, parseUpstreamModel, parseUpstreamTask, parseWorkBuddyAuth, prepareChatBody, processStartTimeMs, progressText, readHostHeartbeat, readPoolState, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, registerWorkBuddy2ApiStatusRoute, resolvePolicy, selectCliModels, setWorkBuddyTaskDelay, stickyKeyOf, toPersistedWorkBuddyModel, unsupportedReasonFor, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, workbuddyPoolStatePath, writeHostHeartbeat, writePoolState };
