@@ -1,5 +1,21 @@
 # 更新日志
 
+## [Unreleased]
+
+### 发布
+
+- **发布到 npm**：新增 `.github/workflows/publish.yml`，推 `v*` 标签即通过 npm
+  trusted publishing（OIDC）自动发布，仓库里不存任何令牌，provenance 自动附加。
+  首个版本需手动首发 —— trusted publisher 的配置入口在包的设置页，包不在 registry
+  上就没法配。
+
+### 修复
+
+- **测试里的定时炸弹**：`tests/upstream.spec.ts` 的积分用例把赠包到期日写死成
+  `2026-09-20`。`fetchCredits` 会丢弃已过期的一次性赠包，所以这个字面量在写下
+  那一刻是对的、过期那天起就必然失败 —— **代码一行没改**。已改为相对当前时间推算，
+  这样断言测的是聚合逻辑，不是跑测试的日期。
+
 ## [0.4.9] - 2026-09-18
 
 对齐参考实现（workbuddy2api）的池策略，并回答三个分析项。完整对比见

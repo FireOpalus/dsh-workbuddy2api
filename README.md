@@ -186,7 +186,7 @@ shim 再拿这个 id 去凭据库解析 token。这样 token 永远不进入调�
 # 从工作区目录安装（开发期）
 dsh plugin --profile web add D:/Project/dsh-wb2api
 
-# 或从 npm 安装（发布后）
+# 或从 npm 安装
 dsh plugin --profile web add dsh-workbuddy2api
 ```
 
@@ -227,11 +227,11 @@ dsh plugin --profile web exec dsh-workbuddy2api logout   # 清除插件自有的
 - **模型**：从上游刷新目录 → 勾选启用 → 保存；图片输入按模型手动勾选
   （上游的能力标记不可靠，不作为依据）。刷新是草稿操作，点保存才生效。
 
-## 发布（GitHub）
+## 发布
 
-本插件的分发以 **GitHub 仓库 + Release** 为主：仓库即安装源
-（`dsh plugin add https://github.com/FireOpalus/dsh-workbuddy2api`），
-每个 tag 的 Release 附上 `npm pack` 出的 tarball 作为可归档产物。
+分发有两条路，都由同一个 `v*` 标签触发：**GitHub 仓库 + Release**（仓库即安装源）
+与 **npm**（`dsh plugin add dsh-workbuddy2api`）。两条路互不依赖，任一失败不影响
+另一条。
 
 ### 打一个版本
 
@@ -246,10 +246,13 @@ git add -A && git commit -m "chore(release): x.y.z"
 git tag vx.y.z && git push origin main --tags
 ```
 
-标签推上去后，`.github/workflows/release.yml` 会自动：校验标签与 package.json
-版本一致 → 跑 typecheck 与全部单测 → `npm pack` 并做产物自检 → 用 CHANGELOG
-里对应版本的段落建 Release 并附上 tarball。**版本不一致或测试不过，就不会产生
-Release**，这是刻意的。
+标签推上去后两个工作流并行跑，都会先校验标签与 package.json 版本一致：
+
+- `.github/workflows/release.yml`：typecheck + 全部单测 → `npm pack` 并做产物自检
+  → 用 CHANGELOG 里对应版本的段落建 Release 并附上 tarball。
+- `.github/workflows/publish.yml`：同样的检查 → `npm publish`（OIDC，无需令牌）。
+
+**版本不一致或测试不过，两边都不会发**，这是刻意的。
 
 ### 手动建 Release（可选）
 
@@ -261,13 +264,34 @@ WB2API_GH_TOKEN=<token> node scripts/publish-release.mjs v0.1.0
 
 token 只从环境变量读、绝不打印；输出只有状态码与 URL；同名 asset 已存在时跳过。
 
-### 为什么默认不发 npm
+### npm（trusted publishing / OIDC）
 
-本插件是 DSH bundle，主要安装方式就是 git/本地目录，npm 只是可选渠道。
-若之后要同时发 npm，参照同机 `dsh-laa` 的
-`.github/workflows/publish.yml`（npm trusted publishing / OIDC），注意三个坑：
-不要给 `setup-node` 传 `registry-url`、发布前 `unset NODE_AUTH_TOKEN`（空串也会
-让 npm 先走 token 认证并报 `ENEEDAUTH`）、npm 必须 ≥ 11.5.1。
+npm 侧走 **trusted publishing**：仓库里不放任何 npm 令牌，GitHub Actions 用 OIDC
+换取一次性发布凭据，provenance 自动附加。
+
+一次性配置（每个包只做一遍）：
+
+1. **首个版本必须手动发**：trusted publisher 的配置入口在**包的设置页**，包在
+   registry 上不存在就没法配。手动发一版（账号开了 2FA 就带上 `--otp=<6位验证码>`，
+   否则报 `E403`）。
+2. 包页 → **Settings → Trusted publishing → GitHub Actions**：
+
+   | 字段 | 值 |
+   |---|---|
+   | Organization or user | `FireOpalus` |
+   | Repository | `dsh-workbuddy2api`（**不含 owner**） |
+   | Workflow filename | `publish.yml`（**只填文件名，必须带 `.yml`**） |
+   | Environment name | 留空 |
+   | Allowed actions | 勾 `npm publish`（只勾 `npm stage publish` 则每次都要人工批准） |
+
+   npm 保存时**不做任何校验**：字段写错也提示成功，只会在真正发布时报
+   `ENEEDAUTH`；而且**存了不能改，只能删了重建**。
+3. 确认 OIDC 发布跑通后，再上 **Settings → Publishing access → Require two-factor
+   authentication and disallow tokens**。此后令牌彻底发不了，只有 trusted publisher 能发。
+
+工作流本身有三个坑（都来自同机 `dsh-laa` 的实测，报错非常有误导性）：不要给
+`setup-node` 传 `registry-url`；发布前 `unset NODE_AUTH_TOKEN`（**空串也算**，
+npm 只要看到变量存在就先走 token 认证并报 `ENEEDAUTH`）；npm 必须 ≥ 11.5.1。
 
 ## 开发
 

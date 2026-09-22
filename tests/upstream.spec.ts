@@ -229,21 +229,35 @@ describe('WorkBuddyUpstreamClient', () => {
 
   it('aggregates credit packages and skips exhausted one-off gifts', async () => {
     const client = new WorkBuddyUpstreamClient()
+    // 日期一律相对「现在」推算，不写死字面量。fetchCredits 会把 ExpiredTime 已过的
+    // 一次性赠包丢掉，所以一个写死的「未来」日期就是一颗定时炸弹：它在写下的那一刻
+    // 是对的，过期那天起断言就会失败，而代码一行没改（2026-09-20 那颗在写下两天后
+    // 就爆了：Gift 被正确判为过期，total 从 491 掉成 451）。
+    const DAY_MS = 24 * 60 * 60 * 1000
+    // 本地时区格式，与 fetchCredits 解析的形态一致（Date.parse 会按本地时间解释它）。
+    const local = (ms: number): string => {
+      const date = new Date(ms)
+      const pad = (value: number): string => value.toString().padStart(2, '0')
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+        `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+    }
+    const cycleEnd = local(Date.now() + 10 * DAY_MS)
+    const giftExpiry = local(Date.now() + 3 * DAY_MS)
     vi.stubGlobal('fetch', async () => new Response(JSON.stringify({
       code: 0,
       msg: '',
       data: { Response: { Data: { Accounts: [
-        { PackageName: 'Monthly', CapacityType: 4, CycleCapacitySize: 500, CycleCapacityRemain: 451, CycleEndTime: '2026-10-01 00:00:00' },
-        { PackageName: 'Gift', CapacityType: 1, CapacitySize: 100, CapacityRemain: 40, ExpiredTime: '2026-09-20 00:00:00' },
-        { PackageName: 'Spent gift', CapacityType: 1, CapacitySize: 100, CapacityRemain: 0, ExpiredTime: '2026-09-20 00:00:00' },
-        { PackageName: 'Expired gift', CapacityType: 1, CapacitySize: 100, CapacityRemain: 10, ExpiredTime: '2000-01-01 00:00:00' },
+        { PackageName: 'Monthly', CapacityType: 4, CycleCapacitySize: 500, CycleCapacityRemain: 451, CycleEndTime: cycleEnd },
+        { PackageName: 'Gift', CapacityType: 1, CapacitySize: 100, CapacityRemain: 40, ExpiredTime: giftExpiry },
+        { PackageName: 'Spent gift', CapacityType: 1, CapacitySize: 100, CapacityRemain: 0, ExpiredTime: giftExpiry },
+        { PackageName: 'Expired gift', CapacityType: 1, CapacitySize: 100, CapacityRemain: 10, ExpiredTime: local(Date.now() - 3 * DAY_MS) },
       ] } } },
     }), { status: 200 }))
     const credits = await client.fetchCredits(credential())
     expect(credits.total).toBe(491)
     expect(credits.packages.map(pack => pack.packageName)).toEqual(['Monthly', 'Gift'])
     expect(credits.packages[0]?.monthly).toBe(true)
-    expect(credits.packages[0]?.refreshAtMs).toBe(Date.parse('2026-10-01 00:00:00') + 1_000)
+    expect(credits.packages[0]?.refreshAtMs).toBe(Date.parse(cycleEnd) + 1_000)
     expect(credits.packages[1]?.monthly).toBe(false)
     vi.unstubAllGlobals()
   })
