@@ -1,5 +1,45 @@
 # 更新日志
 
+## [0.6.5] - 2026-09-25
+
+### 修复：真正的根因 —— 读一个没注入的服务会**抛异常**，不是返回 undefined
+
+浏览器控制台终于给出了确切答案（我上一条请求的那行输出）：
+
+```
+[dsh-workbuddy2api] client card failed to load (host provider unaffected):
+Error: cannot get property "settingsScope" without inject
+    at new apply (client.js:2312:1)
+```
+
+就是这个。cordis 的 context 代理在**读取未注入的服务属性时抛异常**，而我写的是：
+
+```js
+const settingsScope = ctx.settingsScope === undefined   // ← 这里就抛了
+  ? createRouteSettingsScope(...)
+  : ctx.settingsScope.bind(...)
+```
+
+0.1.7-rc.2 移除了 `settingsScope`，我把「不再必需」这件事做对了（否则条目 pending），
+但**读取它的那一行**仍然在 —— 于是 `apply` 在**任何注册发生之前**就抛了，
+被我的 try/catch 吞掉，表现为「没有卡片、也没有任何输出」。
+
+这也解释了为什么 0.6.3 加的 `mounted` / `could not mount` 两行**一个字都没出现**：
+异常发生在它们之前。我一直在找"注册为什么没生效"，而实际上**注册代码根本没被执行到**。
+
+**修法**：改用 `ctx.get('settingsScope')` —— 这是**会回答"不存在"而不是抛异常**的那个读法，
+并且整体再包一层 try/catch（"这台宿主没有设置服务"在这里是正常状态，不是错误）。
+
+### 代价与反省
+
+这个 bug 一行就修完了，代价是**四个版本**（0.6.0 → 0.6.4）和一个错误的清单改动方向。
+根子上是我在**看不到浏览器时用推理代替验证**，而且连续几版都只盯着"注册逻辑"，
+没有先去确认"我的代码到底执行到了哪一步"。0.6.3 的自报输出是对的思路 —— 它本来一眼就能
+定位，我却是在你贴出控制台之后才真正用上它。
+
+已加守护测试（249 条）：源码中不得出现 `ctx.settingsScope ===` / `ctx.settingsScope.bind`，
+必须通过 `get.call(ctx, 'settingsScope')` 读取。
+
 ## [0.6.4] - 2026-09-25
 
 ### 修复：设置页仍不出现 —— 清单里声明了两个「不是客户端模块」的依赖

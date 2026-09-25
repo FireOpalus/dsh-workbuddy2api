@@ -68,19 +68,50 @@ type WorkBuddySlotsCompat = WorkBuddyClientContext['slots'] & {
   subscribeDeclaration?(key: string, listener: () => void): () => void
 }
 
+/**
+ * The framework's own settings service, when this host still has one.
+ *
+ * Read through `ctx.get`, never as a plain property: a property read of a service
+ * this entry did not inject THROWS in cordis, it does not return undefined — and
+ * that throw happens before anything is registered, so the card silently vanishes.
+ * The whole thing is guarded anyway, because "the host has no settings service" is
+ * an ordinary state here (0.1.7+ removed it), not an error worth failing on.
+ */
+function legacySettingsScope(ctx: WorkBuddyClientContext): WorkBuddySettingsScope | undefined {
+  try {
+    const get = (ctx as unknown as { get?: (name: string) => unknown }).get
+    if (typeof get !== 'function') return undefined
+    const service = get.call(ctx, 'settingsScope') as
+      | { bind(options: { namespace: string }): WorkBuddySettingsScope }
+      | undefined
+    if (service === undefined || typeof service.bind !== 'function') return undefined
+    return service.bind({ namespace: 'workbuddy2api' })
+  } catch {
+    // Present but unusable, or a proxy that still refuses the read: fall back to
+    // this plugin's own configuration route.
+    return undefined
+  }
+}
+
 /** Register card copy and the pool card under Plugin configuration. */
 export function apply(ctx: WorkBuddyClientContext): void {
   try {
     const namespace = 'settings.workbuddy2api'
     ctx.effect(() => ctx.locale.register(namespace, { zh, en }), 'dsh-workbuddy2api: settings copy')
     const t = ctx.locale.bind(namespace) as WorkBuddyPoolCardInjected['t']
-    // Absent on 0.1.7+, which removed the service. There the SAME interface is
-    // satisfied by the plugin's own configuration route, so the card's settings
-    // code is identical on both lines — and an unreachable host still only costs
-    // the form, never the entry.
-    const settingsScope: WorkBuddySettingsScope | undefined = ctx.settingsScope === undefined
-      ? createRouteSettingsScope({ url: WORKBUDDY2API_CONFIG_PATH })
-      : ctx.settingsScope.bind({ namespace: 'workbuddy2api' }) as WorkBuddySettingsScope
+    // The settings surface, on either DSH line.
+    //
+    // TWO traps here, both of which cost a release:
+    //   1. On 0.1.7+ the `settingsScope` SERVICE is gone, so this entry no longer
+    //      requires it — a required-but-absent service leaves the entry pending,
+    //      which DSH reports as a boot-level failure banner.
+    //   2. But reading it anyway is not "undefined": cordis's context proxy THROWS
+    //      ("cannot get property \"settingsScope\" without inject") for a service
+    //      that was not injected. That throw happened before any registration, so
+    //      the card never mounted and the failure looked like nothing at all.
+    // `ctx.get` is the read that answers "absent" instead of throwing.
+    const settingsScope: WorkBuddySettingsScope = legacySettingsScope(ctx)
+      ?? createRouteSettingsScope({ url: WORKBUDDY2API_CONFIG_PATH })
     const injected = (): WorkBuddyPoolCardInjected => ({ t, settingsScope })
     // 0.1.7+ replaced `settings.plugin.item` (a row inside another page's list)
     // with `settings.section` (a page of its own in the settings panel — the

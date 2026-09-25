@@ -117,6 +117,17 @@ describe('the browser half across DSH lines', () => {
     expect(CLIENT).toContain('could not mount')
   })
 
+  it('never READS an uninjected service as a property', () => {
+    // cordis's context proxy THROWS on a property read of a service this entry did
+    // not inject ("cannot get property \"settingsScope\" without inject") — it does
+    // not answer undefined. That throw landed before any registration, so the card
+    // silently never mounted and four releases were spent looking elsewhere.
+    // \`ctx.get\` is the read that answers "absent".
+    expect(CLIENT).not.toContain('ctx.settingsScope ===')
+    expect(CLIENT).not.toContain('ctx.settingsScope.bind')
+    expect(CLIENT).toContain("get.call(ctx, 'settingsScope')")
+  })
+
   it('falls back to its own route when the scope service is gone', () => {
     expect(CLIENT).toContain('createRouteSettingsScope')
     expect(CLIENT).toContain('WORKBUDDY2API_CONFIG_PATH')
