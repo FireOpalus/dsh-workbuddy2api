@@ -83,26 +83,44 @@ export function apply(ctx: WorkBuddyClientContext): void {
     const injected = (): WorkBuddyPoolCardInjected => ({ t, settingsScope })
     // 0.1.7+ replaced `settings.plugin.item` (a row inside another page's list)
     // with `settings.section` (a page of its own in the settings panel — the
-    // shape this card was always meant to have). Register into whichever the host
-    // actually declares, detected rather than assumed.
+    // shape this card was always meant to have).
+    //
+    // Which one this host has is decided by ASKING THE REGISTRY THROUGH `inject`,
+    // never by testing for the slot up front. These slots are declared by OTHER
+    // browser plugins, and at our apply time that declaration may not have happened
+    // yet — so a synchronous existence check answers "absent" on a host that does
+    // have the slot, and the card is then registered into a slot that will never
+    // render: no card, and no error either. (Learned the hard way: that is exactly
+    // how the settings page went missing while every test still passed.)
+    //
+    // `inject` is the API that WAITS for the declaration. Both are armed, the first
+    // to fire mounts the card, and the newer slot wins if a host ever declares both.
     const slots = ctx.slots as WorkBuddySlotsCompat
-    if (typeof slots.specDynamic === 'function' && slots.specDynamic('settings.section') !== undefined) {
-      ctx.slots.inject('settings.section', () => ctx.slots.register({
-        name: 'settings.section',
-        id: 'workbuddy2api',
-        order: 60,
-        label: () => t('card.pageTitle'),
-        locale: namespace,
+    let mounted = false
+    const mount = () => {
+      // Already mounted by the other arm: nothing left to contribute, but the
+      // callback still has to hand back a disposer.
+      if (mounted) return () => {}
+      mounted = true
+      if (typeof slots.specDynamic === 'function' && slots.specDynamic('settings.section') !== undefined) {
+        return ctx.slots.register({
+          name: 'settings.section',
+          id: 'workbuddy2api',
+          order: 60,
+          label: () => t('card.pageTitle'),
+          locale: namespace,
+          inject: injected,
+        }, WorkBuddyPoolCard)
+      }
+      return ctx.slots.register({
+        name: 'settings.plugin.item',
+        key: 'workbuddy2api',
+        priority: 30,
         inject: injected,
-      }, WorkBuddyPoolCard))
-      return
+      }, WorkBuddyPoolCard)
     }
-    ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
-      name: 'settings.plugin.item',
-      key: 'workbuddy2api',
-      priority: 30,
-      inject: injected,
-    }, WorkBuddyPoolCard))
+    ctx.slots.inject('settings.section', () => mount())
+    ctx.slots.inject('settings.plugin.item', () => mount())
   } catch (error: unknown) {
     // Degrade silently on the page: the host provider still serves models.
     // Developers see the full cause in the browser console; users see no banner.

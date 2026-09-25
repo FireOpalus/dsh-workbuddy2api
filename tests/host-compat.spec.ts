@@ -102,6 +102,19 @@ describe('the browser half across DSH lines', () => {
     expect(CLIENT).toContain("'settings.plugin.item'")
   })
 
+  it('arms BOTH slot injections instead of testing for the slot up front', () => {
+    // The bug this pins down: the slots are declared by OTHER browser plugins, so
+    // at our apply time the declaration may not exist yet. Checking synchronously
+    // answered "absent" on a host that has the slot, the card was registered into
+    // a slot that never renders, and the settings page was simply missing — with
+    // no error anywhere and every test still green.
+    expect(CLIENT).toContain("ctx.slots.inject('settings.section'")
+    expect(CLIENT).toContain("ctx.slots.inject('settings.plugin.item'")
+    // Both must route through the one mount, so the first to fire wins.
+    expect((CLIENT.match(/\(\) => mount\(\)/gu) ?? []).length).toBe(2)
+    expect(CLIENT).toContain('const mount = () => {')
+  })
+
   it('falls back to its own route when the scope service is gone', () => {
     expect(CLIENT).toContain('createRouteSettingsScope')
     expect(CLIENT).toContain('WORKBUDDY2API_CONFIG_PATH')
