@@ -251,6 +251,38 @@ export const inject = ['llm', 'settings']
 /** Settings namespace for the plugin configuration card. */
 export const WORKBUDDY2API_SETTINGS_NS = 'workbuddy2api' as SettingsNamespace
 
+/**
+ * The profile entry id, which is ALSO the settings key on DSH 0.1.7 and later.
+ *
+ * That line keys a plugin's settings by its entry id (see `cordis.patch.yml`),
+ * not by a name the plugin invents — it is the same string the Loader shows — so
+ * the entry id has to be known here to read the current values back.
+ */
+export const WORKBUDDY2API_ENTRY_ID = 'dsh-workbuddy2api'
+
+/**
+ * The settings service across the supported DSH lines.
+ *
+ * 0.1.7-rc.2 replaced `installSection` (which pushed a live config source and a
+ * change callback) with schema-derived forms keyed by entry id, plus a
+ * `configure` policy call. One build supports both by feature-detecting the
+ * service rather than by pinning a DSH version.
+ */
+interface WorkBuddySettingsCompat {
+  /** Present from 0.1.7: declare this instance's automatic-page policy. */
+  configure?(presentation: { auto?: boolean }, owner?: unknown): () => void
+  /** Present before 0.1.7: register the section and receive a live source. */
+  installSection?(
+    ctx: Context,
+    ns: SettingsNamespace,
+    schema: unknown,
+    config: unknown,
+    hooks: { setSource(source: () => Config): void; onChange(): void },
+  ): void
+  /** Present from 0.1.7: the current values, keyed by profile entry id. */
+  describe?(): readonly { ns: string; value?: unknown }[]
+}
+
 /** One persisted model entry; the settings codec rejects unknown keys. */
 export interface WorkBuddyPersistedModel {
   id: string
@@ -800,15 +832,53 @@ export function apply(ctx: Context, config: Config): void {
     runTaskSweep: async () => { await taskScheduler.runNow() },
   }))
 
-  ctx.settings.installSection(ctx, WORKBUDDY2API_SETTINGS_NS, Config, config, {
-    setSource(source: () => Config) { current = source },
-    onChange() {
-      applySelection(current())
-      // The schedule is read fresh before every sweep, so a change only has to
-      // re-arm the timers.
-      taskScheduler.start()
-    },
-  })
+  // The plugin-configuration surface, on either DSH line.
+  //
+  // 0.1.7-rc.2 removed `installSection` — which pushed a live source and a change
+  // callback — in favour of schema-derived forms keyed by PROFILE ENTRY ID. That
+  // removal is not cosmetic: calling the old method on the new line throws inside
+  // `apply`, which takes the whole plugin down with it (no providers, no models).
+  // So the service is feature-detected and both shapes are supported.
+  const settingsService = ctx.settings as unknown as WorkBuddySettingsCompat
+  if (typeof settingsService.configure === 'function') {
+    // Read the values back from the service on demand instead of caching them:
+    // that line reports changes through the entry's revision, not through a
+    // callback, so a stale cache would keep serving the previous configuration.
+    const describe = settingsService.describe
+    if (typeof describe === 'function') {
+      current = (): Config => {
+        for (const id of [WORKBUDDY2API_ENTRY_ID, WORKBUDDY2API_SETTINGS_NS]) {
+          const descriptor = describe.call(settingsService).find(entry => entry.ns === id)
+          if (descriptor?.value !== undefined) return descriptor.value as Config
+        }
+        // Nothing stored yet (a fresh install): the applied defaults are correct.
+        return config
+      }
+    }
+    // `auto: false` — this plugin ships its own page, so the framework must not
+    // also generate one from the schema. `ctx.fiber` may be absent on older
+    // cordis, in which case the service defaults the owner to the calling fiber.
+    ctx.inject(['settings'], (child) => {
+      // Cast through the compat shape: the types this repo compiles against are
+      // the older line's, which has no `configure` at all.
+      const service = child.settings as unknown as WorkBuddySettingsCompat
+      child.effect(
+        // `configure` returns the disposer the effect must hand back.
+        () => service.configure?.({ auto: false }, (ctx as unknown as { fiber?: unknown }).fiber) ?? (() => {}),
+        'dsh-workbuddy2api: settings page policy',
+      )
+    })
+  } else if (typeof settingsService.installSection === 'function') {
+    settingsService.installSection(ctx, WORKBUDDY2API_SETTINGS_NS, Config, config, {
+      setSource(source: () => Config) { current = source },
+      onChange() {
+        applySelection(current())
+        // The schedule is read fresh before every sweep, so a change only has to
+        // re-arm the timers.
+        taskScheduler.start()
+      },
+    })
+  }
 
   // Initial wiring: selections and each region's catalog from its saved state.
   applySelection(config)
