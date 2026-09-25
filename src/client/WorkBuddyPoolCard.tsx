@@ -54,11 +54,18 @@ import type { WorkBuddySettingsKey } from './locales.ts'
 /** Localized copy injected by the browser-plugin registration. */
 export interface WorkBuddyPoolCardInjected {
   t: (key: WorkBuddySettingsKey, params?: Record<string, unknown>) => string
-  settingsScope: {
+  /**
+   * The framework's settings scope.
+   *
+   * Absent on DSH 0.1.7-rc.2, which removed the service; every read below is
+   * guarded, so the card then renders the live pool without its settings form
+   * rather than failing to load at all.
+   */
+  settingsScope?: {
     getSnapshot(): { status: string; value?: unknown; writable: boolean }
     subscribe(listener: () => void): () => void
     set(field: string, value: unknown): Promise<void>
-  }
+  } | undefined
 }
 
 /** Props delivered by the Plugin configuration item slot. */

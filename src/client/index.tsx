@@ -48,8 +48,21 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 
 /** Stable browser-plugin name. */
 export const name = 'dsh-workbuddy2api-client'
-/** Client services required by the Plugin configuration contribution. */
-export const inject = ['slots', 'locale', 'settingsScope']
+/**
+ * Client services this contribution needs.
+ *
+ * `settingsScope` is deliberately NOT required. DSH 0.1.7-rc.2 removed it, and a
+ * required-but-absent service keeps the whole entry PENDING — which DSH reports
+ * as a boot-level "Failed to load plugins / 1 entry did not activate" banner, not
+ * as a merely missing card. The scope is resolved optionally below instead, and
+ * the card already treats every read as possibly-absent.
+ */
+export const inject = ['slots', 'locale']
+
+/** The slot lookup this entry needs, across DSH lines that changed it. */
+type WorkBuddySlotsCompat = WorkBuddyClientContext['slots'] & {
+  specDynamic?(key: string): unknown
+}
 
 /** Register card copy and the pool card under Plugin configuration. */
 export function apply(ctx: WorkBuddyClientContext): void {
@@ -57,12 +70,33 @@ export function apply(ctx: WorkBuddyClientContext): void {
     const namespace = 'settings.workbuddy2api'
     ctx.effect(() => ctx.locale.register(namespace, { zh, en }), 'dsh-workbuddy2api: settings copy')
     const t = ctx.locale.bind(namespace) as WorkBuddyPoolCardInjected['t']
-    const settingsScope = ctx.settingsScope.bind({ namespace: 'workbuddy2api' }) as NonNullable<WorkBuddyPoolCardInjected['settingsScope']>
+    // Absent on 0.1.7+: the card then shows the pool without its settings form,
+    // which is far better than the entry never activating at all.
+    const settingsScope = ctx.settingsScope === undefined
+      ? undefined
+      : ctx.settingsScope.bind({ namespace: 'workbuddy2api' }) as NonNullable<WorkBuddyPoolCardInjected['settingsScope']>
+    const injected = (): WorkBuddyPoolCardInjected => ({ t, settingsScope })
+    // 0.1.7+ replaced `settings.plugin.item` (a row inside another page's list)
+    // with `settings.section` (a page of its own in the settings panel — the
+    // shape this card was always meant to have). Register into whichever the host
+    // actually declares, detected rather than assumed.
+    const slots = ctx.slots as WorkBuddySlotsCompat
+    if (typeof slots.specDynamic === 'function' && slots.specDynamic('settings.section') !== undefined) {
+      ctx.slots.inject('settings.section', () => ctx.slots.register({
+        name: 'settings.section',
+        id: 'workbuddy2api',
+        order: 60,
+        label: () => t('card.pageTitle'),
+        locale: namespace,
+        inject: injected,
+      }, WorkBuddyPoolCard))
+      return
+    }
     ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
       name: 'settings.plugin.item',
       key: 'workbuddy2api',
       priority: 30,
-      inject: (): WorkBuddyPoolCardInjected => ({ t, settingsScope }),
+      inject: injected,
     }, WorkBuddyPoolCard))
   } catch (error: unknown) {
     // Degrade silently on the page: the host provider still serves models.

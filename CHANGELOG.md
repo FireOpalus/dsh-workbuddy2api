@@ -1,5 +1,42 @@
 # 更新日志
 
+## [0.5.2] - 2026-09-22
+
+### 修复：0.1.7-rc.2 上启动横幅 "Failed to load plugins"
+
+0.5.1 修好了宿主半，但浏览器半仍把 `settingsScope` 列为**必需**服务。该服务在
+0.1.7-rc.2 已被移除，于是 DSH 把整个条目判为未激活：
+
+```
+web boot: 1 entry did not activate
+dsh-workbuddy2api: pending (waiting for service: settingsScope)
+```
+
+**必需服务缺失不是"少个卡片"，而是启动级的红色横幅** —— 这比卡片不显示严重得多，
+所以 `settingsScope` 不再必需，改为可选解析（卡片本来就把每次读取都做了空值保护）。
+
+### 新增：卡片升级为独立设置页
+
+0.1.7-rc.2 用 `settings.section`（设置面板里的**独立页面**）取代了
+`settings.plugin.item`（别人页面里的一行）。现在**按宿主实际声明的槽位注册**，
+而不是假定某一个：
+
+```
+宿主声明 settings.section  -> 注册为独立页面（order 60，标题「WorkBuddy 账号池」）
+否则                        -> 旧的 settings.plugin.item 行内条目
+```
+
+检测用 `slots.specDynamic('settings.section')`，所以新旧两线同一份产物都能用。
+
+### 本版在 0.1.7-rc.2 上的实际状态
+
+- **启动横幅消失**，条目正常激活
+- **设置面板里出现独立页面「WorkBuddy 账号池」**，账号池、健康度、积分可见
+- **设置类控件暂不可用**（改模型选择、改定时时间、浏览器登录加号）——
+  它们依赖已被移除的 `settingsScope`，读写在下一版改由宿主路由支撑
+- 模型调用、账号池轮换、冷却熔断、定时任务、启动签到**全部正常**
+- 命令行 `dsh-workbuddy2api <doctor|status|pool|logout>` 正常
+
 ## [0.5.1] - 2026-09-22
 
 ### 修复（重要）：DSH 0.1.7-rc.2 上插件整个加载失败
