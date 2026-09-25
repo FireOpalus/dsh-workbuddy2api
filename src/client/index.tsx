@@ -127,10 +127,14 @@ export function apply(ctx: WorkBuddyClientContext): void {
     // for the declaration. Both failed SILENTLY: no card, no error, every test
     // green. So: register immediately when the slot is already there, otherwise
     // wait for the declaration, and say something if neither ever happens.
-    const slots = ctx.slots as WorkBuddySlotsCompat
+    // The slot's OWN DECLARATION is the only trustworthy signal — not a probe.
+    //
+    // `specDynamic('settings.section')` answers "absent" on hosts where
+    // registering into it demonstrably works (dshmarket / dsh-bridge /
+    // archive-manager all do exactly that, and their pages are in the sidebar).
+    // Trusting that probe is what put this card into `settings.plugin.item` — a
+    // row inside someone else's page, where nobody was looking for it.
     let mounted = false
-    const declared = (key: string): boolean =>
-      typeof slots.specDynamic === 'function' && slots.specDynamic(key) !== undefined
     const registerSection = () => ctx.slots.register({
       name: 'settings.section',
       id: 'workbuddy2api',
@@ -145,36 +149,25 @@ export function apply(ctx: WorkBuddyClientContext): void {
       priority: 30,
       inject: injected,
     }, WorkBuddyPoolCard)
-    const mount = () => {
+    const mountInto = (key: 'settings.section' | 'settings.plugin.item') => {
       if (mounted) return () => {}
       mounted = true
-      // The card's own page is the newer, better home; the inline row is the
-      // fallback for hosts that only have the older slot.
-      const section = declared('settings.section')
-      console.info('[dsh-workbuddy2api] settings card mounted into '
-        + (section ? 'settings.section' : 'settings.plugin.item'))
-      return section ? registerSection() : registerItem()
+      console.info('[dsh-workbuddy2api] settings card mounted into ' + key)
+      return key === 'settings.section' ? registerSection() : registerItem()
     }
-    const arm = (key: 'settings.section' | 'settings.plugin.item'): void => {
-      if (mounted || declared(key)) { mount(); return }
-      if (typeof slots.subscribeDeclaration === 'function') {
-        const off = slots.subscribeDeclaration(key, () => {
-          if (mounted) { off(); return }
-          if (declared(key)) { off(); mount() }
-        })
-        return
-      }
-      ctx.slots.inject(key, () => mount())
-    }
-    arm('settings.section')
-    arm('settings.plugin.item')
-    // Doing nothing quietly is what made this take three releases to find.
+    // The card's own page wins outright.
+    ctx.slots.inject('settings.section', () => mountInto('settings.section'))
+    // The inline row is the fallback for hosts that only have the older slot —
+    // but it waits a beat first, because a host that has BOTH (as 0.1.7-rc.2 does)
+    // would otherwise put the card in the wrong place and never move it.
+    ctx.slots.inject('settings.plugin.item', () => {
+      const timer = setTimeout(() => { mountInto('settings.plugin.item') }, 500)
+      return () => { clearTimeout(timer) }
+    })
+    // Doing nothing quietly is what made this take four releases to find.
     setTimeout(() => {
       if (mounted) return
-      console.warn('[dsh-workbuddy2api] settings card could not mount: neither settings.section nor settings.plugin.item is declared', {
-        section: declared('settings.section'),
-        pluginItem: declared('settings.plugin.item'),
-      })
+      console.warn('[dsh-workbuddy2api] settings card could not mount: no settings slot was declared')
     }, 5000)
   } catch (error: unknown) {
     // Degrade silently on the page: the host provider still serves models.

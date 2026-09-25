@@ -95,25 +95,16 @@ describe('the browser half across DSH lines', () => {
     expect(inject).not.toContain('settingsScope')
   })
 
-  it('registers the page slot when the host declares it, and the old one otherwise', () => {
-    // 0.1.7+ moved the card from a row inside another page to a page of its own.
-    expect(CLIENT).toContain("declared('settings.section')")
-    expect(CLIENT).toContain("'settings.section'")
-    expect(CLIENT).toContain("'settings.plugin.item'")
-  })
-
-  it('registers on DECLARATION instead of assuming a slot exists', () => {
-    // Three attempts got this wrong, all silently: first a synchronous existence
-    // test (answered "absent" on a host that has the slot, so the card went into a
-    // slot that never renders), then trusting `inject` to wait. Both produced no
-    // card and no error. The declaration must be subscribed to explicitly.
-    expect(CLIENT).toContain('subscribeDeclaration')
-    expect(CLIENT).toContain("arm('settings.section')")
-    expect(CLIENT).toContain("arm('settings.plugin.item')")
-    // Registering immediately when the slot IS already there, rather than waiting
-    // for an event that may never come.
-    expect(CLIENT).toContain('const declared = (key: string): boolean')
-    // And never doing nothing quietly: that is what hid this for three releases.
+  it('lets the slot declaration decide, never a probe', () => {
+    // Five attempts got this wrong, all silently. The last one trusted
+    // `specDynamic('settings.section')`, which answers "absent" on hosts where
+    // registering into that slot demonstrably works — so the card was registered
+    // into someone else's page and nobody could find it.
+    expect(CLIENT).toContain("ctx.slots.inject('settings.section', () => mountInto('settings.section'))")
+    expect(CLIENT).toContain("mountInto('settings.plugin.item')")
+    // The inline row waits, so a host with both slots gets the card on its own page.
+    expect(CLIENT).toContain('}, 500)')
+    // And it still refuses to fail quietly.
     expect(CLIENT).toContain('could not mount')
   })
 
