@@ -23,6 +23,7 @@
     "tests"
   ],
   "exclude": [
-    "src/client"
+    "src/client",
+    "tests/client-render.spec.ts"
   ]
 }

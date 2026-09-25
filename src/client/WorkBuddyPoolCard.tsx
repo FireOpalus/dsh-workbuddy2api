@@ -14,10 +14,9 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { createElement as h } from 'react'
+import type { ReactElement } from 'react'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
-import { IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   toPersistedWorkBuddyModel,
   withWorkBuddyRegion,
@@ -82,6 +81,15 @@ export type WorkBuddyPoolCardProps =
   & Partial<WorkBuddyPoolCardInjected>
 
 const POLL_INTERVAL_MS = 60_000
+
+/** Keep this small glyph local: DSH renamed its icon exports in 0.1.7. */
+function ChevronDown() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true" focusable="false">
+      <path d="m3 5 4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
 
 /** How often a running browser sign-in is checked, while the card is open. */
 const LOGIN_POLL_INTERVAL_MS = 3_000
@@ -223,7 +231,7 @@ function CreditRing({ ratio, title, size = 14 }: {
   title: string
   /** Rendered edge length; the geometry is in viewBox units so it scales. */
   size?: number
-}): ReturnType<typeof h> {
+}): ReactElement {
   const radius = 6
   const circumference = 2 * Math.PI * radius
   const share = ratio === undefined ? 0 : Math.min(Math.max(ratio, 0), 1)
@@ -308,6 +316,8 @@ export function WorkBuddyPoolCard({ t, settingsScope, page }: WorkBuddyPoolCardP
   // As a PAGE the card must be visible immediately: it used to be a collapsed row
   // in a list, and reusing that default left the settings page looking empty.
   const asPage = page === true
+  const Container = asPage ? 'section' : 'li'
+  const Header = asPage ? 'div' : 'button'
   const [open, setOpen] = useState(asPage)
   const [activeRegion, setActiveRegion] = useState<WorkBuddyWebRegion>('cn')
   /** Last-known usage per region, so tab dots survive tab switches. */
@@ -996,26 +1006,28 @@ export function WorkBuddyPoolCard({ t, settingsScope, page }: WorkBuddyPoolCardP
   const dirty = poolDraft !== undefined || modelDraft !== undefined
 
   return (
-    <li className={`dsm-plugin-card${open ? ' dsm-plugin-card-open' : ''}`}>
-      <button
-        type="button"
+    <Container className={`dsm-plugin-card${open ? ' dsm-plugin-card-open' : ''}`}>
+      <Header
+        {...asPage ? {} : {
+          type: 'button' as const,
+          'aria-expanded': open,
+          'aria-label': `${t(open ? 'row.collapse' : 'row.expand')}: ${title}`,
+          onClick: () => { setOpen(!open) },
+        }}
         className="dsm-plugin-card-header"
-        aria-expanded={open}
-        aria-label={`${t(open ? 'row.collapse' : 'row.expand')}: ${title}`}
-        onClick={() => { setOpen(!open) }}
       >
         <img className="dsm-plugin-card-icon" src={WORKBUDDY2API_PLUGIN_ICON} alt="" />
         <span className="dsm-plugin-card-head">
           <span className="dsm-plugin-card-title">{title}</span>
           <span className="dsm-plugin-card-description">{t('row.desc')}</span>
         </span>
-        <span
+        {!asPage && <span
           aria-hidden="true"
           className={`dsm-plugin-card-chevron${open ? ' dsm-plugin-card-chevron-open' : ''}`}
         >
-          {h(IconChevronDownOutline14, { size: 14 })}
-        </span>
-      </button>
+          <ChevronDown />
+        </span>}
+      </Header>
       <div className="dsm-plugin-card-body" hidden={!open && !asPage}>
         {open
           ? <div className="dsm-wb2api-root">
@@ -1446,7 +1458,7 @@ export function WorkBuddyPoolCard({ t, settingsScope, page }: WorkBuddyPoolCardP
                       aria-hidden="true"
                       className={`dsm-wb2api-section-chevron${tasksExpanded ? ' dsm-wb2api-section-chevron-open' : ''}`}
                     >
-                      {h(IconChevronDownOutline14, { size: 14 })}
+                      <ChevronDown />
                     </span>
                     <span className="dsm-wb2api-section-toggle-text">
                       <span className="dsm-wb2api-section-title">
@@ -1713,7 +1725,7 @@ export function WorkBuddyPoolCard({ t, settingsScope, page }: WorkBuddyPoolCardP
             </div>
           : null}
       </div>
-    </li>
+    </Container>
   )
 }
 

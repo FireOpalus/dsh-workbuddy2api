@@ -2,7 +2,7 @@
   "name": "dsh-workbuddy2api",
   "displayName": "DSH WorkBuddy2API",
   "description": "用多个 WorkBuddy 账号（网页登录或本机桌面端）组成两个独立账号池（国内版 / 国际版）：加权轮换、会话粘性、冷却熔断、换号重试，并每天自动完成成长任务。",
-  "version": "0.6.7",
+  "version": "0.6.8",
   "author": "Boiser",
   "copyright": "Copyright (c) 2026 dsh-wb2api",
   "license": "MIT",
@@ -54,7 +54,7 @@
   },
   "dsh": {
     "engines": {
-      "dsh": ">=0.1.5-rc.2 || >=0.1.7-rc.2"
+      "dsh": ">=0.1.5-rc.2 <0.2.0 || >=0.1.7-rc.2 <0.2.0"
     },
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -100,7 +100,9 @@
     "@earendil-works/pi-ai": "^0.85.1",
     "@types/node": "^22.20.0",
     "@types/react": "~18.3.31",
+    "@types/react-dom": "18.3.7",
     "react": "^18.3.1",
+    "react-dom": "18.3.1",
     "tsdown": "^0.22.2",
     "typescript": "^5.9.3",
     "vitest": "^4.1.8"

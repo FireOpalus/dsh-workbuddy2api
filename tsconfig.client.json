@@ -21,6 +21,7 @@
     ]
   },
   "include": [
-    "src/client"
+    "src/client",
+    "tests/client-render.spec.ts"
   ]
 }

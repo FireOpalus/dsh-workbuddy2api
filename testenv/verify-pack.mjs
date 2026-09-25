@@ -23,6 +23,10 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSy
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { gunzipSync } from 'node:zlib'
+import { runInNewContext } from 'node:vm'
+import * as React from 'react'
+import * as jsxRuntime from 'react/jsx-runtime'
+import { renderToStaticMarkup } from 'react-dom/server'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO = resolve(HERE, '..')
@@ -173,6 +177,46 @@ if (clientRel !== undefined) {
   const bundle = readFileSync(join(PACKAGE, clientRel), 'utf8')
   check('client bundle registers with __ModuleLoader__', bundle.includes('__ModuleLoader__.load'))
   check('client bundle names the plugin id', bundle.includes(PLUGIN_NAME))
+
+  // Exercise the shipped factory and render its registered page. Checking only
+  // files/registration missed a removed host icon export that crashed in React.
+  // This client needs only the host React runtime; reject any new hidden import.
+  try {
+    let client
+    let section
+    const dictionaries = new Map()
+    runInNewContext(bundle, {
+      window: { __ModuleLoader__: { load: ({ factory }) => {
+        client = factory(id => {
+          if (id === 'react') return React
+          if (id === 'react/jsx-runtime') return jsxRuntime
+          throw new Error(`unexpected browser runtime dependency: ${id}`)
+        })
+      } } },
+      console,
+      setTimeout: () => 0,
+      clearTimeout: () => {},
+      fetch: async () => ({ ok: true, json: async () => ({ writable: false }) }),
+    }, { filename: clientRel })
+    client.apply({
+      effect: run => run(),
+      get: () => undefined,
+      locale: {
+        register: (ns, copy) => { dictionaries.set(ns, copy.zh); return () => {} },
+        bind: ns => key => dictionaries.get(ns)?.[key] ?? key,
+      },
+      slots: {
+        inject: (name, run) => { if (name === 'settings.section') run() },
+        register: (options, component) => { section = { options, component }; return () => {} },
+      },
+    })
+    if (!section) throw new Error('settings.section was not registered')
+    const html = renderToStaticMarkup(React.createElement(section.component, section.options.inject()))
+    check('packed settings page renders both region tabs',
+      html.includes('role="tablist"') && html.includes('国内版') && html.includes('国际版'))
+  } catch (error) {
+    check('packed settings page renders', false, error instanceof Error ? error.message : String(error))
+  }
 }
 
 // 3. Wire a second isolated profile that uses the EXTRACTED package.

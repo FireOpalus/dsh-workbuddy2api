@@ -11,7 +11,7 @@
 
 | DSH 版本 | 状态 |
 |---|---|
-| **0.1.7-rc.2** | 支持。模型、账号池轮换、定时任务、启动签到均正常。**设置卡片暂未迁移**，见下 |
+| **0.1.7-rc.2** | 支持独立「WorkBuddy 账号池」设置页；0.6.8 修复旧图标导出被移除导致的空白页 |
 | 0.1.5-rc.2 ～ 0.1.6 | 支持，功能完整（含设置卡片） |
 | 0.2.x / 其他 | 未声明 |
 
@@ -21,7 +21,7 @@
 
 ### 0.1.7-rc.2 的适配方式
 
-0.1.7-rc.2 移除了 `settings.plugin.item` 槽位与 `settingsScope` 服务，本插件按下面两条改：
+0.1.7-rc.2 的设置页使用 `settings.section`，且不再提供旧 `settingsScope` 服务。本插件按下面两条适配：
 
 - **槽位按宿主实际声明选择**：有 `settings.section` 就注册成设置面板里的**独立页面**
   「WorkBuddy 账号池」，否则退回旧的 `settings.plugin.item` 行内条目。
@@ -41,7 +41,8 @@
 dsh-workbuddy2api <doctor|status|pool|logout> [--json]
 ```
 
-设置页迁移（改用 `settings.section` 并去掉 `settingsScope`）在下一版完成。
+0.6.8 同时移除了对宿主旧图标 `IconChevronDownOutline14` 的依赖（0.1.7 已改名），
+改用插件内的 SVG，避免组件渲染报错后只剩侧栏入口。独立页面默认展开且不能整页折叠。
 
 ## 为什么需要它
 
