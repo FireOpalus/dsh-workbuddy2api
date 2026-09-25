@@ -24,6 +24,9 @@ import type {} from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { WorkBuddyPoolCard } from './WorkBuddyPoolCard.tsx'
 import type { WorkBuddyPoolCardInjected } from './WorkBuddyPoolCard.tsx'
+import { createRouteSettingsScope } from './scope.ts'
+import type { WorkBuddySettingsScope } from './scope.ts'
+import { WORKBUDDY2API_CONFIG_PATH } from '../status-paths.ts'
 import { en, zh } from './locales.ts'
 import type { WorkBuddySettingsKey } from './locales.ts'
 
@@ -70,11 +73,13 @@ export function apply(ctx: WorkBuddyClientContext): void {
     const namespace = 'settings.workbuddy2api'
     ctx.effect(() => ctx.locale.register(namespace, { zh, en }), 'dsh-workbuddy2api: settings copy')
     const t = ctx.locale.bind(namespace) as WorkBuddyPoolCardInjected['t']
-    // Absent on 0.1.7+: the card then shows the pool without its settings form,
-    // which is far better than the entry never activating at all.
-    const settingsScope = ctx.settingsScope === undefined
-      ? undefined
-      : ctx.settingsScope.bind({ namespace: 'workbuddy2api' }) as NonNullable<WorkBuddyPoolCardInjected['settingsScope']>
+    // Absent on 0.1.7+, which removed the service. There the SAME interface is
+    // satisfied by the plugin's own configuration route, so the card's settings
+    // code is identical on both lines — and an unreachable host still only costs
+    // the form, never the entry.
+    const settingsScope: WorkBuddySettingsScope | undefined = ctx.settingsScope === undefined
+      ? createRouteSettingsScope({ url: WORKBUDDY2API_CONFIG_PATH })
+      : ctx.settingsScope.bind({ namespace: 'workbuddy2api' }) as WorkBuddySettingsScope
     const injected = (): WorkBuddyPoolCardInjected => ({ t, settingsScope })
     // 0.1.7+ replaced `settings.plugin.item` (a row inside another page's list)
     // with `settings.section` (a page of its own in the settings panel — the

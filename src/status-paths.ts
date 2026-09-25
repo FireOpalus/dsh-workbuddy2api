@@ -25,6 +25,16 @@ export const WORKBUDDY2API_CREDITS_REFRESH_PATH = '/plugins/dsh-workbuddy2api/cr
 export const WORKBUDDY2API_CHECKIN_PATH = '/plugins/dsh-workbuddy2api/checkin'
 /** Plugin-owned pool control endpoint (reset / release). */
 export const WORKBUDDY2API_POOL_ACTION_PATH = '/plugins/dsh-workbuddy2api/pool'
+/**
+ * Plugin-owned configuration document endpoint (GET reads, POST edits one field).
+ *
+ * Exists because DSH 0.1.7-rc.2 removed the browser-side `settingsScope` service
+ * the card used to read and write its settings through. Rather than re-implement
+ * the framework's form model, the card talks to its host over the same kind of
+ * route it already uses for everything else — which also means ONE code path
+ * serves both DSH lines.
+ */
+export const WORKBUDDY2API_CONFIG_PATH = '/plugins/dsh-workbuddy2api/config'
 /** Plugin-owned web sign-in start endpoint: returns an authorization URL. */
 export const WORKBUDDY2API_LOGIN_START_PATH = '/plugins/dsh-workbuddy2api/login/start'
 /** Plugin-owned web sign-in poll endpoint: reports progress and finishes it. */
@@ -210,6 +220,22 @@ export interface WorkBuddyWebPoolEntry {
   modelCooldowns?: readonly { model: string; untilMs: number; reason: string; hits: number }[]
   present: boolean
   tokenExpiresAtMs: number
+}
+
+/**
+ * The plugin's own configuration document, as the card reads and edits it.
+ *
+ * Read through {@link WORKBUDDY2API_CONFIG_PATH} on hosts that no longer ship the
+ * browser-side settings scope; the whole section is returned verbatim so the card
+ * can pick out the fields it owns exactly as it did before.
+ */
+export interface WorkBuddyWebConfig {
+  /** Whether this deployment accepts configuration edits at all. */
+  writable: boolean
+  /** The whole section, or absent when nothing is stored yet. */
+  value?: unknown
+  /** Present only on a refusal, for the card to show. */
+  error?: string
 }
 
 /** One account's credit panel document. */

@@ -190,6 +190,21 @@ interface WorkBuddyWebPoolEntry {
   present: boolean;
   tokenExpiresAtMs: number;
 }
+/**
+ * The plugin's own configuration document, as the card reads and edits it.
+ *
+ * Read through {@link WORKBUDDY2API_CONFIG_PATH} on hosts that no longer ship the
+ * browser-side settings scope; the whole section is returned verbatim so the card
+ * can pick out the fields it owns exactly as it did before.
+ */
+interface WorkBuddyWebConfig {
+  /** Whether this deployment accepts configuration edits at all. */
+  writable: boolean;
+  /** The whole section, or absent when nothing is stored yet. */
+  value?: unknown;
+  /** Present only on a refusal, for the card to show. */
+  error?: string;
+}
 /** One account's credit panel document. */
 interface WorkBuddyWebAccountCredits {
   accountId: string;
@@ -1883,6 +1898,23 @@ interface WorkBuddyStatusRouteOptions {
   taskSchedule?(): WorkBuddyTaskScheduleStatus;
   /** Run one task sweep right now, over every eligible account. */
   runTaskSweep?(): Promise<void>;
+  /**
+   * The plugin's own configuration, for the card.
+   *
+   * Exists because DSH 0.1.7-rc.2 removed the browser-side settings scope: the
+   * card reads and edits its settings over this route instead, so ONE code path
+   * serves both DSH lines. Absent means the card keeps using the framework's own
+   * scope, which is what the older line ships.
+   */
+  configDocument?(): WorkBuddyWebConfig;
+  /**
+   * Merge one top-level field of the plugin's own configuration.
+   *
+   * A merge, not a whole-section replace: the wire never carries secret-marked
+   * fields, so a replace rebuilt from what the browser holds would silently
+   * delete them.
+   */
+  writeConfigField?(field: string, value: unknown): Promise<void>;
 }
 /**
  * Assemble one region's card document: that region's locally discovered

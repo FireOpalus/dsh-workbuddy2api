@@ -33,6 +33,7 @@ import {
   WORKBUDDY2API_ACCOUNTS_REFRESH_PATH,
   WORKBUDDY2API_ACCOUNT_PARAM,
   WORKBUDDY2API_CHECKIN_PATH,
+  WORKBUDDY2API_CONFIG_PATH,
   WORKBUDDY2API_CREDITS_REFRESH_PATH,
   WORKBUDDY2API_LOGIN_POLL_PATH,
   WORKBUDDY2API_LOGIN_START_PATH,
@@ -47,6 +48,7 @@ import type {
   WorkBuddyPoolPolicy,
   WorkBuddyWebAccount,
   WorkBuddyWebAccountCredits,
+  WorkBuddyWebConfig,
   WorkBuddyWebCredits,
   WorkBuddyWebLogin,
   WorkBuddyWebModel,
@@ -65,6 +67,7 @@ export {
   WORKBUDDY2API_ACCOUNTS_REFRESH_PATH,
   WORKBUDDY2API_ACCOUNT_PARAM,
   WORKBUDDY2API_CHECKIN_PATH,
+  WORKBUDDY2API_CONFIG_PATH,
   WORKBUDDY2API_CREDITS_REFRESH_PATH,
   WORKBUDDY2API_LOGIN_POLL_PATH,
   WORKBUDDY2API_LOGIN_START_PATH,
@@ -119,6 +122,23 @@ export interface WorkBuddyStatusRouteOptions {
   taskSchedule?(): WorkBuddyTaskScheduleStatus
   /** Run one task sweep right now, over every eligible account. */
   runTaskSweep?(): Promise<void>
+  /**
+   * The plugin's own configuration, for the card.
+   *
+   * Exists because DSH 0.1.7-rc.2 removed the browser-side settings scope: the
+   * card reads and edits its settings over this route instead, so ONE code path
+   * serves both DSH lines. Absent means the card keeps using the framework's own
+   * scope, which is what the older line ships.
+   */
+  configDocument?(): WorkBuddyWebConfig
+  /**
+   * Merge one top-level field of the plugin's own configuration.
+   *
+   * A merge, not a whole-section replace: the wire never carries secret-marked
+   * fields, so a replace rebuilt from what the browser holds would silently
+   * delete them.
+   */
+  writeConfigField?(field: string, value: unknown): Promise<void>
 }
 
 /** Redact token-like content before it crosses to the browser. */
@@ -457,6 +477,49 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
       },
     })
 
+    /**
+     * The plugin's own configuration, for hosts without a browser-side scope.
+     *
+     * GET returns the whole section plus whether edits are accepted; POST merges
+     * ONE top-level field. The card drives both through the same three-member
+     * interface it used for the framework's scope, so its own code did not have to
+     * learn a second settings API.
+     */
+    const disposeConfig = ctx.webServer.register({
+      kind: 'exact',
+      path: WORKBUDDY2API_CONFIG_PATH,
+      handler: async (req: IncomingMessage, res: ServerResponse) => {
+        const read = deps.configDocument
+        if (read === undefined) {
+          json(res, 501, { writable: false, error: 'this host has no configuration route' })
+          return
+        }
+        if (req.method === 'GET') {
+          if (!guard(req, res, 'GET')) return
+          json(res, 200, read())
+          return
+        }
+        if (!guard(req, res, 'POST')) return
+        const write = deps.writeConfigField
+        if (write === undefined) {
+          json(res, 403, { writable: false, error: 'this deployment stores settings read-only' })
+          return
+        }
+        try {
+          const body = await readJsonBody(req)
+          const field = typeof body?.['field'] === 'string' ? body['field'] : undefined
+          if (field === undefined || field === '') {
+            json(res, 400, { error: 'field is required' })
+            return
+          }
+          await write(field, body?.['value'])
+          json(res, 200, read())
+        } catch (error: unknown) {
+          json(res, 500, { error: safeMessage(error) })
+        }
+      },
+    })
+
     const disposeModels = ctx.webServer.register({
       kind: 'exact',
       path: WORKBUDDY2API_MODELS_REFRESH_PATH,
@@ -729,6 +792,7 @@ export function registerWorkBuddy2ApiStatusRoute(ctx: Context, deps: WorkBuddySt
       disposeLoginStart()
       disposePool()
       disposeModels()
+      disposeConfig()
       disposeCheckin()
       disposeCredits()
       disposeAccounts()

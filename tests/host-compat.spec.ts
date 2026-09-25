@@ -84,3 +84,34 @@ describe('the declared DSH compatibility range', () => {
     }
   })
 })
+
+describe('the browser half across DSH lines', () => {
+  const CLIENT = readFileSync(new URL('../src/client/index.tsx', import.meta.url), 'utf8')
+
+  it('does not require the removed settings scope', () => {
+    // A required-but-absent service keeps the entry PENDING, which DSH reports as
+    // a boot-level "Failed to load plugins" banner — far worse than a missing card.
+    const inject = /export const inject = (\[[^\]]*\])/u.exec(CLIENT)?.[1] ?? ''
+    expect(inject).not.toContain('settingsScope')
+  })
+
+  it('registers the page slot when the host declares it, and the old one otherwise', () => {
+    // 0.1.7+ moved the card from a row inside another page to a page of its own.
+    expect(CLIENT).toContain("specDynamic('settings.section')")
+    expect(CLIENT).toContain("'settings.section'")
+    expect(CLIENT).toContain("'settings.plugin.item'")
+  })
+
+  it('falls back to its own route when the scope service is gone', () => {
+    expect(CLIENT).toContain('createRouteSettingsScope')
+    expect(CLIENT).toContain('WORKBUDDY2API_CONFIG_PATH')
+  })
+
+  it('reads and writes that route instead of assuming a framework service', () => {
+    const ROUTE = readFileSync(new URL('../src/web-status.ts', import.meta.url), 'utf8')
+    expect(ROUTE).toContain('WORKBUDDY2API_CONFIG_PATH')
+    // A merge of one field, never a whole-section replace: the wire never carries
+    // secret-marked fields, so a replace would silently delete them.
+    expect(ROUTE).toContain('writeConfigField')
+  })
+})

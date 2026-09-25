@@ -281,6 +281,16 @@ interface WorkBuddySettingsCompat {
   ): void
   /** Present from 0.1.7: the current values, keyed by profile entry id. */
   describe?(): readonly { ns: string; value?: unknown }[]
+  /**
+   * Present from 0.1.7: merge fields into this entry's stored section.
+   *
+   * A merge rather than a replace, deliberately: the wire never carries
+   * secret-marked fields, so a caller that rebuilt the whole section from what it
+   * had received would silently drop them.
+   */
+  update?(ns: string, patch: object, expectedRevision?: number): Promise<void>
+  /** Present from 0.1.7: whether this profile accepts edits at all. */
+  readonly writable?: boolean
 }
 
 /** One persisted model entry; the settings codec rejects unknown keys. */
@@ -830,6 +840,24 @@ export function apply(ctx: Context, config: Config): void {
     tasks: taskEngine,
     taskSchedule: () => taskScheduler.status(),
     runTaskSweep: async () => { await taskScheduler.runNow() },
+    // The card's settings read/write, for hosts with no browser-side scope
+    // (0.1.7+). One code path: the card talks to these instead of the framework's
+    // service, and the older line simply keeps using that service.
+    configDocument: () => ({
+      writable: settingsService.writable === true,
+      value: current(),
+    }),
+    ...typeof settingsService.update !== 'function' ? {} : {
+      writeConfigField: async (field: string, value: unknown): Promise<void> => {
+        // Keyed by the profile ENTRY id on this line, not by the name the plugin
+        // used to register itself under.
+        await settingsService.update?.(WORKBUDDY2API_ENTRY_ID, { [field]: value })
+        // The schedule is re-read before every sweep, so an edited time only has
+        // to re-arm the timers — no reload, no re-apply.
+        applySelection(current())
+        taskScheduler.start()
+      },
+    },
   }))
 
   // The plugin-configuration surface, on either DSH line.
