@@ -112,7 +112,10 @@ export function apply(ctx: WorkBuddyClientContext): void {
     // `ctx.get` is the read that answers "absent" instead of throwing.
     const settingsScope: WorkBuddySettingsScope = legacySettingsScope(ctx)
       ?? createRouteSettingsScope({ url: WORKBUDDY2API_CONFIG_PATH })
-    const injected = (): WorkBuddyPoolCardInjected => ({ t, settingsScope })
+    // `page` is chosen per registration: the settings page renders the card open,
+    // the inline row keeps its collapsed default.
+    const injected = (extra: Partial<WorkBuddyPoolCardInjected> = {}): WorkBuddyPoolCardInjected =>
+      ({ t, settingsScope, ...extra })
     // 0.1.7+ replaced `settings.plugin.item` (a row inside another page's list)
     // with `settings.section` (a page of its own in the settings panel — the
     // shape this card was always meant to have).
@@ -141,7 +144,7 @@ export function apply(ctx: WorkBuddyClientContext): void {
       order: 60,
       label: () => t('card.pageTitle'),
       locale: namespace,
-      inject: injected,
+      inject: () => injected({ page: true }),
     }, WorkBuddyPoolCard)
     const registerItem = () => ctx.slots.register({
       name: 'settings.plugin.item',

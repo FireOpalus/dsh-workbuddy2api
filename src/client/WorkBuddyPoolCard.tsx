@@ -61,6 +61,14 @@ export interface WorkBuddyPoolCardInjected {
    * guarded, so the card then renders the live pool without its settings form
    * rather than failing to load at all.
    */
+  /**
+   * Render as a settings PAGE rather than a collapsed row in a list.
+   *
+   * The two contexts differ in one way that matters: a row starts collapsed and
+   * is opened by a click, while a page has no click to wait for — rendering it
+   * collapsed is exactly what made the settings page look empty.
+   */
+  page?: boolean
   settingsScope?: {
     getSnapshot(): { status: string; value?: unknown; writable: boolean }
     subscribe(listener: () => void): () => void
@@ -295,9 +303,12 @@ const policyFields: readonly {
 ]
 
 /** Render the two account pools, their credits, policies, and model selection. */
-export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) {
+export function WorkBuddyPoolCard({ t, settingsScope, page }: WorkBuddyPoolCardProps) {
   if (t === undefined) throw new Error('WorkBuddy pool card requires its translation function')
-  const [open, setOpen] = useState(false)
+  // As a PAGE the card must be visible immediately: it used to be a collapsed row
+  // in a list, and reusing that default left the settings page looking empty.
+  const asPage = page === true
+  const [open, setOpen] = useState(asPage)
   const [activeRegion, setActiveRegion] = useState<WorkBuddyWebRegion>('cn')
   /** Last-known usage per region, so tab dots survive tab switches. */
   const [statusByRegion, setStatusByRegion] = useState<Partial<Record<WorkBuddyWebRegion, WorkBuddyWebUsage>>>({})
@@ -1005,7 +1016,7 @@ export function WorkBuddyPoolCard({ t, settingsScope }: WorkBuddyPoolCardProps) 
           {h(IconChevronDownOutline14, { size: 14 })}
         </span>
       </button>
-      <div className="dsm-plugin-card-body" hidden={!open}>
+      <div className="dsm-plugin-card-body" hidden={!open && !asPage}>
         {open
           ? <div className="dsm-wb2api-root">
               <div className="dsm-wb2api-tabs" role="tablist" aria-label={title}>

@@ -88,6 +88,26 @@ describe('the declared DSH compatibility range', () => {
 describe('the browser half across DSH lines', () => {
   const CLIENT = readFileSync(new URL('../src/client/index.tsx', import.meta.url), 'utf8')
 
+  it('declares which DSH versions it supports', () => {
+    // The same spelling as the peer ranges, and for the same reason: a bare
+    // `>=0.1.5-rc.2` does NOT admit 0.1.7-rc.2 under semver's prerelease rule, so
+    // the 0.1.7 tuple has to be listed separately.
+    const engines = (MANIFEST as { dsh?: { engines?: { dsh?: string } } }).dsh?.engines?.dsh ?? ''
+    expect(engines).toContain('>=0.1.5-rc.2')
+    expect(engines).toContain('>=0.1.7-rc.2')
+  })
+
+  it('renders the card OPEN when it is a settings page', () => {
+    // The bug this pins down: the card was written as a collapsed row in a list,
+    // and a page has no click to wait for — so the settings page rendered its
+    // header and nothing else, looking for all the world like "not registered".
+    expect(CLIENT).toContain("injected({ page: true })")
+    const CARD = readFileSync(new URL('../src/client/WorkBuddyPoolCard.tsx', import.meta.url), 'utf8')
+    expect(CARD).toContain('const asPage = page === true')
+    expect(CARD).toContain('useState(asPage)')
+    expect(CARD).toContain('hidden={!open && !asPage}')
+  })
+
   it('does not require the removed settings scope', () => {
     // A required-but-absent service keeps the entry PENDING, which DSH reports as
     // a boot-level "Failed to load plugins" banner — far worse than a missing card.
