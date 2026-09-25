@@ -97,22 +97,24 @@ describe('the browser half across DSH lines', () => {
 
   it('registers the page slot when the host declares it, and the old one otherwise', () => {
     // 0.1.7+ moved the card from a row inside another page to a page of its own.
-    expect(CLIENT).toContain("specDynamic('settings.section')")
+    expect(CLIENT).toContain("declared('settings.section')")
     expect(CLIENT).toContain("'settings.section'")
     expect(CLIENT).toContain("'settings.plugin.item'")
   })
 
-  it('arms BOTH slot injections instead of testing for the slot up front', () => {
-    // The bug this pins down: the slots are declared by OTHER browser plugins, so
-    // at our apply time the declaration may not exist yet. Checking synchronously
-    // answered "absent" on a host that has the slot, the card was registered into
-    // a slot that never renders, and the settings page was simply missing — with
-    // no error anywhere and every test still green.
-    expect(CLIENT).toContain("ctx.slots.inject('settings.section'")
-    expect(CLIENT).toContain("ctx.slots.inject('settings.plugin.item'")
-    // Both must route through the one mount, so the first to fire wins.
-    expect((CLIENT.match(/\(\) => mount\(\)/gu) ?? []).length).toBe(2)
-    expect(CLIENT).toContain('const mount = () => {')
+  it('registers on DECLARATION instead of assuming a slot exists', () => {
+    // Three attempts got this wrong, all silently: first a synchronous existence
+    // test (answered "absent" on a host that has the slot, so the card went into a
+    // slot that never renders), then trusting `inject` to wait. Both produced no
+    // card and no error. The declaration must be subscribed to explicitly.
+    expect(CLIENT).toContain('subscribeDeclaration')
+    expect(CLIENT).toContain("arm('settings.section')")
+    expect(CLIENT).toContain("arm('settings.plugin.item')")
+    // Registering immediately when the slot IS already there, rather than waiting
+    // for an event that may never come.
+    expect(CLIENT).toContain('const declared = (key: string): boolean')
+    // And never doing nothing quietly: that is what hid this for three releases.
+    expect(CLIENT).toContain('could not mount')
   })
 
   it('falls back to its own route when the scope service is gone', () => {

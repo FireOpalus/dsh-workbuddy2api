@@ -62,9 +62,10 @@ export const name = 'dsh-workbuddy2api-client'
  */
 export const inject = ['slots', 'locale']
 
-/** The slot lookup this entry needs, across DSH lines that changed it. */
+/** The slot lookups this entry needs, across DSH lines that changed it. */
 type WorkBuddySlotsCompat = WorkBuddyClientContext['slots'] & {
   specDynamic?(key: string): unknown
+  subscribeDeclaration?(key: string, listener: () => void): () => void
 }
 
 /** Register card copy and the pool card under Plugin configuration. */
@@ -85,42 +86,65 @@ export function apply(ctx: WorkBuddyClientContext): void {
     // with `settings.section` (a page of its own in the settings panel — the
     // shape this card was always meant to have).
     //
-    // Which one this host has is decided by ASKING THE REGISTRY THROUGH `inject`,
-    // never by testing for the slot up front. These slots are declared by OTHER
-    // browser plugins, and at our apply time that declaration may not have happened
-    // yet — so a synchronous existence check answers "absent" on a host that does
-    // have the slot, and the card is then registered into a slot that will never
-    // render: no card, and no error either. (Learned the hard way: that is exactly
-    // how the settings page went missing while every test still passed.)
+    // Registering happens on DECLARATION, and the declaration is subscribed to
+    // explicitly rather than assumed.
     //
-    // `inject` is the API that WAITS for the declaration. Both are armed, the first
-    // to fire mounts the card, and the newer slot wins if a host ever declares both.
+    // These slots belong to OTHER browser plugins, so at our apply time they may
+    // not be declared yet. Two earlier attempts got this wrong in different ways —
+    // first a synchronous existence test (answered "absent", so the card was
+    // registered into a slot that never renders), then relying on `inject` to wait
+    // for the declaration. Both failed SILENTLY: no card, no error, every test
+    // green. So: register immediately when the slot is already there, otherwise
+    // wait for the declaration, and say something if neither ever happens.
     const slots = ctx.slots as WorkBuddySlotsCompat
     let mounted = false
+    const declared = (key: string): boolean =>
+      typeof slots.specDynamic === 'function' && slots.specDynamic(key) !== undefined
+    const registerSection = () => ctx.slots.register({
+      name: 'settings.section',
+      id: 'workbuddy2api',
+      order: 60,
+      label: () => t('card.pageTitle'),
+      locale: namespace,
+      inject: injected,
+    }, WorkBuddyPoolCard)
+    const registerItem = () => ctx.slots.register({
+      name: 'settings.plugin.item',
+      key: 'workbuddy2api',
+      priority: 30,
+      inject: injected,
+    }, WorkBuddyPoolCard)
     const mount = () => {
-      // Already mounted by the other arm: nothing left to contribute, but the
-      // callback still has to hand back a disposer.
       if (mounted) return () => {}
       mounted = true
-      if (typeof slots.specDynamic === 'function' && slots.specDynamic('settings.section') !== undefined) {
-        return ctx.slots.register({
-          name: 'settings.section',
-          id: 'workbuddy2api',
-          order: 60,
-          label: () => t('card.pageTitle'),
-          locale: namespace,
-          inject: injected,
-        }, WorkBuddyPoolCard)
-      }
-      return ctx.slots.register({
-        name: 'settings.plugin.item',
-        key: 'workbuddy2api',
-        priority: 30,
-        inject: injected,
-      }, WorkBuddyPoolCard)
+      // The card's own page is the newer, better home; the inline row is the
+      // fallback for hosts that only have the older slot.
+      const section = declared('settings.section')
+      console.info('[dsh-workbuddy2api] settings card mounted into '
+        + (section ? 'settings.section' : 'settings.plugin.item'))
+      return section ? registerSection() : registerItem()
     }
-    ctx.slots.inject('settings.section', () => mount())
-    ctx.slots.inject('settings.plugin.item', () => mount())
+    const arm = (key: 'settings.section' | 'settings.plugin.item'): void => {
+      if (mounted || declared(key)) { mount(); return }
+      if (typeof slots.subscribeDeclaration === 'function') {
+        const off = slots.subscribeDeclaration(key, () => {
+          if (mounted) { off(); return }
+          if (declared(key)) { off(); mount() }
+        })
+        return
+      }
+      ctx.slots.inject(key, () => mount())
+    }
+    arm('settings.section')
+    arm('settings.plugin.item')
+    // Doing nothing quietly is what made this take three releases to find.
+    setTimeout(() => {
+      if (mounted) return
+      console.warn('[dsh-workbuddy2api] settings card could not mount: neither settings.section nor settings.plugin.item is declared', {
+        section: declared('settings.section'),
+        pluginItem: declared('settings.plugin.item'),
+      })
+    }, 5000)
   } catch (error: unknown) {
     // Degrade silently on the page: the host provider still serves models.
     // Developers see the full cause in the browser console; users see no banner.
