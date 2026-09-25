@@ -2006,15 +2006,6 @@ interface Config {
   /** @deprecated See {@link Config.lastCatalog}. */
   pool?: Partial<WorkBuddyPoolTuning>;
 }
-/**
- * The plugin configuration schema.
- *
- * The shape is asserted once at the export boundary rather than per field: a
- * cast inside an object literal cannot carry a nested generic such as
- * `z<Partial<Record<Region, State>>>` — the parser loses the expression context
- * at the closing brackets — so the single outer assertion is both the portable
- * form and the one place a reader has to check.
- */
 declare const Config: z<Config>;
 /** Every region, in card tab order. */
 declare const REGION_KEYS: readonly WorkBuddyRegion[];

@@ -432,11 +432,29 @@ const regionStateConfig = z.object({
  * at the closing brackets — so the single outer assertion is both the portable
  * form and the one place a reader has to check.
  */
+/**
+ * Mark a config field as VOLATILE — editable at runtime without re-applying the
+ * plugin.
+ *
+ * The host's settings service only accepts an `update()` patch that touches a
+ * volatile field, and refuses with "Plugin entry … has no volatile fields"
+ * otherwise. The browser card edits these fields live, so they have to be marked.
+ *
+ * Applied defensively: if the runtime's schema builder has no such modifier the
+ * schema is returned unchanged. A missing modifier must cost the settings form,
+ * never the plugin load — the lesson from 0.5.1, where a single wrong API call
+ * took every model down with it.
+ */
+const volatileField = <T>(schema: T): T => {
+  const builder = schema as unknown as { volatile?: () => T }
+  return typeof builder.volatile === 'function' ? builder.volatile() : schema
+}
+
 export const Config: z<Config> = z.object({
   authFile: z.string().description(`WorkBuddy desktop auth file (defaults to the app's own location)`),
-  tasks: taskScheduleConfig.description('Automatic growth-task schedule (daily + on startup)'),
-  regions: z.dict(regionStateConfig).default({})
-    .description('Per-region model directory, selection, and pool state, keyed cn | global'),
+  tasks: volatileField(taskScheduleConfig.description('Automatic growth-task schedule (daily + on startup)')),
+  regions: volatileField(z.dict(regionStateConfig).default({})
+    .description('Per-region model directory, selection, and pool state, keyed cn | global')),
   // 0.1.x wrote these at the TOP level, when both regions shared one pool and one
   // merged directory. They stay DECLARED so an existing settings file keeps
   // loading instead of failing validation, but nothing reads them: a merged

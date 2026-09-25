@@ -1,5 +1,40 @@
 # 更新日志
 
+## [0.6.1] - 2026-09-22
+
+### 修复：0.6.0 的设置写入被宿主拒绝
+
+0.6.0 让卡片改走自有配置路由，但 POST 被宿主拒绝：
+
+```
+500 Plugin entry "dsh-workbuddy2api" has no volatile fields
+```
+
+原因是宿主设置服务的 `update()` **只接受触及 `volatile` 字段的补丁** ——
+`volatile`（`.volatile()` 标记）表示「这个字段可以在运行期改，且不需要重新 apply 插件」。
+本插件的 Config 里一个 volatile 字段都没有，于是整条写入路径不可用（GET 读是好的）。
+
+现在把卡片实际会写的两个字段标成 volatile：`tasks`（定时设置）与 `regions`（模型选择/池状态）。
+
+**应用方式刻意保守**：若运行期的 schema 构造器没有这个修饰符，就原样返回 schema。缺一个修饰符
+应当只损失设置表单，绝不能让插件加载失败 —— 这正是 0.5.1 的教训（一处 API 用错，
+把全部模型一起带下去）。
+
+### 实测（真实 DSH 0.1.7-rc.2）
+
+```
+GET  /plugins/dsh-workbuddy2api/config          -> 200  writable: true
+POST /plugins/dsh-workbuddy2api/config          -> 200  (写回同一个值，验证链路)
+POST 不带 field                                  -> 400  {"error":"field is required"}
+```
+
+### 一个观察（尚未完全解释，如实记录）
+
+标记 volatile 之后，`GET` 返回的文档从 8 个顶层键变成 2 个（`tasks`、`regions`）。
+卡片只读这两个键（`regions[region]` 与 `tasks`），所以功能不受影响；
+其余键（`poolState`/`pool`/`lastCatalog` 等）由宿主自己持久化，卡片从不读。
+但这确实是一个行为变化，成因我还在确认，不想含糊带过。
+
 ## [0.6.0] - 2026-09-22
 
 ### 设置页迁移完成：0.1.7-rc.2 上功能与旧线一致
