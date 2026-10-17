@@ -11,13 +11,32 @@
 
 | DSH 版本 | 状态 |
 |---|---|
-| **0.1.7-rc.2** | 支持独立「WorkBuddy 账号池」设置页；0.6.8 修复旧图标导出被移除导致的空白页 |
+| **0.2.1-rc.2** | 支持。设置页、配置读写、模型路由均按该版 API 核对过（见下） |
+| **0.1.7-rc.2** | 支持。独立「WorkBuddy 账号池」设置页；0.6.8 修复旧图标导出被移除导致的空白页 |
 | 0.1.5-rc.2 ～ 0.1.6 | 支持，功能完整（含设置卡片） |
-| 0.2.x / 其他 | 未声明 |
+| 0.2.x 其他预发布 / 0.3.x | 未声明 |
 
-`peerDependencies` 逐项写明范围。注意 semver 的一条规则：**预发布版本只有在范围里存在
-「同一 major.minor.patch 且带预发布」的比较器时才匹配**，所以 0.1.7 的元组必须显式列出
-（`>=0.1.5-rc.2 <0.2.0 || >=0.1.7-rc.2 <0.2.0`）。每新增一条 DSH 预发布线，都要把该元组补进去。
+`package.json` 的 `dsh.engines.dsh` 与每个 `@deepseek-ai/dsh-*` peer 都写成同一组比较器：
+
+```
+>=0.1.5-rc.2 <0.3.0 || >=0.1.7-rc.2 <0.3.0 || >=0.2.1-rc.2 <0.3.0
+```
+
+为什么这么写：semver 有一条规则 —— **预发布版本只有在范围里存在「同一 major.minor.patch
+且带预发布」的比较器时才匹配**。所以只写 `>=0.1.5-rc.2 <0.3.0` 时，0.1.7-rc.2 与 0.2.1-rc.2
+**都不满足**，声明会变成"不支持"。每新增一条 DSH 预发布线，都要把该元组补进范围。
+
+### 0.2.1-rc.2 的核对结果
+
+| 依赖面 | 0.2.1-rc.2 的状态 | 本插件的应对 |
+|---|---|---|
+| 宿主 `ctx.settings` | `configure` / `describe` / `update` / `writable` 均在；`installSection` 仍不存在 | 与 0.1.7 同一套能力探测，无需改动 |
+| 设置命名空间键 | 仍取 `ctx.fiber.entry.options.id`（条目 id） | 已按条目 id 读取 |
+| 客户端槽位 | `settings.section` 仍在；`settings.plugin.item` 仍不存在；`settingsScope` 仍不存在 | 与 0.1.7 相同的注册与回退路径 |
+| 客户端槽位服务 | `@deepseek-ai/dsh-client-ui-slots` **已从该版本移除**，槽位服务改由 `dsh-client-ui-renderer` 提供；`specDynamic` / `subscribeDeclaration` 仍在 | 客户端清单改为依赖 `dsh-client-ui-renderer` |
+| `@deepseek-ai/dsh-client-ui-primitives` | **已移除** | 客户端产物只依赖 `react` / `react/jsx-runtime`（0.6.8 已去掉该图标导入） |
+| `@earendil-works/pi-ai` | 0.2.1-rc.2 携带 **1.1.0**（0.1.x 是 0.85.x）；`createProvider` 经 `export * from "./models.js"` 仍导出，`api/openai-completions.lazy` 仍在 | peer 范围扩展为 `>=0.85.0 <0.86.0 || >=1.1.0 <2.0.0` |
+| `@deepseek-ai/schemastery` | 3.18.5（peer 要求 `^3.18.2`） | 无需改动 |
 
 ### 0.1.7-rc.2 的适配方式
 

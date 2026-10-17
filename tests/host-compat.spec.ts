@@ -78,9 +78,17 @@ describe('the declared DSH compatibility range', () => {
     }
   })
 
-  it('keeps an upper bound, so a breaking 0.2 is not claimed', () => {
+  it('admits the 0.2.1 prerelease line on every peer', () => {
+    // Same rule again for the next line: 0.2.1-rc.2 needs its own tuple, because
+    // none of the earlier comparators share its major.minor.patch.
     for (const [name, range] of dshPeers) {
-      expect(range, name).toContain('<0.2.0')
+      expect(range, name).toContain('>=0.2.1-rc.2')
+    }
+  })
+
+  it('keeps an upper bound, so a breaking 0.3 is not claimed', () => {
+    for (const [name, range] of dshPeers) {
+      expect(range, name).toContain('<0.3.0')
     }
   })
 })
@@ -95,6 +103,18 @@ describe('the browser half across DSH lines', () => {
     const engines = (MANIFEST as { dsh?: { engines?: { dsh?: string } } }).dsh?.engines?.dsh ?? ''
     expect(engines).toContain('>=0.1.5-rc.2')
     expect(engines).toContain('>=0.1.7-rc.2')
+    expect(engines).toContain('>=0.2.1-rc.2')
+    expect(engines).toContain('<0.3.0')
+  })
+
+  it('does not depend on a client package that 0.2.x dropped', () => {
+    // `@deepseek-ai/dsh-client-ui-slots` is gone from 0.2.1-rc.2: the slots service
+    // now ships inside `dsh-client-ui-renderer`. Declaring the removed package as a
+    // client dependency is how an entry silently never activates.
+    const inject = (MANIFEST as { dsh?: { client?: { inject?: string[] } } }).dsh?.client?.inject ?? []
+    expect(inject).not.toContain('@deepseek-ai/dsh-client-ui-slots')
+    expect(inject).not.toContain('@deepseek-ai/dsh-client-ui-primitives')
+    expect(inject).toContain('@deepseek-ai/dsh-client-ui-renderer')
   })
 
   it('renders the card OPEN when it is a settings page', () => {

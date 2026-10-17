@@ -1,5 +1,39 @@
 # 更新日志
 
+## [0.6.9] - 2026-10-17
+
+### 兼容性：声明并核对 DSH 0.2.1-rc.2
+
+之前声明的是 `<0.2.0`，即**明确排除** 0.2.x。这一版核对后把 0.2.1-rc.2 纳入支持。
+
+**逐项核对结果**（对着 0.2.1-rc.2 的实际安装读的，不是猜的）：
+
+| 依赖面 | 结论 |
+|---|---|
+| 宿主 `ctx.settings` | `configure` / `describe` / `update` / `writable` 都在，`installSection` 仍不存在 → 现有能力探测直接可用 |
+| 命名空间键 | 仍取 `ctx.fiber.entry.options.id` → 已按条目 id 读取 |
+| `settings.section` | 仍在，注册选项 `id/order/label/locale/inject` 与 0.1.7 一致 → 注册代码不用动 |
+| 槽位服务归属 | **`@deepseek-ai/dsh-client-ui-slots` 已从该版本移除**，服务改由 `dsh-client-ui-renderer` 提供；`specDynamic` / `subscribeDeclaration` 仍在 |
+| `dsh-client-ui-primitives` | **已移除**；客户端产物本就只依赖 `react`，不受影响 |
+| `@earendil-works/pi-ai` | 0.2.1-rc.2 带的是 **1.1.0**（0.1.x 是 0.85.x）；`createProvider` 与 `api/openai-completions.lazy` 都还在 |
+
+### 改动
+
+1. **客户端依赖换成实际提供者**：`dsh.client.inject` 里的
+   `@deepseek-ai/dsh-client-ui-slots` → `@deepseek-ai/dsh-client-ui-renderer`。
+   声明一个该版本已不存在的包，正是"条目静默不激活"的成因（0.6.5 之前就栽在同类问题上）。
+2. **范围补上 0.2 元组**：
+   `>=0.1.5-rc.2 <0.3.0 || >=0.1.7-rc.2 <0.3.0 || >=0.2.1-rc.2 <0.3.0`
+   （peerDependencies 与 `dsh.engines.dsh` 同步）。
+3. **pi-ai peer 放宽**：`>=0.85.0 <0.86.0 || >=1.1.0 <2.0.0`。
+
+用真实 semver 实现验证过：0.1.5-rc.2 / 0.1.6 / 0.1.7-rc.2 / 0.1.7 / 0.2.1-rc.2 / 0.2.1 全部满足，
+0.3.0 正确不满足。守护测试新增两条：必须含 0.2.1 元组与 `<0.3.0` 上界；客户端清单不得依赖
+该版本已移除的两个包。
+
+> 说明：以上是**声明与 API 面核对**。我没有把插件装进 0.2.1-rc.2 的桌面宿主里做端到端运行
+> （该实例需要鉴权，且装插件要写你的 profile），所以"能加载并显示设置页"仍需实机确认。
+
 ## [0.6.8] - 2026-09-25
 
 ### 修复 DSH 0.1.7-rc.2 设置页空白
