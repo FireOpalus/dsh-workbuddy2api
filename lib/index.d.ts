@@ -545,6 +545,14 @@ declare class WorkBuddyCredentialStore {
 type WorkBuddyRegion = 'cn' | 'global';
 /** Upstream failure classes the shim maps onto distinct HTTP answers. */
 type UpstreamErrorKind = 'hard_credit' | 'soft_rate' |
+/**
+ * 429 + code 14003 "too many requests": a SHORT-WINDOW burst limit, not a quota
+ * wall. Measured against the live global gateway: the third rapid request is
+ * refused and the next one succeeds about five seconds later, with no
+ * Retry-After header at all. Parking the account for the quota-sized cooldown
+ * (minutes) is what turns one burst into a self-inflicted outage.
+ */
+'burst_rate' |
 /** 429 + code 6004: the MODEL is rate-limited, not the account. */
 'model_rate' |
 /** 11102 "service info not found": this backend has no such model at all. */

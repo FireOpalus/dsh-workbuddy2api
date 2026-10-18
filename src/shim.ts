@@ -72,8 +72,20 @@ const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]'])
 
 /** Failure classes worth retrying on a different account. */
 const RETRYABLE: ReadonlySet<UpstreamErrorKind> = new Set<UpstreamErrorKind>([
-  'hard_credit', 'soft_rate', 'session_dead', 'server',
+  'hard_credit', 'soft_rate', 'burst_rate', 'session_dead', 'server',
 ])
+
+/**
+ * How long to wait before retrying after a failure that says "not now".
+ *
+ * A burst limit is the one case where retrying IMMEDIATELY is actively harmful: the
+ * gateway is refusing because of the rate of the last few seconds, so the next
+ * attempt has to land outside that window. Measured recovery on the live gateway is
+ * about five seconds. The wait is capped so one request cannot hold the HTTP
+ * connection open for an unreasonable time, and a stated Retry-After always wins.
+ */
+const BURST_RETRY_WAIT_MS = 2_000
+const MAX_RETRY_WAIT_MS = 6_000
 
 /** Strip the optional :port from a Host header value, IPv6-bracket aware. */
 function hostnameOfHost(host: string): string {
@@ -155,6 +167,8 @@ function isJsonContentType(req: IncomingMessage): boolean {
 const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   hard_credit: 402,
   soft_rate: 429,
+  // A burst refusal is the client's cue to retry shortly, which 429 says exactly.
+  burst_rate: 429,
   // A model-level limit is not the client's fault and not an auth failure; 429
   // is still the honest status, since the client should simply wait or switch.
   model_rate: 429,
@@ -418,8 +432,17 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
       onDispatch?.()
       lastFailure = { status: KIND_STATUS[result.kind], kind: result.kind, message: result.message }
       if (!RETRYABLE.has(result.kind) || controller.signal.aborted) break
+      // A burst limit has to be waited out, not merely sent elsewhere: with one
+      // account in the pool "another account" does not exist, and even with several
+      // they share the same per-client rate window. Sleeping is what makes the retry
+      // land outside it; every other retryable kind is retried straight away.
+      const waitMs = result.kind === 'burst_rate'
+        ? Math.min(result.retryAfterMs ?? BURST_RETRY_WAIT_MS, MAX_RETRY_WAIT_MS)
+        : 0
+      if (waitMs > 0) await new Promise(resolve => setTimeout(resolve, waitMs))
       logger?.warn(
-        `dsh-workbuddy2api: account ${accountId} failed with ${result.kind}; retrying on another account`,
+        `dsh-workbuddy2api: account ${accountId} failed with ${result.kind}; retrying`
+        + (waitMs === 0 ? ' on another account' : ` after ${waitMs}ms`),
       )
     }
 

@@ -828,3 +828,34 @@ describe('reenableIfCredits (unfreezing after a check-in)', () => {
     expect(pool.pick().ok).toBe(true)
   })
 })
+
+
+describe('burst rate cooldown (seconds, not minutes)', () => {
+  it('cools for seconds and returns to service long before the quota cooldown', async () => {
+    const time = clock()
+    const pool = await makePool(['a'], { now: time.now })
+    pool.report('a', { ok: false, kind: 'burst_rate', message: 'too many requests' })
+    const until = pool.entryView('a')?.cooldownUntil ?? 0
+    // The quota-sized base is 600s; this must be single-digit seconds.
+    expect(until - time.now()).toBe(5_000)
+    expect(pool.entryView('a')?.cooldownKind).toBe('soft')
+    // And it really clears: five seconds later the account is pickable again.
+    time.advance(5_001)
+    expect(pool.pick().ok).toBe(true)
+  })
+
+  it('never grows a burst cooldown into the quota scale', async () => {
+    // Repeated bursts must stay bounded, or a busy conversation re-creates the very
+    // outage this class was introduced to prevent.
+    const time = clock()
+    const pool = await makePool(['a'], { now: time.now })
+    for (let i = 0; i < 6; i += 1) {
+      pool.report('a', { ok: false, kind: 'burst_rate', message: 'too many requests' })
+      time.advance(60_001)
+    }
+    pool.report('a', { ok: false, kind: 'burst_rate', message: 'too many requests' })
+    const wait = (pool.entryView('a')?.cooldownUntil ?? 0) - time.now()
+    expect(wait).toBeLessThanOrEqual(60_000)
+    expect(wait).toBeGreaterThan(0)
+  })
+})

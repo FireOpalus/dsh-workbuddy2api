@@ -393,3 +393,20 @@ describe('the international channel gates', () => {
     expect(conversationIdOf('not json')).not.toBe('')
   })
 })
+
+
+describe('burst rate (14003) is its own class', () => {
+  it('classifies the short-window refusal separately from a quota limit', () => {
+    // Measured live: the third rapid request is refused with 14003 and the next one
+    // succeeds ~5s later, with no Retry-After. It must not inherit the quota-sized
+    // cooldown, or one burst parks an account for minutes.
+    expect(classifyUpstreamError(429, JSON.stringify({ code: 14003, msg: 'too many requests' }))).toBe('burst_rate')
+    expect(classifyUpstreamError(429, JSON.stringify({ code: 0, msg: 'rate limit exceeded' }))).toBe('soft_rate')
+    // A model-level limit still wins: it is narrower and has its own reset clock.
+    expect(classifyUpstreamError(429, JSON.stringify({ code: 6004, msg: '将在 2026-10-19 09:00:00 重置' }))).toBe('model_rate')
+  })
+
+  it('honours the wording when the gateway omits the code', () => {
+    expect(classifyUpstreamError(429, JSON.stringify({ msg: 'Too Many Requests' }))).toBe('burst_rate')
+  })
+})

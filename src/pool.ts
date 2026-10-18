@@ -156,6 +156,17 @@ const MODEL_BLOCK_MAX_MS = 24 * 3_600_000
 const MODEL_BLOCK_SHIFT = 4
 /** Base soft cooldown for a gateway (WAF) refusal, jittered below. */
 const WAF_COOLDOWN_BASE_MS = 60_000
+
+/**
+ * Burst-limit cooldown: seconds, not minutes.
+ *
+ * Measured against the live gateway: the third rapid request is refused with code
+ * 14003 and the next one succeeds about five seconds later, with no Retry-After
+ * header at all. Using the quota-sized base here parked the only account in a realm
+ * for ten minutes per burst — a transient refusal turned into an outage.
+ */
+const BURST_RATE_COOLDOWN_MS = 5_000
+const BURST_RATE_COOLDOWN_MAX_MS = 60_000
 /** How long a cost observation stays usable: covers a "free at night" window. */
 const MODEL_COST_TTL_MS = 6 * 3_600_000
 
@@ -926,6 +937,12 @@ export class WorkBuddyAccountPool {
         entry.cooldownUntil = nextDay4Am(now)
         entry.lastError = '会话已失效（连续 ' + String(SESSION_DEAD_THRESHOLD) + ' 次），请在 WorkBuddy 桌面端重新登录该账号'
         return
+      case 'burst_rate':
+        // Seconds, not minutes: this is a short-window rate refusal that clears on
+        // its own. The quota-sized base below would park an account for ten minutes
+        // per burst — with one account in a realm, that IS the outage.
+        this.applySoftRate(entry, now, outcome, BURST_RATE_COOLDOWN_MS, BURST_RATE_COOLDOWN_MAX_MS)
+        return
       case 'soft_rate':
         this.applySoftRate(entry, now, outcome)
         return
@@ -974,17 +991,21 @@ export class WorkBuddyAccountPool {
     now: number,
     outcome: WorkBuddyDispatchOutcome,
     baseOverrideMs?: number,
+    maxOverrideMs?: number,
   ): void {
     const base = baseOverrideMs ?? this.policy.softRateCooldownMs
+    // A caller with a short-window limit brings its own ceiling, so its stated wait
+    // is not stretched to the quota-sized maximum.
+    const max = maxOverrideMs ?? this.policy.softRateCooldownMaxMs
     if (outcome.resetAtMs !== undefined) {
       entry.cooldownKind = 'soft'
-      entry.cooldownUntil = Math.min(outcome.resetAtMs, now + this.policy.softRateCooldownMaxMs)
+      entry.cooldownUntil = Math.min(outcome.resetAtMs, now + max)
       entry.modelCooldowns.clear()
       return
     }
     if (outcome.retryAfterMs !== undefined) {
       entry.cooldownKind = 'soft'
-      entry.cooldownUntil = now + Math.min(outcome.retryAfterMs, this.policy.softRateCooldownMaxMs)
+      entry.cooldownUntil = now + Math.min(outcome.retryAfterMs, max)
       entry.modelCooldowns.clear()
       return
     }
@@ -992,7 +1013,7 @@ export class WorkBuddyAccountPool {
     const shift = Math.min(entry.softStreak, 16)
     const grown = base * 2 ** shift
     entry.cooldownKind = 'soft'
-    entry.cooldownUntil = now + Math.min(grown, this.policy.softRateCooldownMaxMs)
+    entry.cooldownUntil = now + Math.min(grown, max)
     entry.softStreak += 1
     entry.modelCooldowns.clear()
   }

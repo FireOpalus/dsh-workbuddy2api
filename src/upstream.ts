@@ -33,6 +33,14 @@ export type WorkBuddyRegion = 'cn' | 'global'
 export type UpstreamErrorKind =
   | 'hard_credit'
   | 'soft_rate'
+  /**
+   * 429 + code 14003 "too many requests": a SHORT-WINDOW burst limit, not a quota
+   * wall. Measured against the live global gateway: the third rapid request is
+   * refused and the next one succeeds about five seconds later, with no
+   * Retry-After header at all. Parking the account for the quota-sized cooldown
+   * (minutes) is what turns one burst into a self-inflicted outage.
+   */
+  | 'burst_rate'
   /** 429 + code 6004: the MODEL is rate-limited, not the account. */
   | 'model_rate'
   /** 11102 "service info not found": this backend has no such model at all. */
@@ -191,6 +199,21 @@ const CLIENT_UA = 'CLI/2.63.2 CodeBuddy/2.63.2'
 const DESKTOP_UA = 'WorkBuddy/5.5.2'
 const JSON_TIMEOUT_MS = 30_000
 const ERROR_BODY_LIMIT = 4096
+
+/** Business code of the short-window burst limit ("too many requests"). */
+const BURST_RATE_CODE = '14003'
+
+/**
+ * Whether a 429 is the short-window burst limit rather than an account quota.
+ *
+ * The code is authoritative; the wording is the fallback for a gateway that omits
+ * it. Both are matched narrowly: "too many requests" is the burst phrase, while a
+ * quota refusal says "rate limit"/"quota" and keeps the long cooldown.
+ */
+function isBurstRateLimit(body: string): boolean {
+  if (new RegExp('"code"\\s*:\\s*"?' + BURST_RATE_CODE + '"?').test(body)) return true
+  return /too many requests/i.test(body)
+}
 
 /** Insufficient-credit markers, ASCII lowercase plus the original Chinese. */
 const HARD_CREDIT_MARKERS: readonly string[] = [
@@ -385,7 +408,13 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   for (const marker of SESSION_DEAD_MARKERS) {
     if (body.includes(marker)) return 'session_dead'
   }
-  if (status === 429) return isModelRateLimit(body) ? 'model_rate' : 'soft_rate'
+  if (status === 429) {
+    if (isModelRateLimit(body)) return 'model_rate'
+    // Checked before the generic case so a burst refusal gets the short cooldown
+    // it warrants rather than the quota-sized one.
+    if (isBurstRateLimit(body)) return 'burst_rate'
+    return 'soft_rate'
+  }
   for (const marker of HARD_CREDIT_MARKERS) {
     if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'hard_credit'
   }
