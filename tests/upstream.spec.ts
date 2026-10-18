@@ -10,7 +10,10 @@
 
 import { describe, expect, it, vi } from 'vitest'
 import {
+  chatCompletionPaths,
+  conversationIdOf,
   classifyUpstreamError,
+  ensureSystemFirst,
   parseCreditMultiplier,
   parseReasoning,
   parseUpstreamModel,
@@ -159,11 +162,20 @@ describe('WorkBuddyUpstreamClient', () => {
       return new Response('data: [DONE]\n\n', { status: 200 })
     })
     const client = new WorkBuddyUpstreamClient()
+    // Both international domains take the console route: the /v2 path there answers
+    // 400 code 11128 for every request, so "the brand differs" and "the chat route
+    // moved" are two separate facts and this pins both.
     await client.chatStream(credential({ domain: 'codebuddy.ai' }), '{}')
-    expect(urls[0]).toContain('https://www.codebuddy.ai/v2/chat/completions')
+    expect(urls[0]).toContain('https://www.codebuddy.ai/console/chat/completions')
     urls.length = 0
     await client.chatStream(credential({ domain: 'www.workbuddy.ai' }), '{}')
-    expect(urls[0]).toContain('https://www.workbuddy.ai/v2/chat/completions')
+    expect(urls[0]).toContain('https://www.workbuddy.ai/console/chat/completions')
+    urls.length = 0
+    // The domestic gateway keeps its established path (its chat host differs from
+    // its brand domain, so only the path is asserted here).
+    await client.chatStream(credential({ domain: 'www.workbuddy.cn' }), '{}')
+    expect(urls[0]?.endsWith('/v2/chat/completions')).toBe(true)
+    expect(urls[0]).not.toContain('/console/')
     vi.unstubAllGlobals()
   })
 
@@ -260,5 +272,124 @@ describe('WorkBuddyUpstreamClient', () => {
     expect(credits.packages[0]?.refreshAtMs).toBe(Date.parse(cycleEnd) + 1_000)
     expect(credits.packages[1]?.monthly).toBe(false)
     vi.unstubAllGlobals()
+  })
+})
+
+
+describe('chatCompletionPaths (the international route move)', () => {
+  const cred = (domain: string): WorkBuddyCredential => ({
+    accessToken: 'token', refreshToken: '', expiresAtMs: 0, domain,
+    uid: 'u', nickname: 'n', source: 'desktop', filePath: '/x.info',
+  } as WorkBuddyCredential)
+
+  it('uses the console route for the international gateway', () => {
+    // The retired /v2 route on www.workbuddy.ai answers 400 code 11128 for every
+    // request ("channel verification"), which looks like a fingerprint problem and
+    // is really just the wrong path. Verified live: console → 200, /v2 → 400.
+    expect(chatCompletionPaths(cred('www.workbuddy.ai'))).toEqual([
+      '/console/chat/completions',
+      '/v2/chat/completions',
+    ])
+  })
+
+  it('leaves the domestic gateway exactly as it was', () => {
+    expect(chatCompletionPaths(cred('www.workbuddy.cn'))).toEqual(['/v2/chat/completions'])
+  })
+})
+
+describe('ensureSystemFirst', () => {
+  it('prepends a system prompt when the body opens with a user message', () => {
+    // The console route rejects a user-first body with the SAME code 11128 and the
+    // same "channel verification" tip, so this guarantee is not cosmetic.
+    const out = JSON.parse(ensureSystemFirst(JSON.stringify({
+      model: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: true,
+    }))) as { messages: { role: string }[] }
+    expect(out.messages[0]?.role).toBe('system')
+    expect(out.messages[1]?.role).toBe('user')
+    expect(out.messages).toHaveLength(2)
+  })
+
+  it('leaves a body that already opens with a system prompt untouched', () => {
+    const source = JSON.stringify({
+      messages: [{ role: 'system', content: 's' }, { role: 'user', content: 'hi' }],
+    })
+    expect(ensureSystemFirst(source)).toBe(source)
+  })
+
+  it('passes through anything it cannot read, so the caller sees the real error', () => {
+    expect(ensureSystemFirst('not json')).toBe('not json')
+    expect(ensureSystemFirst('[]')).toBe('[]')
+    expect(ensureSystemFirst(JSON.stringify({ model: 'm' }))).toBe(JSON.stringify({ model: 'm' }))
+    expect(ensureSystemFirst(JSON.stringify({ messages: [] }))).toBe(JSON.stringify({ messages: [] }))
+  })
+})
+
+
+describe('the international channel gates', () => {
+  const cred = (domain: string): WorkBuddyCredential => ({
+    accessToken: 'token', refreshToken: '', expiresAtMs: 0, domain,
+    uid: 'u', nickname: 'n', source: 'desktop', filePath: '/x.info',
+  } as WorkBuddyCredential)
+
+  /** Send one chat and hand back the headers of the first attempt. */
+  const capture = async (domain: string): Promise<Record<string, string>> => {
+    const inits: RequestInit[] = []
+    vi.stubGlobal('fetch', async (_url: string, init?: RequestInit) => {
+      inits.push(init ?? {})
+      return new Response('data: [DONE]\n\n', { status: 200 })
+    })
+    const client = new WorkBuddyUpstreamClient()
+    await client.chatStream(cred(domain), JSON.stringify({
+      model: 'm',
+      messages: [{ role: 'user', content: 'hi' }],
+    }))
+    vi.unstubAllGlobals()
+    return (inits[0]?.headers ?? {}) as Record<string, string>
+  }
+
+  it('sends all three conversation headers to the international gateway', async () => {
+    // Verified live: without them this gateway answers 400 code 11128 "request
+    // illegal"; with them, 200. Omitting ANY one of the three still fails, and the
+    // check is presence-only, so these are non-empty rather than well-formed ids.
+    const headers = await capture('www.workbuddy.ai')
+    for (const name of ['X-Conversation-ID', 'X-Conversation-Request-ID', 'X-Conversation-Message-ID']) {
+      expect(headers[name], name).toBeTruthy()
+    }
+  })
+
+  it('adds a system prompt when the international body arrives without one', async () => {
+    // Second gate on the same route: "first message is not system prompt", again as
+    // code 11128. The captured body is what actually goes on the wire.
+    const inits: RequestInit[] = []
+    vi.stubGlobal('fetch', async (_url: string, init?: RequestInit) => {
+      inits.push(init ?? {})
+      return new Response('data: [DONE]\n\n', { status: 200 })
+    })
+    const client = new WorkBuddyUpstreamClient()
+    await client.chatStream(cred('www.workbuddy.ai'), JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }))
+    vi.unstubAllGlobals()
+    const sent = JSON.parse(String(inits[0]?.body)) as { messages: { role: string }[] }
+    expect(sent.messages[0]?.role).toBe('system')
+    expect(sent.messages[1]?.role).toBe('user')
+  })
+
+  it('leaves the domestic request exactly as it was', async () => {
+    const headers = await capture('www.workbuddy.cn')
+    expect(headers['X-Conversation-ID']).toBeUndefined()
+    expect(headers['X-Conversation-Request-ID']).toBeUndefined()
+    expect(headers['X-Conversation-Message-ID']).toBeUndefined()
+  })
+
+  it('keeps the conversation id stable for one conversation', async () => {
+    // Presence-only means a random id would pass, but the upstream groups by this
+    // value: a stable id keeps that grouping truthful instead of fragmenting.
+    const body = JSON.stringify({
+      messages: [{ role: 'user', content: 'same opening' }, { role: 'assistant', content: 'x' }],
+    })
+    expect(conversationIdOf(body)).toBe(conversationIdOf(body))
+    expect(conversationIdOf(body)).not.toBe(conversationIdOf(JSON.stringify({ messages: [{ role: 'user', content: 'other' }] })))
+    expect(conversationIdOf('not json')).not.toBe('')
   })
 })

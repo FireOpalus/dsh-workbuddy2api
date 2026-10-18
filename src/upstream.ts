@@ -23,7 +23,7 @@
  * @module dsh-workbuddy2api/upstream
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { WorkBuddyCredential } from './auth.ts'
 
 /** WorkBuddy region selected by the credential's login domain. */
@@ -169,6 +169,22 @@ const MODELS_CATALOG_PATH = '/v2/enterprises/personal/models'
 
 /** Remote product-config path on the global gateway (desktop channel). */
 const GLOBAL_CONFIG_PATH = '/v3/config'
+
+/**
+ * Chat-completions paths.
+ *
+ * The CN gateway serves `/v2/chat/completions`. The INTERNATIONAL gateway serves
+ * its chat route at `/console/chat/completions`; its old `/v2/...` route still
+ * exists but now answers HTTP 400 code 11128 ("request illegal", displayed as
+ * "this call failed channel verification, possibly not an official client") for
+ * every request, which reads like a fingerprint problem and is not one.
+ *
+ * Verified live against www.workbuddy.ai: console path → 200 stream; `/v2/...` →
+ * 400 code 11128. The old route is kept only as a 404/405 fallback, mirroring the
+ * reference implementation's per-realm candidate list.
+ */
+const CHAT_COMPLETIONS_PATH = '/v2/chat/completions'
+const GLOBAL_CHAT_CONSOLE_PATH = '/console/chat/completions'
 
 const CLIENT_UA = 'CLI/2.63.2 CodeBuddy/2.63.2'
 /** User agent of the WorkBuddy desktop app (see dsh-connect-workbuddy). */
@@ -429,8 +445,68 @@ function commonHeaders(credential: WorkBuddyCredential): Record<string, string> 
   }
 }
 
+/**
+ * The conversation headers the international gateway checks for.
+ *
+ * Verified live on www.workbuddy.ai: the retired-looking `/v2/chat/completions`
+ * route answers HTTP 400 code 11128 ("request illegal", displayed as "channel
+ * verification") unless all three conversation headers are present, and returns
+ * 200 as soon as they are — with the same body and the same user agent. Several
+ * independent projects reported the same on 2026-10-17, and the check is
+ * PRESENCE-ONLY (a single character passes), not a signature or a fingerprint.
+ *
+ * Ids vary the way the official client's do: the conversation id is stable for one
+ * conversation, while the request and message ids are fresh for every request.
+ */
+function conversationHeaders(conversationId: string): Record<string, string> {
+  const requestId = randomUUID()
+  return {
+    'X-Conversation-ID': conversationId,
+    'X-Conversation-Request-ID': requestId,
+    'X-Conversation-Message-ID': randomUUID(),
+    'X-Request-ID': requestId,
+  }
+}
+
+/**
+ * A conversation id that stays stable for one conversation.
+ *
+ * Derived from the FIRST user message, so two requests of one conversation share
+ * it while two different conversations do not. The gateway only checks presence
+ * today, but a stable id keeps the upstream's own grouping truthful instead of
+ * fragmenting every request into its own conversation.
+ */
+export function conversationIdOf(bodyJson: string): string {
+  try {
+    const parsed: unknown = JSON.parse(bodyJson)
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      const messages = (parsed as Record<string, unknown>)['messages']
+      if (Array.isArray(messages)) {
+        for (const value of messages) {
+          if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+          const message = value as Record<string, unknown>
+          if (message['role'] !== 'user') continue
+          const content = message['content']
+          const text = typeof content === 'string'
+            ? content
+            : Array.isArray(content)
+              ? content.map(part => (typeof part === 'object' && part !== null && !Array.isArray(part)
+                ? String((part as Record<string, unknown>)['text'] ?? '')
+                : '')).join('')
+              : ''
+          if (text !== '') return createHash('sha256').update(text).digest('hex').slice(0, 32)
+          break
+        }
+      }
+    }
+  } catch {
+    // An unparsable body still needs an id; a random one satisfies the presence check.
+  }
+  return randomUUID()
+}
+
 /** Chat request headers, including the X-No-* conventions the official CLI uses. */
-function chatHeaders(credential: WorkBuddyCredential): Record<string, string> {
+function chatHeaders(credential: WorkBuddyCredential, conversationId?: string): Record<string, string> {
   return {
     ...commonHeaders(credential),
     'Content-Type': 'application/json',
@@ -441,6 +517,8 @@ function chatHeaders(credential: WorkBuddyCredential): Record<string, string> {
       : { 'X-Enterprise-Id': credential.enterpriseId },
     ...credential.domain === '' ? { 'X-No-Department-Info': '1' } : { 'X-Domain': credential.domain },
     'X-Product': 'SaaS',
+    // Only the international gateway gates on these; the domestic one is untouched.
+    ...conversationId === undefined ? {} : conversationHeaders(conversationId),
   }
 }
 
@@ -496,6 +574,54 @@ export function prepareChatBody(source: string): string {
     }
   }
   normalizeToolChoice(obj)
+  return JSON.stringify(obj)
+}
+
+/**
+ * The chat-completions paths to try, most-specific first.
+ *
+ * Global tries its console route first and keeps the CN route only as a fallback
+ * for a deployment that has not moved yet; CN stays byte-for-byte what it was.
+ */
+export function chatCompletionPaths(credential: WorkBuddyCredential): string[] {
+  return regionOf(credential.domain) === 'global'
+    ? [GLOBAL_CHAT_CONSOLE_PATH, CHAT_COMPLETIONS_PATH]
+    : [CHAT_COMPLETIONS_PATH]
+}
+
+/** The neutral system prompt used only when a global body arrives without one. */
+const SYSTEM_PROMPT_FIRST = 'You are a helpful assistant.'
+
+/**
+ * Guarantee that the first message is a system prompt.
+ *
+ * The international console route rejects anything else outright — HTTP 400 code
+ * 11128 with `"first message is not system prompt"` — and the message does NOT
+ * look like a validation error from the outside (it arrives with the same code and
+ * the same "channel verification" tip as a fingerprint block). The CN route accepts
+ * a user-first body, so this only runs for the global realm.
+ *
+ * A well-behaved client already opens with a system message; this is the guarantee,
+ * not an assumption, and an unparsable body is passed through untouched for the
+ * caller to fail on with the upstream's own words.
+ */
+export function ensureSystemFirst(source: string): string {
+  let body: unknown
+  try {
+    body = JSON.parse(source)
+  } catch {
+    return source
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return source
+  const obj = body as Record<string, unknown>
+  const messages = obj['messages']
+  if (!Array.isArray(messages) || messages.length === 0) return source
+  const first: unknown = messages[0]
+  const role = typeof first === 'object' && first !== null && !Array.isArray(first)
+    ? (first as Record<string, unknown>)['role']
+    : undefined
+  if (role === 'system') return source
+  messages.unshift({ role: 'system', content: SYSTEM_PROMPT_FIRST })
   return JSON.stringify(obj)
 }
 
@@ -941,14 +1067,39 @@ export class WorkBuddyUpstreamClient {
     bodyJson: string,
     signal?: AbortSignal,
   ): Promise<WorkBuddyChatResult> {
+    // The global realm differs in TWO ways, both verified against the live gateway:
+    // its chat route is `/console/chat/completions`, and that route rejects a body
+    // whose first message is not a system prompt. Both failures arrive as HTTP 400
+    // code 11128 "request illegal", so the CN behaviour is left byte-for-byte alone
+    // and these adjustments stay realm-scoped rather than becoming global defaults.
+    const paths = chatCompletionPaths(credential)
+    const global = paths[0] === GLOBAL_CHAT_CONSOLE_PATH
+    const payload = global ? ensureSystemFirst(bodyJson) : bodyJson
+    const conversationId = global ? conversationIdOf(payload) : undefined
+    const headers = (): Record<string, string> => ({
+      ...chatHeaders(credential, conversationId),
+      'Authorization': `Bearer ${credential.accessToken}`,
+    })
     let response: Response
     try {
-      response = await fetch(`${chatBase(credential)}/v2/chat/completions`, {
+      response = await fetch(`${chatBase(credential)}${paths[0] ?? CHAT_COMPLETIONS_PATH}`, {
         method: 'POST',
-        headers: { ...chatHeaders(credential), 'Authorization': `Bearer ${credential.accessToken}` },
-        body: bodyJson,
+        headers: headers(),
+        body: payload,
         ...signal === undefined ? {} : { signal },
       })
+      // Only a MISSING route falls back: the retired `/v2` route answers 400 (not
+      // 404) on this deployment, and retrying a request the gateway just refused
+      // would only produce the same refusal a second time.
+      if ((response.status === 404 || response.status === 405) && paths.length > 1) {
+        response.body?.cancel().catch(() => {})
+        response = await fetch(`${chatBase(credential)}${paths[1] ?? CHAT_COMPLETIONS_PATH}`, {
+          method: 'POST',
+          headers: headers(),
+          body: payload,
+          ...signal === undefined ? {} : { signal },
+        })
+      }
     } catch (error: unknown) {
       return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
     }
@@ -1472,7 +1623,10 @@ export class WorkBuddyUpstreamClient {
   ): Promise<{ conversationId: string; requestId: string }> {
     const conversationId = 'wb2api-conv-' + String(Date.now()) + '-' + Math.floor(Math.random() * 1e6).toString(36)
     const model = options.model ?? 'fast-model'
-    const response = await fetch(chatBase(credential) + '/v2/chat/completions', {
+    // Same realm split as chatStream: the global gateway's chat route lives at
+    // `/console/chat/completions` and wants a system prompt first (this body already
+    // opens with one).
+    const response = await fetch(chatBase(credential) + (chatCompletionPaths(credential)[0] ?? CHAT_COMPLETIONS_PATH), {
       method: 'POST',
       headers: {
         'Authorization': 'Bearer ' + credential.accessToken,
@@ -1482,7 +1636,11 @@ export class WorkBuddyUpstreamClient {
         'X-Domain': chatBase(credential),
         'X-Product': 'SaaS',
         'X-User-Id': credential.uid,
+        // The same conversation headers the intl gateway gates on; presence-only,
+        // so sending them on the domestic route changes nothing there.
         'X-Conversation-ID': conversationId,
+        'X-Conversation-Request-ID': conversationId + '-req',
+        'X-Conversation-Message-ID': createHash('sha256').update(conversationId + ':' + Date.now()).digest('hex').slice(0, 32),
         'X-Request-ID': String(Date.now()),
         'X-Agent-Intent': 'craft',
         'X-Agent-Type': 'main',

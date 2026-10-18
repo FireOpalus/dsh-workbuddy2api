@@ -7,6 +7,22 @@
 **两个 provider、两个账号池、两份模型目录** —— `workbuddy2api`（国内版账号）
 与 `workbuddy2api-global`（国际版账号）互不相通，各自轮换、各自计费。
 
+## 国际版（www.workbuddy.ai）的渠道校验
+
+2026-10-15 起国际版网关加了一道**渠道校验**，不满足就回 HTTP 400 `code 11128` /
+`msg "request illegal"`，提示文案是"可能不是官方客户端发出的"，很容易被误判成
+UA 指纹或账号风控。实测（逐变量拆解）证明它是**两道"与"关系的闸门**：
+
+1. **三个会话头必须存在**：`X-Conversation-ID` / `X-Conversation-Request-ID` /
+   `X-Conversation-Message-ID` —— 只查存在性，缺任一即拦；UA 换成官方形态**无效**。
+2. **首条消息必须是 system**，否则同样是 11128，文案为 `first message is not system prompt`。
+
+另外 chat 路由也换了：国际版走 `/console/chat/completions`，旧 `/v2/chat/completions`
+对任何请求都返回 400（不是 404，所以按状态码回退不会触发）。
+
+本插件已自动处理：国际版用 console 路由 + 补三个会话头 + 保证首条 system；
+**国内版（copilot.tencent.com）没有这道闸门，行为完全未改。**
+
 ## 兼容性
 
 | DSH 版本 | 状态 |

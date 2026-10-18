@@ -1,5 +1,58 @@
 # 更新日志
 
+## [0.6.10] - 2026-10-18
+
+### 修复：国际版每次请求都报 11128 "request illegal" / 渠道校验
+
+**根因**：国际版网关在 2026-10-15/16 之后加了一道**渠道校验**，普通请求被判为"非官方客户端"。
+它不是账号风控，也不是 UA 指纹 —— 本机实测把变量逐个拆开验证：
+
+| 实验 | 结果 |
+|---|---|
+| `/v2/chat/completions` + 用户优先的请求体（原状） | **400 code 11128 request illegal** |
+| `/v2` + 首条 system + **三个会话头** | **200** |
+| `/console/chat/completions` + 首条 system | **200** |
+| `/console` 不带会话头 | **200**（该路由不查这三头） |
+| 换成官方国际 UA `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2` | 仍然 400（**UA 无关**） |
+| 请求体含 `11128`（讨论这个错误码） | 仍 200（该路由**无反探测**） |
+
+结论：国际版有**两道闸门**，是「与」关系 ——
+1. **三个会话头**（`X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID`），
+   只查**存在性**（单字符即可），缺任一即 11128；
+2. **首条消息必须是 system**，否则同样 11128，但文案是 `first message is not system prompt`。
+
+而 chat 路由也换了：国际版是 `/console/chat/completions`，旧的 `/v2/chat/completions` 现在
+对任何请求都返回 400（不是 404），所以按状态码回退永远不会触发 —— 这也是为什么"看起来像
+指纹问题"却怎么改头都没用。
+
+### 改动
+
+- **按 realm 选 chat 路径**：国际版 → `/console/chat/completions`（`/v2` 仅作 404/405 回退）；
+  国内版逐字不变。
+- **国际版补三个会话头**：`X-Conversation-ID` 由**首条 user 消息**哈希得出（同一对话稳定，
+  便于上游按对话聚合），请求/消息 id 每请求新生成。
+- **国际版保证首条是 system**：缺失时补一句中性的 `You are a helpful assistant.`；
+  国内版不注入（它的网关没有这道闸门，不改变既有行为）。
+- **成长任务的桌面 chat** 同步补齐缺的两个会话头。
+
+国内版完全未受影响：路径、请求头、请求体三处都保持原样，用例显式断言"国内请求不得带会话头"。
+
+### 验证
+
+用**插件自己的客户端代码**对真实国际版网关跑通（用户优先请求体，即原本必失败的形状）：
+
+```
+paths(global): /console/chat/completions , /v2/chat/completions
+chatStream ok: true | status: 200
+answer: pong
+usage: {"prompt_tokens":19,"completion_tokens":2,"total_tokens":21,...}
+```
+
+国内版同时做对照组：同一套请求形状 → 200 流式正常。
+
+参考旁证（同日多项目独立复现）：workbuddy2api-hub#425、dsh-xdpool#48、
+dsh-our-free-model#377、cpa-workbuddy-plugin#3、qoder-trae-workbuddy-switch#43。
+
 ## [0.6.9] - 2026-10-17
 
 ### 兼容性：声明并核对 DSH 0.2.1-rc.2
