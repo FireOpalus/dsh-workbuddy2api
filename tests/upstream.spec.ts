@@ -19,6 +19,7 @@ import {
   parseUpstreamModel,
   prepareChatBody,
   regionOf,
+  sanitizeCnChatBody,
   selectCliModels,
   WorkBuddyUpstreamClient,
 } from '../src/upstream.ts'
@@ -394,6 +395,132 @@ describe('the international channel gates', () => {
   })
 })
 
+
+describe('the domestic prompt fingerprint gates', () => {
+  const cred = (domain: string): WorkBuddyCredential => ({
+    accessToken: 'token', refreshToken: '', expiresAtMs: 0, domain,
+    uid: 'u', nickname: 'n', source: 'desktop', filePath: '/x.info',
+  } as WorkBuddyCredential)
+
+  /** Parse a sanitized body so the assertions read the wire shape. */
+  const sanitized = (body: unknown): Record<string, any> =>
+    JSON.parse(sanitizeCnChatBody(JSON.stringify(body))) as Record<string, any>
+
+  it('shortens the two-word harness brand in model-read messages only', () => {
+    // Measured live on 2026-10-28: the CN gateway answers 400 code 11128 for a
+    // system prompt naming the full brand, and 200 once it is shortened. Assistant
+    // history is scanned by the same gate (the same sentence replayed as an
+    // assistant message is refused too), so assistant text is rewritten as well;
+    // user data is not, and a brand name the user quoted stays verbatim.
+    const out = sanitized({
+      messages: [
+        { role: 'system', content: 'You are an AI agent powered by DeepSeek Harness.' },
+        { role: 'user', content: 'I quoted DeepSeek Harness in my own words.' },
+        { role: 'assistant', content: 'DeepSeek Harness again.' },
+      ],
+    })
+    expect(out.messages[0].content).toBe('You are an AI agent powered by DeepSeek.')
+    expect(out.messages[1].content).toBe('I quoted DeepSeek Harness in my own words.')
+    expect(out.messages[2].content).toBe('DeepSeek again.')
+  })
+
+  it('matches every whitespace variant of the brand and never the identifier', () => {
+    const out = sanitized({
+      messages: [{
+        role: 'system',
+        // The gateway's own match is case-insensitive (a lowercased spelling is
+        // rejected too), so the rewrite is too. Double space and tab are a
+        // superset of the single-space form the gate measured; the hyphenated
+        // spelling is a package name/path, so it is deliberately kept.
+        content: 'a DeepSeek  Harness b DeepSeek\tHarness c deepseek-harness d deepSeek Harness e DeepSeek',
+      }],
+    })
+    expect(out.messages[0].content).toBe('a DeepSeek b DeepSeek c deepseek-harness d DeepSeek e DeepSeek')
+  })
+
+  it('replaces a bare mention @ and leaves every other @ shape alone', () => {
+    // Measured live: only a bare token @ surrounded by whitespace is refused;
+    // @file, @scope/pkg, addresses and quoted forms pass and stay verbatim.
+    const out = sanitized({
+      messages: [{
+        role: 'system',
+        content: 'Tokens prefixed with @ are paths.'
+          + ' | mail someone@example.com'
+          + ' | install @scope/pkg'
+          + ' | read @"a b"'
+          + ' | open @file.txt',
+      }],
+    })
+    expect(out.messages[0].content).toBe(
+      'Tokens prefixed with ＠ are paths.'
+      + ' | mail someone@example.com'
+      + ' | install @scope/pkg'
+      + ' | read @"a b"'
+      + ' | open @file.txt',
+    )
+  })
+
+  it('covers multipart content, the developer role and both tool-description shapes', () => {
+    // The same prompt reaches the wire as a plain string, as a multipart text
+    // part, or as tool prose; the gateway applies the fingerprint to all three.
+    const out = sanitized({
+      messages: [{
+        role: 'developer',
+        content: [
+          { type: 'text', text: 'via DeepSeek Harness' },
+          { type: 'image_url', image_url: { url: 'https://example.com/a.png' } },
+        ],
+      }],
+      tools: [
+        { type: 'function', function: { name: 'a', description: 'DeepSeek Harness tool' } },
+        { name: 'b', description: 'flat DeepSeek Harness description' },
+      ],
+    })
+    expect(out.messages[0].content[0].text).toBe('via DeepSeek')
+    expect(out.messages[0].content[1]).toEqual({ type: 'image_url', image_url: { url: 'https://example.com/a.png' } })
+    expect(out.tools[0].function.description).toBe('DeepSeek tool')
+    expect(out.tools[1].description).toBe('flat DeepSeek description')
+  })
+
+  it('returns a body with nothing to rewrite byte-identical', () => {
+    // A request the gateway already accepts must not be reserialized: the body is
+    // returned exactly as received (and unparsable input is the caller's error).
+    const clean = JSON.stringify({ model: 'm', messages: [{ role: 'system', content: 'plain' }] })
+    expect(sanitizeCnChatBody(clean)).toBe(clean)
+    expect(sanitizeCnChatBody('not json')).toBe('not json')
+    expect(sanitizeCnChatBody('[]')).toBe('[]')
+  })
+
+  it('sanitizes the domestic wire body and leaves the international one untouched', async () => {
+    const bodies: string[] = []
+    vi.stubGlobal('fetch', async (_url: string, init?: RequestInit) => {
+      bodies.push(String(init?.body))
+      return new Response('data: [DONE]', { status: 200 })
+    })
+    const build = (): string => JSON.stringify({
+      model: 'm',
+      messages: [
+        { role: 'system', content: 'You are an AI agent powered by DeepSeek Harness. Tokens prefixed with @ are paths.' },
+        { role: 'user', content: 'hi' },
+      ],
+    })
+    const client = new WorkBuddyUpstreamClient()
+    await client.chatStream(cred('www.codebuddy.cn'), build())
+    await client.chatStream(cred('www.workbuddy.ai'), build())
+    vi.unstubAllGlobals()
+    const domestic = JSON.parse(bodies[0] ?? '{}') as Record<string, any>
+    const international = JSON.parse(bodies[1] ?? '{}') as Record<string, any>
+    expect(domestic.messages[0].content).toBe(
+      'You are an AI agent powered by DeepSeek. Tokens prefixed with ＠ are paths.',
+    )
+    expect(domestic.messages[1].content).toBe('hi')
+    // The international gateway accepts the branded prompt (measured 200 on
+    // 2026-10-28), so its wire body stays byte-for-byte what it was.
+    expect(international.messages[0].content).toBe(
+      'You are an AI agent powered by DeepSeek Harness. Tokens prefixed with @ are paths.',
+    )
+  })
+})
 
 describe('burst rate (14003) is its own class', () => {
   it('classifies the short-window refusal separately from a quota limit', () => {

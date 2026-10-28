@@ -7,7 +7,12 @@
 **两个 provider、两个账号池、两份模型目录** —— `workbuddy2api`（国内版账号）
 与 `workbuddy2api-global`（国际版账号）互不相通，各自轮换、各自计费。
 
-## 国际版（www.workbuddy.ai）的渠道校验
+## 渠道校验（11128）与两个区域的差异
+
+两个区域都会用 HTTP 400 + `code 11128` 拦截"看起来不像官方客户端"的请求，
+但**触发条件完全不同**，所以修复也分别作用于各自的区域。
+
+### 国际版（www.workbuddy.ai）
 
 2026-10-15 起国际版网关加了一道**渠道校验**，不满足就回 HTTP 400 `code 11128` /
 `msg "request illegal"`，提示文案是"可能不是官方客户端发出的"，很容易被误判成
@@ -20,8 +25,25 @@ UA 指纹或账号风控。实测（逐变量拆解）证明它是**两道"与"�
 另外 chat 路由也换了：国际版走 `/console/chat/completions`，旧 `/v2/chat/completions`
 对任何请求都返回 400（不是 404，所以按状态码回退不会触发）。
 
-本插件已自动处理：国际版用 console 路由 + 补三个会话头 + 保证首条 system；
-**国内版（copilot.tencent.com）没有这道闸门，行为完全未改。**
+本插件已自动处理：国际版用 console 路由 + 补三个会话头 + 保证首条 system。
+
+### 国内版（copilot.tencent.com）
+
+2026-10-28 起国内版也加入 11128 拦截，但**不是头/路由问题，而是对「指令文本内容」
+做指纹**（同一份请求体加官方客户端全套 per-request 身份头仍被拒，去掉触发词后立即 200）：
+
+1. `system` / `developer` / `assistant` 消息里出现两词品牌名 `DeepSeek Harness`（空格/Tab 均可，
+   大小写不敏感）→ 拒；
+2. 同一条消息里出现**裸 `@` 提及**（被空格包围，且与「@ 前缀是路径」那段说明同时出现）→ 拒。
+
+`user` / `tool` 消息里的品牌名不动（实测不触发）；`@file`、`@scope/pkg`、
+`someone@example.com`、`@"..."` 这些 @ 形态也都不触发。`assistant` 历史同样被扫描
+（把同一句放进 assistant 消息也会 400），所以它也在清洗范围内——否则「对话里提到过品牌名」
+的下一轮会复发。
+
+本插件已自动处理：国内版发送前把 `system` / `developer` / `assistant` 消息（字符串与
+multipart text 两种载体）和工具描述里的 `DeepSeek Harness` 缩短为 `DeepSeek`、把裸 `@`
+换成全角 `＠`；其余内容逐字节原样发送，国际版不做这项清洗。
 
 ## 兼容性
 

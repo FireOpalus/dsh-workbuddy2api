@@ -147,12 +147,12 @@ function modelOf(bodyJson: string): string | undefined {
  * multiplier, but the gateway reports what a request actually cost. Watching the
  * real number means a promotional model that quietly starts billing is noticed.
  */
-function usageOf(frame: string): { credit: number; totalTokens: number } | undefined {
+export function usageOf(frame: string): { credit: number; totalTokens: number } | undefined {
   const at = frame.indexOf('"usage"')
   if (at === -1) return undefined
   const tail = frame.slice(at)
-  const credit = /"credit"s*:s*(-?d+(?:.d+)?)/u.exec(tail)
-  const tokens = /"total_tokens"s*:s*(d+)/u.exec(tail)
+  const credit = /"credit"\s*:\s*(-?\d+(?:\.\d+)?)/u.exec(tail)
+  const tokens = /"total_tokens"\s*:\s*(\d+)/u.exec(tail)
   if (credit === null || tokens === null) return undefined
   return { credit: Number(credit[1]), totalTokens: Number(tokens[1]) }
 }

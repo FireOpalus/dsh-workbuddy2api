@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { WorkBuddyCredentialStore } from '../src/auth.ts'
 import { WorkBuddyCatalog } from '../src/catalog.ts'
 import { WorkBuddyAccountPool } from '../src/pool.ts'
-import { createWorkBuddyShim } from '../src/shim.ts'
+import { createWorkBuddyShim, usageOf } from '../src/shim.ts'
 import type { WorkBuddyShim } from '../src/shim.ts'
 import type { WorkBuddyCredential } from '../src/auth.ts'
 import type { WorkBuddyChatResult } from '../src/upstream.ts'
@@ -342,5 +342,18 @@ describe('shim multi-account dispatch', () => {
     expect(forwarded.tool_choice).toBe('read')
     expect(forwarded.messages[0]?.role).toBe('system')
     await shim.close()
+  })
+})
+
+describe('usage accounting', () => {
+  it('reads the credit and token count out of the final usage frame', () => {
+    // Measured shape from the live CN gateway (glm-5.3): the last SSE frame carries
+    // usage.credit and usage.total_tokens. A regex here that never matches silently
+    // disables per-model cost accounting, so this pins the wire spelling.
+    const frame = 'data: {"id":"x","choices":[],"usage":{"prompt_tokens":24,'
+      + '"completion_tokens":3,"total_tokens":27,"credit":0.01}}'
+    expect(usageOf(frame)).toEqual({ credit: 0.01, totalTokens: 27 })
+    expect(usageOf('data: {"choices":[]}')).toBeUndefined()
+    expect(usageOf('data: {"usage":{"total_tokens":7}}')).toBeUndefined()
   })
 })

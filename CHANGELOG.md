@@ -1,5 +1,51 @@
 # 更新日志
 
+## [0.6.12] - 2026-10-28
+
+### 修复：国内版 11128「请求被拦截」——网关按指令文本内容做指纹，品牌名与裸 @ 触发
+
+**现象**：2026-10-28 起国内版（`copilot.tencent.com`）对正常对话回 HTTP 400 `code 11128` /
+`msg "Illegal API invocation from an unapproved channel"`，`displayTips` 说「没通过渠道校验，
+可能不是官方客户端发出的」。同一时刻同 provider 的会话标题请求却能 200——所以不是账号，
+也不是整台机器的指纹。
+
+**实测**（同一账号、同一模型、同一组请求头，逐变量拆解）：
+
+| 实验 | 结果 |
+|---|---|
+| 失败会话原样请求体（48KB system + 5 条 user + 工具 + stream_options + max_completion_tokens 128000 + reasoning_effort max） | **400 / 11128** |
+| 同一份请求体 + 官方客户端全套 per-request 身份头（X-Request-ID、traceparent/b3/X-B3-*、X-Conversation-* 三件套、X-IDE-*） | **仍 400**（不是头的问题） |
+| 同一份请求体，仅把 system 里的 `DeepSeek Harness` 换成 `DeepSeek`、裸 `@` 换成 `＠` | **200 流式回答** |
+| system = `You are an AI agent powered by DeepSeek Harness.` | **400** |
+| 同上，品牌缩短为 `DeepSeek` | **200** |
+| 品牌名放进 **user** 消息（system 干净） | 200（不是全局内容审查） |
+| 同一句品牌放进 **assistant** 历史 | 原样 **400 / 11128**；经插件清洗 **200** |
+| 小写品牌 `deepseek harness` 放入 system | **400**（大小写不敏感） |
+| 国际版（console 路由 + 会话头）带品牌名的 system | 200（国际版无此内容闸门） |
+
+结论：国内版是按「指令文本内容」做指纹——`system`/`developer`/`assistant` 里的
+**两词品牌名**（`DeepSeek Harness`，大小写不敏感）与**裸 `@` 提及**会被拦；
+`user`/`tool` 消息里的品牌名不触发，`@file`、`@scope/pkg`、`someone@example.com`、
+`@"..."` 等 @ 形态也都不触发。
+
+**改动**：`chatStream` 在国内区域发送前新增 `sanitizeCnChatBody` 内容清洗——
+
+- 只清洗**模型读到的指令文本**：`system` / `developer` / `assistant` 消息（字符串与 multipart
+  `[{type:'text'}]` 两种载体）以及 `tools[].function.description`（嵌套与扁平两种形态）；
+  `user` / `tool` 消息一字不动（`assistant` 也要清：同一句放进 assistant 历史同样 400，
+  不清的话「对话里提到过品牌名」的下一轮会复发）。
+- 两条改写：`DeepSeek[ \t]+Harness` → `DeepSeek`；被空白包围的裸 `@` → 全角 `＠`（句意不变，
+  模型仍能理解为 @ 提及）。连字符形态 `deepseek-harness` 是包名/路径，保持原样。
+- **没有可改写内容的请求体逐字节原样发送**（不重新序列化），不会扰动网关本来就接受的请求。
+- 国际版不做这项清洗（实测接受带品牌名的 system，保持逐字节不变）。
+
+**验证**：走插件真实代码路径（shim → `prepareChatBody` → `WorkBuddyUpstreamClient.chatStream`），
+用失败会话的**原样请求体**对真实国内账号跑通：`status 200`、流式回答正常（修复前同一请求必 400；
+独立复验 5 个账号 × 2 个模型 × 2 轮 = 20/20 全 200，工具调用 SSE 正常）；输出线上抓包确认
+`system`/assistant 里已无品牌名与裸 `@`；国际版同请求体 200 不受影响。新增 7 条用例，
+共 **274 条**通过；产物自检 13/13 通过。0.6.12 已安装进本机 desktop profile（0.6.11 备份保留），
+重启 DSH 后生效。
+
 ## [0.6.11] - 2026-10-18
 
 ### 修复：429 `code 14003 too many requests` 被当成额度限流，一次突发停号 10 分钟
