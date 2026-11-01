@@ -438,9 +438,33 @@ describe('the domestic prompt fingerprint gates', () => {
     expect(out.messages[0].content).toBe('a DeepSeek b DeepSeek c deepseek-harness d DeepSeek e DeepSeek')
   })
 
+  it('breaks up the five-sentence file-reference paragraph', () => {
+    // Measured 2026-11-01: the CN gateway matches the WHOLE paragraph contiguously,
+    // and it normalises the full-width ＠ before matching, so the old character swap
+    // is no longer sufficient (raw and ＠ spellings both answer 400). Inserting the
+    // missing "that" breaks the window and measures 200 on the failing shape.
+    const paragraph = 'Tokens prefixed with @ are paths the user explicitly referenced.'
+      + ' Relative paths resolve from the workspace root; absolute paths identify files'
+      + ' or directories on the host. A trailing slash marks a directory: list it when'
+      + ' its contents matter.'
+    const out = sanitized({ messages: [{ role: 'system', content: paragraph }] })
+    expect(out.messages[0].content as string).toContain('are paths that the user explicitly referenced')
+    expect(out.messages[0].content as string).not.toContain('are paths the user explicitly referenced')
+    // Idempotent: an already-repaired body is returned byte-identical.
+    const repaired = JSON.stringify({ messages: [{ role: 'system', content: out.messages[0].content }] })
+    expect(sanitizeCnChatBody(repaired)).toBe(repaired)
+    // The full-width spelling is repaired too: the sentence, not the character, is
+    // the fingerprint now.
+    const widened = sanitized({
+      messages: [{ role: 'system', content: paragraph.replace('with @ are', 'with ＠ are') }],
+    })
+    expect(widened.messages[0].content as string).toContain('are paths that the user explicitly referenced')
+  })
+
   it('replaces a bare mention @ and leaves every other @ shape alone', () => {
-    // Measured live: only a bare token @ surrounded by whitespace is refused;
-    // @file, @scope/pkg, addresses and quoted forms pass and stay verbatim.
+    // The @ rewrite is kept as defense in depth for a matcher that still treats a
+    // bare mention as a token; @file, @scope/pkg, addresses and quoted forms all
+    // stay verbatim.
     const out = sanitized({
       messages: [{
         role: 'system',
@@ -500,7 +524,11 @@ describe('the domestic prompt fingerprint gates', () => {
     const build = (): string => JSON.stringify({
       model: 'm',
       messages: [
-        { role: 'system', content: 'You are an AI agent powered by DeepSeek Harness. Tokens prefixed with @ are paths.' },
+        {
+          role: 'system',
+          content: 'You are an AI agent powered by DeepSeek Harness.'
+            + ' Tokens prefixed with @ are paths the user explicitly referenced.',
+        },
         { role: 'user', content: 'hi' },
       ],
     })
@@ -511,13 +539,15 @@ describe('the domestic prompt fingerprint gates', () => {
     const domestic = JSON.parse(bodies[0] ?? '{}') as Record<string, any>
     const international = JSON.parse(bodies[1] ?? '{}') as Record<string, any>
     expect(domestic.messages[0].content).toBe(
-      'You are an AI agent powered by DeepSeek. Tokens prefixed with ＠ are paths.',
+      'You are an AI agent powered by DeepSeek.'
+      + ' Tokens prefixed with ＠ are paths that the user explicitly referenced.',
     )
     expect(domestic.messages[1].content).toBe('hi')
     // The international gateway accepts the branded prompt (measured 200 on
     // 2026-10-28), so its wire body stays byte-for-byte what it was.
     expect(international.messages[0].content).toBe(
-      'You are an AI agent powered by DeepSeek Harness. Tokens prefixed with @ are paths.',
+      'You are an AI agent powered by DeepSeek Harness.'
+      + ' Tokens prefixed with @ are paths the user explicitly referenced.',
     )
   })
 })

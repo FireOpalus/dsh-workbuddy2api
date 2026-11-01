@@ -30,20 +30,25 @@ UA 指纹或账号风控。实测（逐变量拆解）证明它是**两道"与"�
 ### 国内版（copilot.tencent.com）
 
 2026-10-28 起国内版也加入 11128 拦截，但**不是头/路由问题，而是对「指令文本内容」
-做指纹**（同一份请求体加官方客户端全套 per-request 身份头仍被拒，去掉触发词后立即 200）：
+做指纹**（同一份请求体加官方客户端全套 per-request 身份头仍被拒，去掉触发词后立即 200）。
+上游会持续收紧匹配窗口，目前已实测到两代规则：
 
 1. `system` / `developer` / `assistant` 消息里出现两词品牌名 `DeepSeek Harness`（空格/Tab 均可，
    大小写不敏感）→ 拒；
-2. 同一条消息里出现**裸 `@` 提及**（被空格包围，且与「@ 前缀是路径」那段说明同时出现）→ 拒。
+2. 「@ 路径说明」整段（`Tokens prefixed with @ are paths the user explicitly referenced. …`）
+   被**连续整段**匹配 → 拒。2026-11-01 实测：整段发送即 400，把裸 `@` 换成全角 `＠` 仍 400
+   （上游先归一化全角字符再匹配），在 `paths` 后补一个词 `that` 才能打断连续窗口。
 
 `user` / `tool` 消息里的品牌名不动（实测不触发）；`@file`、`@scope/pkg`、
 `someone@example.com`、`@"..."` 这些 @ 形态也都不触发。`assistant` 历史同样被扫描
 （把同一句放进 assistant 消息也会 400），所以它也在清洗范围内——否则「对话里提到过品牌名」
 的下一轮会复发。
 
-本插件已自动处理：国内版发送前把 `system` / `developer` / `assistant` 消息（字符串与
-multipart text 两种载体）和工具描述里的 `DeepSeek Harness` 缩短为 `DeepSeek`、把裸 `@`
-换成全角 `＠`；其余内容逐字节原样发送，国际版不做这项清洗。
+本插件已自动处理：国内版发送前，对 `system` / `developer` / `assistant` 消息（字符串与
+multipart text 两种载体）和工具描述做两件事 —— 把 `DeepSeek Harness` 缩短为 `DeepSeek`；
+把「@ 路径说明」段补成 `paths that the user explicitly referenced`（缺词才补，幂等）。
+其余内容逐字节原样发送，国际版不做这项清洗。裸 `@` 换全角 `＠` 作为兜底保留，
+但它已不足以绕过第二类规则。
 
 ## 兼容性
 
